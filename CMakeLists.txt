@@ -18,6 +18,10 @@ add_executable(vidyagodfs
     src/fuseops.cpp
 )
 
+# No Qt — disable the Qt autogen steps in case this is built as a subdirectory of a Qt project
+# (which inherits CMAKE_AUTOMOC=ON).
+set_target_properties(vidyagodfs PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+
 # FUSE_USE_VERSION=31 (FUSE 3.1 high-level API) — only the 3.0/3.1 ops are used, so this builds
 # against any libfuse 3.x (e.g. 3.10 on Ubuntu 22.04). _FILE_OFFSET_BITS=64 for >4 GB archives.
 target_compile_definitions(vidyagodfs PRIVATE FUSE_USE_VERSION=31 _FILE_OFFSET_BITS=64)
