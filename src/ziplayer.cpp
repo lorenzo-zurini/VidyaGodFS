@@ -183,6 +183,12 @@ std::shared_ptr<ZipIndex> BuildZipIndex(const std::string &ArchivePath)
         {
             if (st.valid & ZIP_STAT_SIZE) e.size = st.size;
 
+            // Unix symlink? The mode lives in the high 16 bits of the central-dir external attributes.
+            zip_uint8_t opsys = 0; zip_uint32_t extAttr = 0;
+            if (zip_file_get_external_attributes(za, i, 0, &opsys, &extAttr) == 0 &&
+                opsys == ZIP_OPSYS_UNIX && S_ISLNK((mode_t)(extAttr >> 16)))
+                e.symlink = true;
+
             // STORED + unencrypted → resolve the data offset for zero-copy pread.
             bool storeMethod = (st.valid & ZIP_STAT_COMP_METHOD) && st.comp_method == ZIP_CM_STORE;
             bool encrypted   = (st.valid & ZIP_STAT_ENCRYPTION_METHOD) && st.encryption_method != ZIP_EM_NONE;

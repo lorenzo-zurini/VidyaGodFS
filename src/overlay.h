@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <atomic>
 #include <sys/types.h>
 
 //A resolved layer in the running filesystem.
@@ -33,6 +34,10 @@ struct VfsState {
     gid_t                 gid = 1000;
     std::vector<Layer>    layers;        // ascending priority (index 0 lowest)
     std::set<std::string> implicitDirs;  // synthesized structural dirs (target parents)
+
+    // Set once any opaque-dir marker (.wh..wh..opq) is seen (created here, or encountered in a readdir).
+    // Gates the per-Resolve ancestor-opacity check so the hot path stays free when no opaque dirs exist.
+    std::atomic<bool>     hasOpaque{false};
 
     std::mutex                                         copyUpMapMtx;
     std::map<std::string, std::shared_ptr<std::mutex>> copyUpLocks;
@@ -59,6 +64,12 @@ std::string WhiteoutPath(const VfsState &S, const std::string &vrel);
 bool        IsWhiteouted(const VfsState &S, const std::string &vrel);
 void        CreateWhiteout(const VfsState &S, const std::string &vrel);
 void        RemoveWhiteout(const VfsState &S, const std::string &vrel);
+
+//Opaque directories: a writelayer dir holding a `.wh..wh..opq` marker fully masks the lower layers for
+//its whole subtree (used when a lower-backed dir is deleted then recreated — the new one is empty).
+bool        IsOpaqueDir(const VfsState &S, const std::string &vrel);
+void        MarkOpaque(VfsState &S, const std::string &vrel);
+bool        IsUnderOpaque(const VfsState &S, const std::string &vrel);
 
 //Resolve a vrel: whiteout → None; writelayer entry → WriteLayer; covering layer (highest priority
 //first) → DirLayer/FileLayer/ZipEntry; structural dir → ImplicitDir; else None.

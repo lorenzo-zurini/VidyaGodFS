@@ -6,6 +6,7 @@
 #include <string>
 #include <set>
 #include <filesystem>
+#include <algorithm>
 #include <cstring>
 #include <cerrno>
 #include <dirent.h>
@@ -49,6 +50,7 @@ static std::string SegmentAfter(const std::string &v, const std::string &path)
 static void CollectChildren(VfsState *S, const std::string &v, std::set<std::string> &out)
 {
     std::set<std::string> whiteouts;
+    bool opaque = false; // this dir masks the lower layers entirely (.wh..wh..opq present)
 
     if (!S->writelayer.empty())
     {
@@ -58,17 +60,19 @@ static void CollectChildren(VfsState *S, const std::string &v, std::set<std::str
             {
                 std::string n = e->d_name;
                 if (n == "." || n == "..") continue;
+                if (n == ".wh..wh..opq") { opaque = true; continue; }
                 if (n.rfind(".wh.", 0) == 0) { whiteouts.insert(n.substr(4)); continue; }
                 out.insert(n);
             }
             ::closedir(d);
         }
     }
+    if (opaque) S->hasOpaque.store(true, std::memory_order_relaxed); // enable Resolve masking lazily
 
     for (const Layer &L : S->layers)
     {
-        // Real entries of a covering dir/zip layer.
-        if (LayerCovers(L, v))
+        // Real entries of a covering dir/zip layer — skipped when this dir is opaque.
+        if (!opaque && LayerCovers(L, v))
         {
             if (L.type == LayerType::Dir)
             {
@@ -128,7 +132,7 @@ static int op_getattr(const char *path, struct stat *st, struct fuse_file_info *
             return 0;
         case HitKind::ZipEntry:
             if (rr.zipEntry == nullptr || rr.zipEntry->isDir) { FillDirStat(st, S, 0555); return 0; }
-            st->st_mode = S_IFREG | 0555;
+            st->st_mode = rr.zipEntry->symlink ? (S_IFLNK | 0777) : (S_IFREG | 0555);
             st->st_nlink = 1;
             st->st_size = (off_t)rr.zipEntry->size;
             st->st_mtime = rr.zipEntry->mtime;
@@ -260,9 +264,13 @@ static int op_mkdir(const char *path, mode_t mode)
     std::string v = V(path);
     std::string host;
     if (PassthroughHost(*S, v, host)) { EnsureHostParent(host); return ::mkdir(host.c_str(), mode) == 0 ? 0 : -errno; }
+    // A whiteout here means this dir existed in a lower layer and was deleted; recreating it must yield
+    // an EMPTY dir, so mark it opaque to mask the lower layer's old contents.
+    bool recreateOverLower = IsWhiteouted(*S, v);
     RemoveWhiteout(*S, v);
     if (int e = EnsureWriteParent(*S, v); e != 0) return e;
     if (::mkdir(WLPath(*S, v).c_str(), mode) != 0) return -errno;
+    if (recreateOverLower) MarkOpaque(*S, v);
     return 0;
 }
 
@@ -288,8 +296,47 @@ static int op_rmdir(const char *path)
     if (!children.empty()) return -ENOTEMPTY;
     std::string host;
     if (PassthroughHost(*S, v, host)) return ::rmdir(host.c_str()) == 0 ? 0 : -errno;
-    if (!S->writelayer.empty()) ::rmdir(WLPath(*S, v).c_str());
+    if (!S->writelayer.empty())
+    {
+        // The writelayer dir may still hold child whiteouts / an opaque marker (all ".wh."-prefixed),
+        // which make it non-empty on disk even though the merged view is empty. Clear them so rmdir works.
+        std::string wl = WLPath(*S, v);
+        if (DIR *d = ::opendir(wl.c_str()))
+        {
+            while (dirent *e = ::readdir(d))
+            {
+                std::string n = e->d_name;
+                if (n.rfind(".wh.", 0) == 0) ::unlink((wl + "/" + n).c_str());
+            }
+            ::closedir(d);
+        }
+        ::rmdir(wl.c_str());
+    }
     if (Resolve(*S, v).kind != HitKind::None) CreateWhiteout(*S, v);
+    return 0;
+}
+
+//Recursively copy-up the merged subtree rooted at vsrc into the writelayer (each node at its own path),
+//so the whole subtree becomes writable in place. After this, vsrc lives entirely in the writelayer and
+//can be moved with a single ::rename — which is how a cross-layer directory rename is realized.
+static int DeepCopyUp(VfsState *S, const std::string &vsrc)
+{
+    ResolveResult rr = Resolve(*S, vsrc);
+    if (rr.kind == HitKind::None) return -ENOENT;
+    if (int e = CopyUp(*S, vsrc, rr); e != 0) return e; // dir → mkdir in WL; file/symlink → materialize
+
+    bool isDir = (rr.kind == HitKind::ImplicitDir) ||
+                 (rr.kind == HitKind::ZipEntry && (rr.zipEntry == nullptr || rr.zipEntry->isDir));
+    if (!isDir && (rr.kind == HitKind::WriteLayer || rr.kind == HitKind::DirLayer))
+    {
+        struct stat st; if (::lstat(rr.hostPath.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) isDir = true;
+    }
+    if (!isDir) return 0;
+
+    std::set<std::string> children;
+    CollectChildren(S, vsrc, children);
+    for (const std::string &c : children)
+        if (int e = DeepCopyUp(S, vsrc + "/" + c); e != 0) return e;
     return 0;
 }
 
@@ -302,16 +349,20 @@ static int op_rename(const char *from, const char *to, unsigned int flags)
     ResolveResult rr = Resolve(*S, vf);
     if (rr.kind == HitKind::None) return -ENOENT;
 
-    // Directory rename spanning layers → EXDEV (recursive dir copy-up deferred). Pure-writelayer dirs rename fine.
     struct stat st;
     bool isDir = (rr.kind == HitKind::ImplicitDir) ||
                  (rr.kind == HitKind::ZipEntry && (rr.zipEntry == nullptr || rr.zipEntry->isDir)) ||
                  ((rr.kind == HitKind::DirLayer || rr.kind == HitKind::WriteLayer) &&
                   ::lstat(rr.hostPath.c_str(), &st) == 0 && S_ISDIR(st.st_mode));
-    if (isDir && rr.kind != HitKind::WriteLayer) return -EXDEV;
 
+    // Bring the source fully into the writelayer first: a cross-layer DIRECTORY needs the whole subtree
+    // copied up (so it can then be moved with one ::rename); a file is a single copy-up. Passthrough or
+    // already-writable sources skip this.
     if (rr.kind != HitKind::WriteLayer && !rr.rwPassthrough)
-        if (int e = CopyUp(*S, vf, rr); e != 0) return e;
+    {
+        int e = isDir ? DeepCopyUp(S, vf) : CopyUp(*S, vf, rr);
+        if (e != 0) return e;
+    }
 
     std::string src = rr.rwPassthrough ? rr.hostPath : WLPath(*S, vf);
     std::string dst;
@@ -385,7 +436,19 @@ static int op_readlink(const char *path, char *buf, size_t size)
         buf[n] = '\0';
         return 0;
     }
-    return -EINVAL; // not a symlink (zip symlinks deferred)
+    // Zip symlink entry: the link target IS the entry content. Read it (STORED → zero-copy pread).
+    if (rr.kind == HitKind::ZipEntry && rr.zipEntry && rr.zipEntry->symlink && size > 0)
+    {
+        ZipReader zr;
+        int e = OpenZipEntry(*const_cast<ZipIndex *>(rr.layer->zip.get()), *rr.zipEntry, zr);
+        if (e != 0) return e;
+        size_t want = std::min<uint64_t>(rr.zipEntry->size, size - 1);
+        int got = ReadZipEntry(zr, buf, want, 0);
+        if (got < 0) return got;
+        buf[got] = '\0';
+        return 0;
+    }
+    return -EINVAL; // not a symlink
 }
 
 static int op_symlink(const char *target, const char *path)

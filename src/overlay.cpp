@@ -137,6 +137,38 @@ void RemoveWhiteout(const VfsState &S, const std::string &vrel)
     ::unlink(WhiteoutPath(S, vrel).c_str());
 }
 
+// ---- opaque directories --------------------------------------------------
+
+static std::string OpaqueMarker(const VfsState &S, const std::string &vrel)
+{
+    return WLPath(S, vrel) + "/.wh..wh..opq";
+}
+
+bool IsOpaqueDir(const VfsState &S, const std::string &vrel)
+{
+    if (S.writelayer.empty()) return false;
+    struct stat st;
+    return ::lstat(OpaqueMarker(S, vrel).c_str(), &st) == 0;
+}
+
+void MarkOpaque(VfsState &S, const std::string &vrel)
+{
+    if (S.writelayer.empty()) return;
+    int fd = ::open(OpaqueMarker(S, vrel).c_str(), O_CREAT | O_WRONLY, 0644);
+    if (fd >= 0) ::close(fd);
+    S.hasOpaque.store(true, std::memory_order_relaxed);
+}
+
+//True if any ancestor directory of vrel (including the root) is opaque — meaning the lower layers are
+//masked here. Gated by hasOpaque so it costs nothing until an opaque dir actually exists.
+bool IsUnderOpaque(const VfsState &S, const std::string &vrel)
+{
+    if (!S.hasOpaque.load(std::memory_order_relaxed) || S.writelayer.empty()) return false;
+    for (std::string cur = ParentVRel(vrel); !cur.empty(); cur = ParentVRel(cur))
+        if (IsOpaqueDir(S, cur)) return true;
+    return IsOpaqueDir(S, ""); // root opaque masks everything
+}
+
 // ---- resolution ----------------------------------------------------------
 
 ResolveResult Resolve(VfsState &S, const std::string &vrel)
@@ -149,6 +181,8 @@ ResolveResult Resolve(VfsState &S, const std::string &vrel)
         std::string wp = WLPath(S, vrel);
         struct stat st;
         if (::lstat(wp.c_str(), &st) == 0) { R.kind = HitKind::WriteLayer; R.hostPath = wp; return R; }
+        // Not in the writelayer, but masked by an opaque ancestor → the lower layers don't show here.
+        if (IsUnderOpaque(S, vrel)) return R;
     }
 
     // Highest priority first.
@@ -244,6 +278,27 @@ int CopyUp(VfsState &S, const std::string &vrel, const ResolveResult &rr)
         std::error_code ec;
         fs::create_directories(dst, ec);
         return ec ? -EIO : 0;
+    }
+
+    // Symlink copy-up: recreate the link itself; never dereference it into a regular file.
+    if (rr.kind == HitKind::ZipEntry && rr.zipEntry && rr.zipEntry->symlink)
+    {
+        ZipReader zr;
+        if (int e = OpenZipEntry(*const_cast<ZipIndex *>(rr.layer->zip.get()), *rr.zipEntry, zr); e != 0) return e;
+        std::string tgt(rr.zipEntry->size, '\0');
+        int got = ReadZipEntry(zr, tgt.data(), tgt.size(), 0);
+        if (got < 0) return got;
+        tgt.resize(got);
+        return ::symlink(tgt.c_str(), dst.c_str()) == 0 ? 0 : -errno;
+    }
+    if ((rr.kind == HitKind::DirLayer || rr.kind == HitKind::FileLayer) &&
+        ::lstat(rr.hostPath.c_str(), &st) == 0 && S_ISLNK(st.st_mode))
+    {
+        char tgt[4096];
+        ssize_t n = ::readlink(rr.hostPath.c_str(), tgt, sizeof tgt - 1);
+        if (n < 0) return -errno;
+        tgt[n] = '\0';
+        return ::symlink(tgt, dst.c_str()) == 0 ? 0 : -errno;
     }
 
     // File copy-up: materialize full content into the writelayer.

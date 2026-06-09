@@ -18,6 +18,9 @@ struct ZipEntry {
     uint64_t    size = 0;        // uncompressed size
     time_t      mtime = 0;
     bool        isDir = false;
+    // A Unix symlink entry (S_IFLNK in the central-directory external attrs). Its content IS the link
+    // target string, so getattr reports S_IFLNK and readlink reads `size` bytes of content.
+    bool        symlink = false;
     // STORED (uncompressed, unencrypted) entries are served zero-copy: their bytes sit contiguously
     // in the archive at `dataOffset`, so reads are a direct pread (no decompression, no materialization).
     bool        stored = false;
