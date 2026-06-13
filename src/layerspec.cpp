@@ -38,9 +38,10 @@ bool ParseSpec(const std::string &Path, Spec &Out, std::string &Err)
             else if (Type == "zip")  LS.type = LayerType::Zip;
             else if (Type == "file") LS.type = LayerType::File;
             else { Err = "unknown layer type: " + Type; return false; }
-            LS.source = L.at("source").get<std::string>();
-            LS.target = NormalizeVPath(L.value("target", std::string()));
-            LS.rw     = L.value("rw", false);
+            LS.source  = L.at("source").get<std::string>();
+            LS.target  = NormalizeVPath(L.value("target", std::string()));
+            LS.subpath = NormalizeVPath(L.value("subpath", std::string()));
+            LS.rw      = L.value("rw", false);
             Out.layers.push_back(std::move(LS));
         }
     }

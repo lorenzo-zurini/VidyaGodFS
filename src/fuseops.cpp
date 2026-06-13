@@ -76,7 +76,7 @@ static void CollectChildren(VfsState *S, const std::string &v, std::set<std::str
         {
             if (L.type == LayerType::Dir)
             {
-                std::string rel = RelUnder(L, v);
+                std::string rel = SourceRel(L, v);
                 std::string host = rel.empty() ? L.source : (L.source + "/" + rel);
                 if (DIR *d = ::opendir(host.c_str()))
                 {
@@ -90,7 +90,7 @@ static void CollectChildren(VfsState *S, const std::string &v, std::set<std::str
             }
             else if (L.type == LayerType::Zip)
             {
-                auto it = L.zip->dirChildren.find(RelUnder(L, v));
+                auto it = L.zip->dirChildren.find(SourceRel(L, v));
                 if (it != L.zip->dirChildren.end())
                     for (const std::string &c : it->second) out.insert(c);
             }

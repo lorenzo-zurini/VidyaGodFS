@@ -18,6 +18,7 @@ struct Layer {
     LayerType   type = LayerType::Dir;
     std::string source;      // host path (dir / archive / single file)
     std::string target;      // normalized virtual subtree root ("" == mount root); for File, the containing dir
+    std::string subpath;     // path within source exposed at target ("" == whole source). dir/zip only.
     bool        rw = false;  // Dir + rw:true = RW passthrough (writes go straight to source)
     int         priority = 0;
     std::shared_ptr<ZipIndex> zip;  // Zip layers only
@@ -58,7 +59,8 @@ struct ResolveResult {
 
 //Path helpers (vrel = normalized, no leading slash, "" == root).
 bool        LayerCovers(const Layer &L, const std::string &vrel);
-std::string RelUnder(const Layer &L, const std::string &vrel);
+std::string RelUnder(const Layer &L, const std::string &vrel);   // path under target (coverage side)
+std::string SourceRel(const Layer &L, const std::string &vrel);  // subpath-prefixed: the source/zip side
 std::string WLPath(const VfsState &S, const std::string &vrel);   // writelayer host path for vrel
 std::string WhiteoutPath(const VfsState &S, const std::string &vrel);
 bool        IsWhiteouted(const VfsState &S, const std::string &vrel);

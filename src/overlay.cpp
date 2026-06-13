@@ -56,6 +56,7 @@ bool VfsState::Init(const Spec &S, std::string &Err)
         L.type = LS.type;
         L.source = LS.source;
         L.target = LS.target;
+        L.subpath = LS.subpath;
         L.rw = LS.rw;
         L.priority = prio++;
 
@@ -106,6 +107,16 @@ std::string RelUnder(const Layer &L, const std::string &vrel)
     if (L.target.empty()) return vrel;
     if (vrel == L.target) return "";
     return vrel.substr(L.target.size() + 1);
+}
+
+//The source/zip-side relative path for vrel: the path under target (RelUnder), prefixed by the layer's
+//subpath. With subpath set, the layer exposes source/subpath at target (subpath="" → whole source).
+std::string SourceRel(const Layer &L, const std::string &vrel)
+{
+    std::string rel = RelUnder(L, vrel);
+    if (L.subpath.empty()) return rel;
+    if (rel.empty())       return L.subpath;
+    return L.subpath + "/" + rel;
 }
 
 // ---- whiteouts -----------------------------------------------------------
@@ -193,7 +204,7 @@ ResolveResult Resolve(VfsState &S, const std::string &vrel)
 
         if (L.type == LayerType::Dir)
         {
-            std::string rel = RelUnder(L, vrel);
+            std::string rel = SourceRel(L, vrel);
             std::string host = rel.empty() ? L.source : (L.source + "/" + rel);
             struct stat st;
             if (::lstat(host.c_str(), &st) == 0)
@@ -213,7 +224,7 @@ ResolveResult Resolve(VfsState &S, const std::string &vrel)
         }
         else // Zip
         {
-            std::string rel = RelUnder(L, vrel);
+            std::string rel = SourceRel(L, vrel);
             auto fit = L.zip->byName.find(rel);
             bool isDir = (fit != L.zip->byName.end() && fit->second.isDir) || L.zip->dirChildren.count(rel);
             if (fit != L.zip->byName.end() || isDir)
@@ -238,7 +249,7 @@ bool PassthroughHost(VfsState &S, const std::string &vrel, std::string &HostOut)
         const Layer &L = *it;
         if (L.type == LayerType::Dir && L.rw && LayerCovers(L, vrel))
         {
-            std::string rel = RelUnder(L, vrel);
+            std::string rel = SourceRel(L, vrel);
             HostOut = rel.empty() ? L.source : (L.source + "/" + rel);
             return true;
         }

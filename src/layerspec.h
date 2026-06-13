@@ -15,6 +15,8 @@ struct LayerSpec {
     LayerType   type = LayerType::Dir;
     std::string source;      // absolute host path (dir / archive / single file)
     std::string target;      // normalized virtual subtree root: no leading/trailing '/', "" == mount root
+    std::string subpath;     // normalized path WITHIN source exposed at target ("" == whole source). dir/zip only.
+                             // dir-subpath → its subtree appears under target; file-subpath → target IS that file.
     bool        rw = false;  // rw:true dir layer = RW passthrough straight to source (durable persist)
 };
 
