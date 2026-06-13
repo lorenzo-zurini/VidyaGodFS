@@ -3,6 +3,7 @@
 
 #include <string>
 #include <vector>
+#include <utility>
 #include <cstdint>
 
 //The JSON layer-spec is the only contract between the VidyaGod app and this helper. The app writes
@@ -15,8 +16,10 @@ struct LayerSpec {
     LayerType   type = LayerType::Dir;
     std::string source;      // absolute host path (dir / archive / single file)
     std::string target;      // normalized virtual subtree root: no leading/trailing '/', "" == mount root
-    std::string subpath;     // normalized path WITHIN source exposed at target ("" == whole source). dir/zip only.
-                             // dir-subpath → its subtree appears under target; file-subpath → target IS that file.
+    // SUBMOUNTS (dir/zip only): Docker-style "src:dst" mounts of paths WITHIN source. Each (source,target)
+    // pair is normalized and fanned out into its own single-subpath internal layer at Init. Empty → mount the
+    // whole source at `target`. A pair's `first` is the in-source path ("" == whole source), `second` the dest.
+    std::vector<std::pair<std::string,std::string>> submounts;
     bool        rw = false;  // rw:true dir layer = RW passthrough straight to source (durable persist)
 };
 

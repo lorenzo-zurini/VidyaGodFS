@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <sstream>
+#include <iostream>
 
 std::string NormalizeVPath(const std::string &Path)
 {
@@ -40,8 +41,21 @@ bool ParseSpec(const std::string &Path, Spec &Out, std::string &Err)
             else { Err = "unknown layer type: " + Type; return false; }
             LS.source  = L.at("source").get<std::string>();
             LS.target  = NormalizeVPath(L.value("target", std::string()));
-            LS.subpath = NormalizeVPath(L.value("subpath", std::string()));
             LS.rw      = L.value("rw", false);
+            // SUBMOUNTS: array of Docker-style "src:dst" strings → (source,target) pairs (split on first ':').
+            if (L.contains("submounts") && L["submounts"].is_array())
+                for (const auto &E : L["submounts"])
+                {
+                    if (!E.is_string()) continue;
+                    const std::string S = E.get<std::string>();
+                    const size_t C = S.find(':');
+                    if (C == std::string::npos)
+                    {
+                        std::cerr << "[vidyagodfs] ignoring malformed submount (no ':'): " << S << "\n";
+                        continue;
+                    }
+                    LS.submounts.emplace_back(NormalizeVPath(S.substr(0, C)), NormalizeVPath(S.substr(C + 1)));
+                }
             Out.layers.push_back(std::move(LS));
         }
     }

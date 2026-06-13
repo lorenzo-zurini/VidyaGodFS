@@ -52,32 +52,41 @@ bool VfsState::Init(const Spec &S, std::string &Err)
     int prio = 0;
     for (const LayerSpec &LS : S.layers)
     {
-        Layer L;
-        L.type = LS.type;
-        L.source = LS.source;
-        L.target = LS.target;
-        L.subpath = LS.subpath;
-        L.rw = LS.rw;
-        L.priority = prio++;
-
+        // Build the zip index once per spec layer — every fanned-out SUBMOUNT shares this one ZipIndex.
+        std::shared_ptr<ZipIndex> zip;
         if (LS.type == LayerType::Zip)
         {
-            L.zip = BuildZipIndex(LS.source);
-            if (!L.zip) { std::cerr << "[vidyagodfs] skipping unreadable zip layer: " << LS.source << "\n"; continue; }
-            AddAncestors(implicitDirs, L.target.empty() ? std::string("\x01") : L.target); // ancestors of target
-            // (target itself is real via the zip root)
+            zip = BuildZipIndex(LS.source);
+            if (!zip) { std::cerr << "[vidyagodfs] skipping unreadable zip layer: " << LS.source << "\n"; continue; }
         }
-        else if (LS.type == LayerType::File)
+
+        // SUBMOUNTS fan-out: one internal Layer per (subpath,target) mount, or a single whole-mount ("" subpath
+        // at LS.target) when none are declared. File layers ignore submounts (already a single file).
+        std::vector<std::pair<std::string, std::string>> mounts = LS.submounts;
+        if (mounts.empty() || LS.type == LayerType::File) mounts = { { std::string(), LS.target } };
+
+        for (const auto &[sub, tgt] : mounts)
         {
-            L.fileBase  = BaseName(LS.source);
-            L.fileVPath = L.target.empty() ? L.fileBase : (L.target + "/" + L.fileBase);
-            AddAncestors(implicitDirs, L.fileVPath); // includes the containing target dir
+            Layer L;
+            L.type = LS.type;
+            L.source = LS.source;
+            L.target = tgt;
+            L.subpath = sub;
+            L.rw = LS.rw;
+            L.zip = zip;
+            L.priority = prio++;
+
+            if (LS.type == LayerType::File)
+            {
+                L.fileBase  = BaseName(LS.source);
+                L.fileVPath = L.target.empty() ? L.fileBase : (L.target + "/" + L.fileBase);
+                AddAncestors(implicitDirs, L.fileVPath); // includes the containing target dir
+            }
+            else // Dir or Zip — target itself is real (a dir, or the file for a file-submount) via the layer
+                AddAncestors(implicitDirs, L.target.empty() ? std::string("\x01") : L.target);
+
+            layers.push_back(std::move(L));
         }
-        else // Dir
-        {
-            AddAncestors(implicitDirs, L.target.empty() ? std::string("\x01") : L.target);
-        }
-        layers.push_back(std::move(L));
     }
     implicitDirs.erase("\x01");
     implicitDirs.erase("");
