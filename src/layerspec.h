@@ -16,6 +16,9 @@ struct LayerSpec {
     LayerType   type = LayerType::Dir;
     std::string source;      // absolute host path (dir / archive / single file)
     std::string target;      // normalized virtual subtree root: no leading/trailing '/', "" == mount root
+    std::string baseTarget;  // DELTA only: target of the byte-base zip when it lives at a DIFFERENT target than
+                             // `target` (cross-target delta, e.g. a root-mounted complete archive diffed over a
+                             // sub-target base). Empty == same as `target` (the ordinary overlay-relative delta).
     // SUBMOUNTS (dir/zip only): Docker-style "src:dst" mounts of paths WITHIN source. Each (source,target)
     // pair is normalized and fanned out into its own single-subpath internal layer at Init. Empty → mount the
     // whole source at `target`. A pair's `first` is the in-source path ("" == whole source), `second` the dest.

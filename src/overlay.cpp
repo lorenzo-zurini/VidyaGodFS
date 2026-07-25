@@ -76,9 +76,13 @@ bool VfsState::Init(const Spec &S, std::string &Err)
 
             if (LS.type == LayerType::Delta)
             {
-                auto bit = baseByTarget.find(LS.target);
+                // Base = the composed view at this delta's base target. Normally that's its OWN target (the zip
+                // directly below), but a cross-target delta names a different `baseTarget` — e.g. a complete
+                // archive mounted at the package root, diffed over a base zip that mounts at a sub-target.
+                const std::string &baseTgt = LS.baseTarget.empty() ? LS.target : LS.baseTarget;
+                auto bit = baseByTarget.find(baseTgt);
                 if (bit == baseByTarget.end() || !bit->second)
-                { std::cerr << "[vidyagodfs] delta layer has no base at target '" << LS.target << "': " << LS.source << "\n"; continue; }
+                { std::cerr << "[vidyagodfs] delta layer has no base at target '" << baseTgt << "': " << LS.source << "\n"; continue; }
                 std::string derr;
                 auto ds = vgdelta::DeltaByteSource::Create(src, bit->second, derr, false);
                 if (!ds) { std::cerr << "[vidyagodfs] bad delta " << LS.source << ": " << derr << "\n"; continue; }
