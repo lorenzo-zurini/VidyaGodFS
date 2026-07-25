@@ -1,9 +1,11 @@
 #include "overlay.h"
+#include "vgdelta.h"
 
 #include <filesystem>
 #include <fstream>
 #include <cstring>
 #include <cerrno>
+#include <unordered_map>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -50,13 +52,46 @@ bool VfsState::Init(const Spec &S, std::string &Err)
     if (!writelayer.empty()) fs::create_directories(writelayer, ec);
 
     int prio = 0;
-    for (const LayerSpec &LS : S.layers)
+    // Delta chaining + folding: within a run of same-target layers ending in delta(s), the base zip and any
+    // intermediate deltas are BYTE inputs only — they compose into the topmost delta's single FLAT map (done in
+    // DeltaByteSource::Create). Only that top delta surfaces as an overlay layer, so reads never walk the chain
+    // and memory stays O(1) in chain depth (hundreds of daisy-chained versions cost the same as one).
+    std::unordered_map<std::string, std::shared_ptr<ByteSource>> baseByTarget;   // composed view so far, per target
+    std::unordered_map<std::string, size_t> lastDeltaIdx;                        // target → index of its final delta layer
+    for (size_t gi = 0; gi < S.layers.size(); ++gi)
+        if (S.layers[gi].type == LayerType::Delta) lastDeltaIdx[S.layers[gi].target] = gi;
+
+    for (size_t gi = 0; gi < S.layers.size(); ++gi)
     {
-        // Build the zip index once per spec layer — every fanned-out SUBMOUNT shares this one ZipIndex.
+        const LayerSpec &LS = S.layers[gi];
         std::shared_ptr<ZipIndex> zip;
-        if (LS.type == LayerType::Zip)
+        bool opaque = false;
+        if (LS.type == LayerType::Zip || LS.type == LayerType::Delta)
         {
-            zip = BuildZipIndex(LS.source);
+            int fd = ::open(LS.source.c_str(), O_RDONLY);
+            if (fd < 0) { std::cerr << "[vidyagodfs] skipping unreadable layer: " << LS.source << "\n"; continue; }
+            struct stat stt;
+            if (::fstat(fd, &stt) != 0) { ::close(fd); continue; }
+            std::shared_ptr<ByteSource> src = std::make_shared<FdByteSource>(fd, (uint64_t)stt.st_size, true);
+
+            if (LS.type == LayerType::Delta)
+            {
+                auto bit = baseByTarget.find(LS.target);
+                if (bit == baseByTarget.end() || !bit->second)
+                { std::cerr << "[vidyagodfs] delta layer has no base at target '" << LS.target << "': " << LS.source << "\n"; continue; }
+                std::string derr;
+                auto ds = vgdelta::DeltaByteSource::Create(src, bit->second, derr, false);
+                if (!ds) { std::cerr << "[vidyagodfs] bad delta " << LS.source << ": " << derr << "\n"; continue; }
+                src = ds;
+                opaque = true;   // a reconstructed archive is complete → mask anything below at this target
+            }
+            baseByTarget[LS.target] = src;   // the composed view this target has reached (drops the prior flat)
+
+            // Fold: a base zip or intermediate delta of a chain is a byte input only, subsumed into the top
+            // delta's flat map — do not surface it (or even index it) as an overlay layer.
+            if (auto ld = lastDeltaIdx.find(LS.target); ld != lastDeltaIdx.end() && gi != ld->second) continue;
+
+            zip = BuildZipIndex(src, LS.source);
             if (!zip) { std::cerr << "[vidyagodfs] skipping unreadable zip layer: " << LS.source << "\n"; continue; }
         }
 
@@ -68,11 +103,12 @@ bool VfsState::Init(const Spec &S, std::string &Err)
         for (const auto &[sub, tgt] : mounts)
         {
             Layer L;
-            L.type = LS.type;
+            L.type = (LS.type == LayerType::Delta) ? LayerType::Zip : LS.type;  // delta-backed → a zip layer
             L.source = LS.source;
             L.target = tgt;
             L.subpath = sub;
             L.rw = LS.rw;
+            L.opaque = opaque;
             L.zip = zip;
             L.priority = prio++;
 
@@ -242,6 +278,9 @@ ResolveResult Resolve(VfsState &S, const std::string &vrel)
                 R.zipEntry = (fit != L.zip->byName.end()) ? &fit->second : nullptr; // null → synthesized dir
                 return R;
             }
+            // Miss on an opaque (delta-reconstructed, complete) archive → the path does not exist; the older
+            // versions it was diffed against are fully masked, so do not fall through to them.
+            if (L.opaque) return R;
         }
     }
 

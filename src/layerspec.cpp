@@ -35,9 +35,10 @@ bool ParseSpec(const std::string &Path, Spec &Out, std::string &Err)
         {
             LayerSpec LS;
             std::string Type = L.at("type").get<std::string>();
-            if      (Type == "dir")  LS.type = LayerType::Dir;
-            else if (Type == "zip")  LS.type = LayerType::Zip;
-            else if (Type == "file") LS.type = LayerType::File;
+            if      (Type == "dir")   LS.type = LayerType::Dir;
+            else if (Type == "zip")   LS.type = LayerType::Zip;
+            else if (Type == "file")  LS.type = LayerType::File;
+            else if (Type == "delta") LS.type = LayerType::Delta;   // a .vgdelta over the same-target layer below
             else { Err = "unknown layer type: " + Type; return false; }
             LS.source  = L.at("source").get<std::string>();
             LS.target  = NormalizeVPath(L.value("target", std::string()));

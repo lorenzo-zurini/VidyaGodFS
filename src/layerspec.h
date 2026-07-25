@@ -10,7 +10,7 @@
 //one per launch (TempPath/vidyagodfs.spec.json) describing an ordered, target-rooted layer stack;
 //the helper serves the merged tree from it. See the plan / README for the format.
 
-enum class LayerType { Dir, Zip, File };
+enum class LayerType { Dir, Zip, File, Delta };
 
 struct LayerSpec {
     LayerType   type = LayerType::Dir;

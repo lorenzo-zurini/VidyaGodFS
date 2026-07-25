@@ -69,8 +69,16 @@ static void CollectChildren(VfsState *S, const std::string &v, std::set<std::str
     }
     if (opaque) S->hasOpaque.store(true, std::memory_order_relaxed); // enable Resolve masking lazily
 
+    // A delta-backed (opaque) layer covering v masks every LOWER same-subtree layer's children (deletions in
+    // the newer version must not resurface from the base it was diffed against). Find the highest such layer.
+    int opaquePrio = -1;
+    for (const Layer &L : S->layers)
+        if (L.opaque && LayerCovers(L, v) && L.priority > opaquePrio) opaquePrio = L.priority;
+
     for (const Layer &L : S->layers)
     {
+        if (L.priority < opaquePrio) continue;   // masked by a higher opaque layer over this subtree
+
         // Real entries of a covering dir/zip layer — skipped when this dir is opaque.
         if (!opaque && LayerCovers(L, v))
         {

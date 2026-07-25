@@ -1,48 +1,34 @@
 #include "ziplayer.h"
 #include "layerspec.h"   // NormalizeVPath
 
+#include <zip.h>
 #include <cstring>
 #include <cerrno>
 #include <algorithm>
-#include <unistd.h>
-#include <fcntl.h>
 #include <sys/stat.h>
 #include <iostream>
 
-ZipIndex::~ZipIndex()
-{
-    if (archive) zip_close(archive);
-    if (rawFd >= 0) ::close(rawFd);
-}
-
-// ---- little-endian readers + pread helper --------------------------------
+// ---- little-endian readers -----------------------------------------------
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static uint32_t rd32(const uint8_t *p) { return (uint32_t)(p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24)); }
 static uint64_t rd64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; --i) v = (v << 8) | p[i]; return v; }
 
-static bool PreadAll(int fd, void *buf, size_t n, uint64_t off)
-{
-    uint8_t *p = (uint8_t *)buf; size_t done = 0;
-    while (done < n) { ssize_t r = ::pread(fd, p + done, n - done, (off_t)(off + done)); if (r <= 0) return false; done += (size_t)r; }
-    return true;
-}
-
 // ---- zip central-directory parsing (for STORED data offsets) --------------
+// Reads through a ByteSource so a delta-backed archive parses exactly like a plain file.
 
 //Walks the central directory and returns normalized-name → local-header offset (ZIP64-aware).
 //Empty on any parse failure (callers then fall back to libzip extraction — no STORED zero-copy).
-static std::unordered_map<std::string, uint64_t> ParseCentralDirOffsets(int fd)
+static std::unordered_map<std::string, uint64_t> ParseCentralDirOffsets(ByteSource &src)
 {
     std::unordered_map<std::string, uint64_t> out;
-    struct stat stt; if (::fstat(fd, &stt) != 0) return out;
-    uint64_t fsize = (uint64_t)stt.st_size;
+    uint64_t fsize = src.size();
     if (fsize < 22) return out;
 
     // Locate the End Of Central Directory by scanning the tail for its signature.
     uint64_t tail = std::min<uint64_t>(fsize, 22 + 65535);
     std::vector<uint8_t> buf(tail);
-    if (!PreadAll(fd, buf.data(), tail, fsize - tail)) return out;
+    if (!src.preadAll(buf.data(), tail, fsize - tail)) return out;
     long eocd = -1;
     for (long i = (long)tail - 22; i >= 0; --i)
         if (rd32(&buf[i]) == 0x06054b50u) { eocd = i; break; }
@@ -58,10 +44,10 @@ static std::unordered_map<std::string, uint64_t> ParseCentralDirOffsets(int fd)
     {
         if (eocdFileOff < 20) return out;
         uint8_t loc[20];
-        if (!PreadAll(fd, loc, 20, eocdFileOff - 20) || rd32(loc) != 0x07064b50u) return out;
+        if (!src.preadAll(loc, 20, eocdFileOff - 20) || rd32(loc) != 0x07064b50u) return out;
         uint64_t z64off = rd64(loc + 8);
         uint8_t z64[56];
-        if (!PreadAll(fd, z64, 56, z64off) || rd32(z64) != 0x06064b50u) return out;
+        if (!src.preadAll(z64, 56, z64off) || rd32(z64) != 0x06064b50u) return out;
         totalEntries = rd64(z64 + 32);
         cdOffset     = rd64(z64 + 48);
     }
@@ -70,23 +56,22 @@ static std::unordered_map<std::string, uint64_t> ParseCentralDirOffsets(int fd)
     for (uint64_t i = 0; i < totalEntries; ++i)
     {
         uint8_t rec[46];
-        if (!PreadAll(fd, rec, 46, pos) || rd32(rec) != 0x02014b50u) break;
+        if (!src.preadAll(rec, 46, pos) || rd32(rec) != 0x02014b50u) break;
         uint16_t nameLen  = rd16(rec + 28);
         uint16_t extraLen = rd16(rec + 30);
         uint16_t commLen  = rd16(rec + 32);
-        uint16_t diskStart16  = rd16(rec + 34);
         uint32_t compSize32   = rd32(rec + 20);
         uint32_t uncompSize32 = rd32(rec + 24);
         uint64_t lhOffset     = rd32(rec + 42);
 
         std::vector<uint8_t> name(nameLen);
-        if (nameLen && !PreadAll(fd, name.data(), nameLen, pos + 46)) break;
+        if (nameLen && !src.preadAll(name.data(), nameLen, pos + 46)) break;
 
         // Pull the 64-bit local-header offset from the ZIP64 extra when the 32-bit field is a sentinel.
         if (lhOffset == 0xFFFFFFFFu)
         {
             std::vector<uint8_t> extra(extraLen);
-            if (extraLen && PreadAll(fd, extra.data(), extraLen, pos + 46 + nameLen))
+            if (extraLen && src.preadAll(extra.data(), extraLen, pos + 46 + nameLen))
             {
                 size_t e = 0;
                 while (e + 4 <= (size_t)extraLen)
@@ -114,13 +99,64 @@ static std::unordered_map<std::string, uint64_t> ParseCentralDirOffsets(int fd)
 }
 
 //Returns the absolute data offset of the entry whose local header is at lhOffset, or UINT64_MAX.
-static uint64_t LocalDataOffset(int fd, uint64_t lhOffset)
+static uint64_t LocalDataOffset(ByteSource &src, uint64_t lhOffset)
 {
     uint8_t lh[30];
-    if (!PreadAll(fd, lh, 30, lhOffset) || rd32(lh) != 0x04034b50u) return UINT64_MAX;
+    if (!src.preadAll(lh, 30, lhOffset) || rd32(lh) != 0x04034b50u) return UINT64_MAX;
     // The LOCAL header's name/extra lengths (which can differ from the central ones) set where data starts.
     return lhOffset + 30 + rd16(lh + 26) + rd16(lh + 28);
 }
+
+// ---- libzip custom source over a ByteSource -------------------------------
+// Lets libzip enumerate entries of an archive whose bytes are not a plain file (a delta view). Read-only,
+// seekable; the actual STORED data reads still bypass libzip via the manual CD offsets above.
+
+namespace {
+struct ZipSrcUD {
+    std::shared_ptr<ByteSource> src;
+    uint64_t   pos = 0;
+    zip_error_t err;
+};
+
+zip_int64_t ZipSrcCb(void *ud0, void *data, zip_uint64_t len, zip_source_cmd_t cmd)
+{
+    auto *ud = static_cast<ZipSrcUD *>(ud0);
+    switch (cmd)
+    {
+        case ZIP_SOURCE_OPEN:  ud->pos = 0; return 0;
+        case ZIP_SOURCE_CLOSE: return 0;
+        case ZIP_SOURCE_READ: {
+            ssize_t r = ud->src->pread(data, (size_t)len, ud->pos);
+            if (r < 0) { zip_error_set(&ud->err, ZIP_ER_READ, EIO); return -1; }
+            ud->pos += (uint64_t)r;
+            return r;
+        }
+        case ZIP_SOURCE_SEEK: {
+            zip_int64_t off = zip_source_seek_compute_offset(ud->pos, ud->src->size(), data, len, &ud->err);
+            if (off < 0) return -1;
+            ud->pos = (uint64_t)off;
+            return 0;
+        }
+        case ZIP_SOURCE_TELL: return (zip_int64_t)ud->pos;
+        case ZIP_SOURCE_STAT: {
+            auto *st = static_cast<zip_stat_t *>(data);
+            if (len < sizeof(zip_stat_t)) return -1;
+            zip_stat_init(st);
+            st->size        = ud->src->size();
+            st->comp_size   = ud->src->size();
+            st->comp_method = ZIP_CM_STORE;
+            st->valid       = ZIP_STAT_SIZE | ZIP_STAT_COMP_SIZE | ZIP_STAT_COMP_METHOD;
+            return sizeof(zip_stat_t);
+        }
+        case ZIP_SOURCE_ERROR:    return zip_error_to_data(&ud->err, data, len);
+        case ZIP_SOURCE_SUPPORTS: return zip_source_make_command_bitmap(
+            ZIP_SOURCE_OPEN, ZIP_SOURCE_READ, ZIP_SOURCE_CLOSE, ZIP_SOURCE_STAT, ZIP_SOURCE_SEEK,
+            ZIP_SOURCE_TELL, ZIP_SOURCE_SUPPORTS, ZIP_SOURCE_ERROR, ZIP_SOURCE_FREE, -1);
+        case ZIP_SOURCE_FREE:     delete ud; return 0;
+        default:                  zip_error_set(&ud->err, ZIP_ER_OPNOTSUPP, 0); return -1;
+    }
+}
+} // namespace
 
 // ---- index ---------------------------------------------------------------
 
@@ -139,24 +175,30 @@ static void RegisterParents(ZipIndex &Z, const std::string &vrel)
     }
 }
 
-std::shared_ptr<ZipIndex> BuildZipIndex(const std::string &ArchivePath)
+std::shared_ptr<ZipIndex> BuildZipIndex(std::shared_ptr<ByteSource> Src, const std::string &Name)
 {
-    int err = 0;
-    zip_t *za = zip_open(ArchivePath.c_str(), ZIP_RDONLY, &err);
+    if (!Src) return nullptr;
+
+    zip_error_t ze; zip_error_init(&ze);
+    auto *ud = new ZipSrcUD{ Src, 0, {} };
+    zip_error_init(&ud->err);
+    zip_source_t *zs = zip_source_function_create(ZipSrcCb, ud, &ze);
+    if (!zs) { delete ud; std::cerr << "[vidyagodfs] zip_source_create failed for " << Name << "\n"; return nullptr; }
+
+    zip_t *za = zip_open_from_source(zs, ZIP_RDONLY, &ze);
     if (!za)
     {
-        std::cerr << "[vidyagodfs] zip_open failed for " << ArchivePath << " (err " << err << ")\n";
+        std::cerr << "[vidyagodfs] zip_open failed for " << Name << " (" << zip_error_strerror(&ze) << ")\n";
+        zip_source_free(zs);   // invokes ZIP_SOURCE_FREE → deletes ud
         return nullptr;
     }
 
     auto Z = std::make_shared<ZipIndex>();
-    Z->archivePath = ArchivePath;
-    Z->archive = za;
-    Z->rawFd = ::open(ArchivePath.c_str(), O_RDONLY);
+    Z->archivePath = Name;
+    Z->src = Src;
 
-    // Local-header offsets for STORED zero-copy (empty if the raw fd or CD parse is unavailable).
-    auto lhOffsets = (Z->rawFd >= 0) ? ParseCentralDirOffsets(Z->rawFd)
-                                     : std::unordered_map<std::string, uint64_t>();
+    // Local-header offsets for STORED zero-copy (empty if the CD parse is unavailable).
+    auto lhOffsets = ParseCentralDirOffsets(*Src);
 
     zip_int64_t n = zip_get_num_entries(za, 0);
     for (zip_int64_t i = 0; i < n; ++i)
@@ -192,12 +234,12 @@ std::shared_ptr<ZipIndex> BuildZipIndex(const std::string &ArchivePath)
             // STORED + unencrypted → resolve the data offset for zero-copy pread.
             bool storeMethod = (st.valid & ZIP_STAT_COMP_METHOD) && st.comp_method == ZIP_CM_STORE;
             bool encrypted   = (st.valid & ZIP_STAT_ENCRYPTION_METHOD) && st.encryption_method != ZIP_EM_NONE;
-            if (storeMethod && !encrypted && Z->rawFd >= 0)
+            if (storeMethod && !encrypted)
             {
                 auto it = lhOffsets.find(vrel);
                 if (it != lhOffsets.end())
                 {
-                    uint64_t doff = LocalDataOffset(Z->rawFd, it->second);
+                    uint64_t doff = LocalDataOffset(*Src, it->second);
                     if (doff != UINT64_MAX) { e.stored = true; e.dataOffset = doff; }
                 }
             }
@@ -205,6 +247,8 @@ std::shared_ptr<ZipIndex> BuildZipIndex(const std::string &ArchivePath)
         }
         RegisterParents(*Z, vrel);
     }
+
+    zip_close(za);   // frees the source → ZIP_SOURCE_FREE → deletes ud (Z->src keeps the ByteSource alive)
     return Z;
 }
 
@@ -214,17 +258,17 @@ int OpenZipEntry(ZipIndex &Z, const ZipEntry &E, ZipReader &Out)
 {
     Out.size = E.size;
 
-    // Only STORED entries are servable — zero-copy pread directly on the archive (no materialization).
+    // Only STORED entries are servable — zero-copy through the ByteSource (no materialization).
     if (E.stored)
     {
         Out.stored = true;
-        Out.storedFd = Z.rawFd;
+        Out.src = Z.src.get();
         Out.dataOffset = E.dataOffset;
         return 0;
     }
 
-    // Compressed entry: unsupported. The app blocks non-STORE zips before mounting (with a re-zip
-    // dialog); this only fires if one slips through.
+    // Compressed entry: unsupported. The app blocks non-STORE zips before mounting (with a re-zip dialog);
+    // this only fires if one slips through.
     std::cerr << "[vidyagodfs] refusing compressed zip entry '" << E.name << "' in " << Z.archivePath
               << " — re-zip the package with 'zip -0' (STORE)\n";
     return -EIO;
@@ -233,11 +277,11 @@ int OpenZipEntry(ZipIndex &Z, const ZipEntry &E, ZipReader &Out)
 int ReadZipEntry(ZipReader &R, char *Buf, size_t Size, off_t Off)
 {
     if (Off < 0) return -EINVAL;
-    if (!R.stored) return -EIO;
+    if (!R.stored || !R.src) return -EIO;
     if ((uint64_t)Off >= R.size) return 0;
     size_t avail = (size_t)(R.size - (uint64_t)Off);
     size_t want = Size < avail ? Size : avail;
 
-    ssize_t got = ::pread(R.storedFd, Buf, want, (off_t)(R.dataOffset + (uint64_t)Off));
-    return got < 0 ? -errno : (int)got;
+    ssize_t got = R.src->pread(Buf, want, R.dataOffset + (uint64_t)Off);
+    return (int)got;   // >=0 bytes, or a negative -errno propagated from the ByteSource
 }

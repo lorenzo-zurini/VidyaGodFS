@@ -20,6 +20,10 @@ struct Layer {
     std::string target;      // normalized virtual subtree root ("" == mount root); for File, the containing dir
     std::string subpath;     // path within source exposed at target ("" == whole source). dir/zip only.
     bool        rw = false;  // Dir + rw:true = RW passthrough (writes go straight to source)
+    // A delta-backed zip reconstructs a COMPLETE archive, so it fully masks lower same-target layers (a file
+    // deleted in the newer version must not leak up from the base it was diffed against). opaque=true → for
+    // this layer's target subtree, only it (and higher-priority layers) contribute; lower layers are hidden.
+    bool        opaque = false;
     int         priority = 0;
     std::shared_ptr<ZipIndex> zip;  // Zip layers only
     std::string fileVPath;   // File layers only: target [+ "/"] + basename(source)
