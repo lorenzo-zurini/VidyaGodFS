@@ -167,19 +167,38 @@ std::shared_ptr<DeltaByteSource> DeltaByteSource::Create(std::shared_ptr<ByteSou
     return D;
 }
 
-int DeltaByteSource::readAdd(const AddSource &A, uint8_t *buf, size_t n, uint64_t addOff) {
+std::shared_ptr<std::vector<uint8_t>> DeltaByteSource::GetAddBlock(uint32_t addSrc, const AddSource &A, uint64_t blk) {
+    uint64_t key = ((uint64_t)addSrc << 40) ^ blk;
+    {
+        std::lock_guard<std::mutex> g(CacheMu);
+        auto it = BlockCache.find(key);
+        if (it != BlockCache.end()) return it->second;
+    }
+    const BlockRec &b = A.blocks[blk];                          // decompress outside the lock
+    std::vector<uint8_t> comp(b.compLen);
+    if (b.compLen && !A.file->preadAll(comp.data(), b.compLen, A.regionOff + b.compOff)) return nullptr;
+    auto raw = std::make_shared<std::vector<uint8_t>>(ZDecompress(comp.data(), b.compLen, b.uncompLen));
+    if (raw->size() != b.uncompLen) return nullptr;
+    {
+        std::lock_guard<std::mutex> g(CacheMu);
+        if (BlockCache.emplace(key, raw).second) {             // first insert of this key → track for eviction
+            CacheFifo.push_back(key);
+            if (CacheFifo.size() > CacheCap) { BlockCache.erase(CacheFifo.front()); CacheFifo.pop_front(); }
+        }
+    }
+    return raw;
+}
+
+int DeltaByteSource::readAdd(uint32_t addSrc, const AddSource &A, uint8_t *buf, size_t n, uint64_t addOff) {
     while (n > 0) {
         uint64_t b = addOff / A.blockSize;
         uint32_t intra = (uint32_t)(addOff % A.blockSize);
         if (b >= A.blocks.size()) return -EIO;
-        const BlockRec &blk = A.blocks[b];
-        std::vector<uint8_t> comp(blk.compLen);
-        if (blk.compLen && !A.file->preadAll(comp.data(), blk.compLen, A.regionOff + blk.compOff)) return -EIO;
-        std::vector<uint8_t> raw = ZDecompress(comp.data(), blk.compLen, blk.uncompLen);
-        if (raw.size() != blk.uncompLen || intra > blk.uncompLen) return -EIO;
-        size_t avail = blk.uncompLen - intra;
+        auto raw = GetAddBlock(addSrc, A, b);
+        if (!raw || intra > raw->size()) return -EIO;
+        size_t avail = raw->size() - intra;
         size_t take  = n < avail ? n : avail;
-        std::memcpy(buf, raw.data() + intra, take);
+        std::memcpy(buf, raw->data() + intra, take);
         buf += take; n -= take; addOff += take;
     }
     return 0;
@@ -211,7 +230,7 @@ ssize_t DeltaByteSource::pread(void *buf, size_t n, uint64_t off) {
             }
         } else {
             uint64_t asrc = s.srcOff + (pos - s.targetOff);
-            if (int e = readAdd(*AddSources[s.addSrc], out + done, chunk, asrc)) return e;
+            if (int e = readAdd(s.addSrc, *AddSources[s.addSrc], out + done, chunk, asrc)) return e;
         }
         done += chunk; pos += chunk; ++idx;
     }
@@ -222,7 +241,9 @@ ssize_t DeltaByteSource::pread(void *buf, size_t n, uint64_t off) {
 // GenerateDelta — rolling-hash + greedy-extend matcher
 // =================================================================================================
 
-static constexpr uint32_t ANCHOR = 1024;   // min match seed; runs >= ~2*ANCHOR are reliably found
+static constexpr uint32_t ANCHOR = 256;    // min match seed; runs >= ~2*ANCHOR are reliably found. 256 (not 1024)
+                                           // so the matcher recovers the sub-KB scattered COPYs that per-version
+                                           // reobfuscation churn produces — the dominant delta-size lever (~27%).
 static constexpr uint64_t RK_R    = 131;
 
 static uint64_t PowR(uint64_t exp) { uint64_t r = 1, b = RK_R; while (exp) { if (exp & 1) r *= b; b *= b; exp >>= 1; } return r; }
@@ -286,7 +307,8 @@ std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
     std::vector<uint8_t>  addRegion;
     for (size_t o = 0; o < addStream.size(); o += blockSize) {
         uint32_t ul = (uint32_t)std::min<size_t>(blockSize, addStream.size() - o);
-        std::vector<uint8_t> c = ZCompress(addStream.data() + o, ul, 12);   // ADD blocks: fast level, tables use 19
+        std::vector<uint8_t> c = ZCompress(addStream.data() + o, ul, 19);   // ADD blocks + tables both at 19 (decode
+                                                                            // cost is level-independent, so max the ratio)
         blocks.push_back({ (uint64_t)addRegion.size(), (uint32_t)c.size(), ul });
         addRegion.insert(addRegion.end(), c.begin(), c.end());
     }

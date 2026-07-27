@@ -4,8 +4,11 @@
 #include "bytesource.h"
 
 #include <cstdint>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -30,7 +33,8 @@ namespace vgdelta {
 
 constexpr char     MAGIC[4]         = { 'V', 'G', 'D', '1' };
 constexpr uint32_t VERSION          = 1;
-constexpr uint32_t DEFAULT_BLOCK    = 65536;
+constexpr uint32_t DEFAULT_BLOCK    = 262144;   // 256K: bigger ADD frames compress ~3% better than 64K while keeping
+                                                // per-read decompression bounded (the reader decompresses one block per read)
 constexpr uint8_t  KIND_COPY        = 0;
 constexpr uint8_t  KIND_ADD         = 1;
 
@@ -79,12 +83,21 @@ public:
     uint64_t size() const override { return TargetSize; }
 
 private:
-    int readAdd(const AddSource &A, uint8_t *buf, size_t n, uint64_t addOff);
+    int readAdd(uint32_t addSrc, const AddSource &A, uint8_t *buf, size_t n, uint64_t addOff);
+    // Decompressed ADD block, cached. Reads (esp. zip enumeration: thousands of small scattered reads) otherwise
+    // re-decompress the same block over and over — expensive once blocks are large. FIFO-capped, mutex-guarded
+    // (pread is a concurrent-safe contract). Key = (addSrc << 40) ^ blockIdx.
+    std::shared_ptr<std::vector<uint8_t>> GetAddBlock(uint32_t addSrc, const AddSource &A, uint64_t blk);
 
     std::shared_ptr<ByteSource>              BaseSrc;    // the ULTIMATE (non-delta) base — for COPY
     std::vector<std::shared_ptr<AddSource>>  AddSources; // one per delta file surviving in the flattened chain
     std::vector<FlatSeg>                     Segs;       // flat, sorted by targetOff, gap-free over [0,TargetSize)
     uint64_t                                 TargetSize = 0;
+
+    std::mutex                                                        CacheMu;
+    std::unordered_map<uint64_t, std::shared_ptr<std::vector<uint8_t>>> BlockCache;
+    std::deque<uint64_t>                                             CacheFifo;
+    static constexpr size_t                                          CacheCap = 64;   // 64 blocks (~16 MB at 256K)
 };
 
 // Generates a .vgdelta reconstructing `target` from `base` (both fully in memory — authoring is a one-shot
