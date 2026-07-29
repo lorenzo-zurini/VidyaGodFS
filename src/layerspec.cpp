@@ -43,6 +43,8 @@ bool ParseSpec(const std::string &Path, Spec &Out, std::string &Err)
             LS.source  = L.at("source").get<std::string>();
             LS.target  = NormalizeVPath(L.value("target", std::string()));
             LS.baseTarget = NormalizeVPath(L.value("baseTarget", std::string()));   // delta cross-target base (empty = same-target)
+            if (L.contains("baseTargets") && L["baseTargets"].is_array())            // MULTI-BASE: ordered concat of bases
+                for (const auto &T : L["baseTargets"]) if (T.is_string()) LS.baseTargets.push_back(NormalizeVPath(T.get<std::string>()));
             LS.rw      = L.value("rw", false);
             // SUBMOUNTS: array of Docker-style "src:dst" strings → (source,target) pairs (split on first ':').
             if (L.contains("submounts") && L["submounts"].is_array())

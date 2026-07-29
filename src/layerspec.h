@@ -19,6 +19,10 @@ struct LayerSpec {
     std::string baseTarget;  // DELTA only: target of the byte-base zip when it lives at a DIFFERENT target than
                              // `target` (cross-target delta, e.g. a root-mounted complete archive diffed over a
                              // sub-target base). Empty == same as `target` (the ordinary overlay-relative delta).
+    std::vector<std::string> baseTargets;  // DELTA only, MULTI-BASE: the delta's base is the CONCATENATION (in this
+                             // exact order) of the composed views at these targets — one delta dedups against several
+                             // sources at once (e.g. a prefix over [wine, dxvk, prev-prefix]). Non-empty overrides
+                             // `baseTarget`. A single entry == a plain cross-target delta.
     // SUBMOUNTS (dir/zip only): Docker-style "src:dst" mounts of paths WITHIN source. Each (source,target)
     // pair is normalized and fanned out into its own single-subpath internal layer at Init. Empty → mount the
     // whole source at `target`. A pair's `first` is the in-source path ("" == whole source), `second` the dest.

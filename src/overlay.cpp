@@ -79,12 +79,34 @@ bool VfsState::Init(const Spec &S, std::string &Err)
                 // Base = the composed view at this delta's base target. Normally that's its OWN target (the zip
                 // directly below), but a cross-target delta names a different `baseTarget` — e.g. a complete
                 // archive mounted at the package root, diffed over a base zip that mounts at a sub-target.
-                const std::string &baseTgt = LS.baseTarget.empty() ? LS.target : LS.baseTarget;
-                auto bit = baseByTarget.find(baseTgt);
-                if (bit == baseByTarget.end() || !bit->second)
-                { std::cerr << "[vidyagodfs] delta layer has no base at target '" << baseTgt << "': " << LS.source << "\n"; continue; }
+                // MULTI-BASE (baseTargets): the byte-base is the CONCATENATION of those composed views, in order —
+                // one delta dedups against several sources at once (e.g. a prefix over [wine, dxvk, prev-prefix]).
+                // Else the single (cross-)target base. Concat parts are ByteSources (often flattened delta chains);
+                // nothing is materialized. The order MUST match what generation concatenated.
+                std::shared_ptr<ByteSource> base;
+                if (!LS.baseTargets.empty())
+                {
+                    std::vector<std::shared_ptr<ByteSource>> bs; bool ok = true;
+                    for (const std::string &t : LS.baseTargets)
+                    {
+                        auto bit = baseByTarget.find(t);
+                        if (bit == baseByTarget.end() || !bit->second)
+                        { std::cerr << "[vidyagodfs] delta multi-base missing target '" << t << "': " << LS.source << "\n"; ok = false; break; }
+                        bs.push_back(bit->second);
+                    }
+                    if (!ok) continue;
+                    base = bs.size() == 1 ? bs[0] : std::make_shared<ConcatByteSource>(bs);
+                }
+                else
+                {
+                    const std::string &baseTgt = LS.baseTarget.empty() ? LS.target : LS.baseTarget;
+                    auto bit = baseByTarget.find(baseTgt);
+                    if (bit == baseByTarget.end() || !bit->second)
+                    { std::cerr << "[vidyagodfs] delta layer has no base at target '" << baseTgt << "': " << LS.source << "\n"; continue; }
+                    base = bit->second;
+                }
                 std::string derr;
-                auto ds = vgdelta::DeltaByteSource::Create(src, bit->second, derr, false);
+                auto ds = vgdelta::DeltaByteSource::Create(src, base, derr, false);
                 if (!ds) { std::cerr << "[vidyagodfs] bad delta " << LS.source << ": " << derr << "\n"; continue; }
                 src = ds;
                 opaque = true;   // a reconstructed archive is complete → mask anything below at this target

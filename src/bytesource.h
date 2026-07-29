@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cerrno>
 #include <vector>
+#include <memory>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -63,6 +64,49 @@ struct MemByteSource : ByteSource {
         return static_cast<ssize_t>(want);
     }
     uint64_t size() const override { return data.size(); }
+};
+
+// ---------------------------------------------------------------------------
+// ConcatByteSource — stitches N ByteSources into ONE contiguous address space, back to back in a fixed order.
+// This is what makes a MULTI-BASE delta possible with NO format change: a .vgdelta's COPY offsets index into
+// this concatenation, so one delta can pull identical runs from wine ‖ dxvk ‖ prev-prefix ‖ … The parts are
+// themselves ByteSources (often DeltaByteSources reconstructing their own chains) — nothing is materialized;
+// pread dispatches to the part covering an offset and splits reads that straddle a boundary. Order + each
+// part's bytes must match what generation concatenated (deterministic reconstruction guarantees this).
+// ---------------------------------------------------------------------------
+struct ConcatByteSource : ByteSource {
+    struct Part { std::shared_ptr<ByteSource> src; uint64_t start; uint64_t len; };
+    std::vector<Part> parts;
+    uint64_t total = 0;
+    explicit ConcatByteSource(const std::vector<std::shared_ptr<ByteSource>> &sources) {
+        for (const auto &s : sources) {
+            const uint64_t len = s ? s->size() : 0;
+            parts.push_back({s, total, len});
+            total += len;
+        }
+    }
+    ssize_t pread(void *buf, size_t n, uint64_t off) override {
+        if (off >= total) return 0;
+        uint8_t *p = static_cast<uint8_t *>(buf);
+        size_t done = 0;
+        while (done < n && off + done < total) {
+            const uint64_t pos = off + done;
+            // locate the part covering `pos` (binary search over start offsets; parts are ordered + contiguous)
+            size_t lo = 0, hi = parts.size();
+            while (lo + 1 < hi) { size_t mid = (lo + hi) / 2; if (parts[mid].start <= pos) lo = mid; else hi = mid; }
+            const Part &pt = parts[lo];
+            if (pt.len == 0 || pos >= pt.start + pt.len) break;   // gap/empty part → stop (short read)
+            const uint64_t local = pos - pt.start;
+            size_t want = n - done;
+            const uint64_t avail = pt.len - local;
+            if (want > avail) want = static_cast<size_t>(avail);
+            const ssize_t r = pt.src->pread(p + done, want, local);
+            if (r <= 0) return done > 0 ? static_cast<ssize_t>(done) : r;
+            done += static_cast<size_t>(r);
+        }
+        return static_cast<ssize_t>(done);
+    }
+    uint64_t size() const override { return total; }
 };
 
 #endif // VIDYAGODFS_BYTESOURCE_H
