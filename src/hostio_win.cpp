@@ -288,11 +288,18 @@ int Symlink(const std::string &target, const std::string &linkpath)
 
 int Statvfs(const std::string &path, StatvfsInfo &out)
 {
-    ULARGE_INTEGER avail, total, free;
-    if (!::GetDiskFreeSpaceExW(Wide(path).c_str(), &avail, &total, &free)) return Err();
+    // GetDiskFreeSpaceExW wants a directory or volume — unlike POSIX statvfs it FAILS on a plain
+    // file path (and a read-only mount hands us the backing zip's file path). Resolve the containing
+    // volume root first so any path (file, dir, drive) works. This must be robust: WinFsp calls
+    // statfs during mount and aborts the whole mount if it returns an error.
+    std::wstring wp = Wide(path);
+    wchar_t vol[MAX_PATH];
+    const wchar_t *q = (::GetVolumePathNameW(wp.c_str(), vol, MAX_PATH)) ? vol : wp.c_str();
+    ULARGE_INTEGER avail, total, freeb;
+    if (!::GetDiskFreeSpaceExW(q, &avail, &total, &freeb)) return Err();
     out.bsize   = 4096;
     out.blocks  = total.QuadPart / 4096;
-    out.bfree   = free.QuadPart  / 4096;
+    out.bfree   = freeb.QuadPart / 4096;
     out.bavail  = avail.QuadPart / 4096;
     out.files   = 0;
     out.ffree   = 0;
