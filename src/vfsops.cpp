@@ -11,6 +11,12 @@
 #include <cerrno>
 #include <fcntl.h>   // O_* flag constants (passed through to HostIO::Open)
 
+// O_NOFOLLOW (don't follow a trailing symlink on open) has no Windows/MinGW equivalent; define it
+// as a no-op there so `& ~O_NOFOLLOW` compiles and is inert (Windows opens don't traverse symlinks).
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0
+#endif
+
 // ---- neutral helpers -----------------------------------------------------
 
 // Path segment of `path` immediately after the directory `v` ("" = root); "" if not under v.

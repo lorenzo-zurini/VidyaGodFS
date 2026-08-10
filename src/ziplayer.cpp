@@ -226,9 +226,11 @@ std::shared_ptr<ZipIndex> BuildZipIndex(std::shared_ptr<ByteSource> Src, const s
             if (st.valid & ZIP_STAT_SIZE) e.size = st.size;
 
             // Unix symlink? The mode lives in the high 16 bits of the central-dir external attributes.
+            // Check the S_IFLNK bits directly (0170000 mask, 0120000 = symlink) — no POSIX S_ISLNK macro,
+            // which doesn't exist on the MinGW/Windows toolchain.
             zip_uint8_t opsys = 0; zip_uint32_t extAttr = 0;
             if (zip_file_get_external_attributes(za, i, 0, &opsys, &extAttr) == 0 &&
-                opsys == ZIP_OPSYS_UNIX && S_ISLNK((mode_t)(extAttr >> 16)))
+                opsys == ZIP_OPSYS_UNIX && (((extAttr >> 16) & 0170000u) == 0120000u))
                 e.symlink = true;
 
             // STORED + unencrypted → resolve the data offset for zero-copy pread.

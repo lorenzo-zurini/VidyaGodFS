@@ -11,7 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <atomic>
-#include <sys/types.h>
+#include <cstdint>
 
 //A resolved layer in the running filesystem.
 struct Layer {
@@ -35,8 +35,8 @@ struct Layer {
 struct VfsState {
     std::string           writelayer;   // empty when readOnly
     bool                  readOnly = false;
-    uid_t                 uid = 1000;
-    gid_t                 gid = 1000;
+    uint32_t              uid = 1000;    // forced ownership presented by getattr (POSIX uid/gid; inert on Windows)
+    uint32_t              gid = 1000;
     std::vector<Layer>    layers;        // ascending priority (index 0 lowest)
     std::set<std::string> implicitDirs;  // synthesized structural dirs (target parents)
 
