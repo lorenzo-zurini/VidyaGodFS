@@ -9,9 +9,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # per-block-compressed reconstruction).
 find_package(nlohmann_json REQUIRED)
 
-# --- backend-neutral core: no FUSE / WinFsp / raw-POSIX; host I/O goes through the HostIO shim ---
-# (overlay/ziplayer/vgdelta/layerspec are shared by every mount backend). main.cpp still owns the mount
-# lifecycle for now (to be split into a MountSession backend in a later step).
+# --- backend-neutral core: no FUSE / WinFsp / raw-POSIX; host I/O goes through the HostIO shim,
+# the ops through VfsOps, and the mount lifecycle through MountSession. main.cpp only parses the
+# spec, builds the state, and calls MountSession::Run — it knows nothing about the mount backend. ---
 set(VGFS_CORE
     src/main.cpp
     src/layerspec.cpp
@@ -21,13 +21,13 @@ set(VGFS_CORE
     src/vgdelta.cpp
 )
 
-# --- platform-selected mount backend + host-I/O shim ---
+# --- platform-selected mount backend: op adapter + mount lifecycle + host-I/O shim ---
 if(WIN32)
-    # Windows: native WinFsp adapter + Win32 host I/O (added in the WinFsp-backend step).
-    set(VGFS_BACKEND src/winfsp_backend.cpp src/hostio_win.cpp)
+    # Windows: native WinFsp adapter + WinFsp mount lifecycle + Win32 host I/O (added later).
+    set(VGFS_BACKEND src/winfsp_backend.cpp src/mountsession_win.cpp src/hostio_win.cpp)
 else()
-    # Linux: the FUSE adapter (fuseops.cpp) + POSIX host I/O.
-    set(VGFS_BACKEND src/fuseops.cpp src/hostio_posix.cpp)
+    # Linux: the FUSE adapter (fuseops.cpp) + FUSE mount lifecycle + POSIX host I/O.
+    set(VGFS_BACKEND src/fuseops.cpp src/mountsession_fuse.cpp src/hostio_posix.cpp)
 endif()
 
 add_executable(vidyagodfs ${VGFS_CORE} ${VGFS_BACKEND})
