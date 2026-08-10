@@ -39,11 +39,26 @@ set_target_properties(vidyagodfs PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 target_link_libraries(vidyagodfs PRIVATE nlohmann_json::nlohmann_json)
 
 if(WIN32)
-    # WinFsp + libzip/zstd (via vcpkg/find_package on MSYS2/MinGW). Wired in the WinFsp-backend step.
-    find_package(LIBZIP CONFIG REQUIRED)
-    find_package(zstd CONFIG REQUIRED)
-    target_link_libraries(vidyagodfs PRIVATE libzip::zip $<IF:$<TARGET_EXISTS:zstd::libzstd_shared>,zstd::libzstd_shared,zstd::libzstd_static>)
-    # winfsp include/lib wiring goes here.
+    # WinFsp's FUSE-compatibility layer (<fuse3/fuse.h>): header-only glue whose static inlines
+    # load winfsp-x64.dll at runtime, so we only need its include dir — no import lib for the FUSE
+    # API. WINFSP_ROOT is overridable; default to the standard 64-bit install path.
+    set(WINFSP_ROOT "C:/Program Files (x86)/WinFsp" CACHE PATH "WinFsp SDK install root")
+    if(NOT EXISTS "${WINFSP_ROOT}/inc/fuse3/fuse.h")
+        message(FATAL_ERROR "WinFsp SDK not found at ${WINFSP_ROOT} (need inc/fuse3/fuse.h). Set -DWINFSP_ROOT=…")
+    endif()
+    target_include_directories(vidyagodfs PRIVATE "${WINFSP_ROOT}/inc")
+    # The FUSE symbols (fsp_fuse3_*) are __declspec(dllimport) from winfsp-x64.dll. WinFsp's own
+    # fuse3.pc links the DLL directly (MinGW ld generates the import stubs from it); do the same.
+    # winfsp-x64.dll must then be reachable at runtime (WinFsp\bin on PATH, or beside the exe).
+    target_link_libraries(vidyagodfs PRIVATE "${WINFSP_ROOT}/bin/winfsp-x64.dll")
+
+    # libzip + libzstd come from MSYS2/MinGW via pkgconf (they ship .pc files) — same as Linux.
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LIBZIP  REQUIRED IMPORTED_TARGET libzip)
+    pkg_check_modules(LIBZSTD REQUIRED IMPORTED_TARGET libzstd)
+    target_link_libraries(vidyagodfs PRIVATE PkgConfig::LIBZIP PkgConfig::LIBZSTD)
+    # The two Windows backend TUs (winfsp_backend.cpp, mountsession_win.cpp) #define FUSE_USE_VERSION
+    # themselves; hostio_win.cpp needs no FUSE. No _FILE_OFFSET_BITS on Windows.
 else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3)
