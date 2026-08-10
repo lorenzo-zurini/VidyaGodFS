@@ -17,6 +17,7 @@ set(VGFS_CORE
     src/layerspec.cpp
     src/ziplayer.cpp
     src/overlay.cpp
+    src/vfsops.cpp
     src/vgdelta.cpp
 )
 
