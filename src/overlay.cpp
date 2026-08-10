@@ -1,14 +1,13 @@
 #include "overlay.h"
 #include "vgdelta.h"
+#include "hostio.h"     // all host filesystem I/O goes through the backend-neutral shim
 
 #include <filesystem>
 #include <fstream>
 #include <cstring>
 #include <cerrno>
 #include <unordered_map>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
+#include <fcntl.h>      // O_RDONLY / O_CREAT / O_WRONLY / O_TRUNC flag constants (passed to HostIO::Open)
 #include <iostream>
 
 namespace fs = std::filesystem;
@@ -68,11 +67,11 @@ bool VfsState::Init(const Spec &S, std::string &Err)
         bool opaque = false;
         if (LS.type == LayerType::Zip || LS.type == LayerType::Delta)
         {
-            int fd = ::open(LS.source.c_str(), O_RDONLY);
+            HostIO::Fd fd = HostIO::Open(LS.source, O_RDONLY);
             if (fd < 0) { std::cerr << "[vidyagodfs] skipping unreadable layer: " << LS.source << "\n"; continue; }
-            struct stat stt;
-            if (::fstat(fd, &stt) != 0) { ::close(fd); continue; }
-            std::shared_ptr<ByteSource> src = std::make_shared<FdByteSource>(fd, (uint64_t)stt.st_size, true);
+            HostIO::Stat stt;
+            if (HostIO::Fstat(fd, stt) != 0) { HostIO::Close(fd); continue; }
+            std::shared_ptr<ByteSource> src = std::make_shared<FdByteSource>(fd, stt.size, true);
 
             if (LS.type == LayerType::Delta)
             {
@@ -200,8 +199,8 @@ std::string WhiteoutPath(const VfsState &S, const std::string &vrel)
 bool IsWhiteouted(const VfsState &S, const std::string &vrel)
 {
     if (S.writelayer.empty() || vrel.empty()) return false;
-    struct stat st;
-    return ::lstat(WhiteoutPath(S, vrel).c_str(), &st) == 0;
+    HostIO::Stat st;
+    return HostIO::Lstat(WhiteoutPath(S, vrel), st) == 0;
 }
 
 void CreateWhiteout(const VfsState &S, const std::string &vrel)
@@ -209,14 +208,14 @@ void CreateWhiteout(const VfsState &S, const std::string &vrel)
     if (S.writelayer.empty()) return;
     std::error_code ec;
     fs::create_directories(WLPath(S, ParentVRel(vrel)), ec);
-    int fd = ::open(WhiteoutPath(S, vrel).c_str(), O_CREAT | O_WRONLY, 0644);
-    if (fd >= 0) ::close(fd);
+    HostIO::Fd fd = HostIO::Open(WhiteoutPath(S, vrel), O_CREAT | O_WRONLY, 0644);
+    if (fd >= 0) HostIO::Close(fd);
 }
 
 void RemoveWhiteout(const VfsState &S, const std::string &vrel)
 {
     if (S.writelayer.empty()) return;
-    ::unlink(WhiteoutPath(S, vrel).c_str());
+    HostIO::Unlink(WhiteoutPath(S, vrel));
 }
 
 // ---- opaque directories --------------------------------------------------
@@ -229,15 +228,15 @@ static std::string OpaqueMarker(const VfsState &S, const std::string &vrel)
 bool IsOpaqueDir(const VfsState &S, const std::string &vrel)
 {
     if (S.writelayer.empty()) return false;
-    struct stat st;
-    return ::lstat(OpaqueMarker(S, vrel).c_str(), &st) == 0;
+    HostIO::Stat st;
+    return HostIO::Lstat(OpaqueMarker(S, vrel), st) == 0;
 }
 
 void MarkOpaque(VfsState &S, const std::string &vrel)
 {
     if (S.writelayer.empty()) return;
-    int fd = ::open(OpaqueMarker(S, vrel).c_str(), O_CREAT | O_WRONLY, 0644);
-    if (fd >= 0) ::close(fd);
+    HostIO::Fd fd = HostIO::Open(OpaqueMarker(S, vrel), O_CREAT | O_WRONLY, 0644);
+    if (fd >= 0) HostIO::Close(fd);
     S.hasOpaque.store(true, std::memory_order_relaxed);
 }
 
@@ -261,8 +260,8 @@ ResolveResult Resolve(VfsState &S, const std::string &vrel)
     {
         if (IsWhiteouted(S, vrel)) return R; // deleted → None
         std::string wp = WLPath(S, vrel);
-        struct stat st;
-        if (::lstat(wp.c_str(), &st) == 0) { R.kind = HitKind::WriteLayer; R.hostPath = wp; return R; }
+        HostIO::Stat st;
+        if (HostIO::Lstat(wp, st) == 0) { R.kind = HitKind::WriteLayer; R.hostPath = wp; return R; }
         // Not in the writelayer, but masked by an opaque ancestor → the lower layers don't show here.
         if (IsUnderOpaque(S, vrel)) return R;
     }
@@ -277,8 +276,8 @@ ResolveResult Resolve(VfsState &S, const std::string &vrel)
         {
             std::string rel = SourceRel(L, vrel);
             std::string host = rel.empty() ? L.source : (L.source + "/" + rel);
-            struct stat st;
-            if (::lstat(host.c_str(), &st) == 0)
+            HostIO::Stat st;
+            if (HostIO::Lstat(host, st) == 0)
             {
                 R.kind = HitKind::DirLayer; R.hostPath = host; R.layer = &L; R.rwPassthrough = L.rw;
                 return R;
@@ -286,8 +285,8 @@ ResolveResult Resolve(VfsState &S, const std::string &vrel)
         }
         else if (L.type == LayerType::File)
         {
-            struct stat st;
-            if (::lstat(L.source.c_str(), &st) == 0)
+            HostIO::Stat st;
+            if (HostIO::Lstat(L.source, st) == 0)
             {
                 R.kind = HitKind::FileLayer; R.hostPath = L.source; R.layer = &L;
                 return R;
@@ -349,14 +348,14 @@ int CopyUp(VfsState &S, const std::string &vrel, const ResolveResult &rr)
     std::lock_guard<std::mutex> g(*lock);
 
     std::string dst = WLPath(S, vrel);
-    struct stat st;
-    if (::lstat(dst.c_str(), &st) == 0) return 0;       // another thread already copied it up
+    HostIO::Stat st;
+    if (HostIO::Lstat(dst, st) == 0) return 0;          // another thread already copied it up
 
     if (int e = EnsureWriteParent(S, vrel); e != 0) return e;
 
     // Directory copy-up: just create the dir in the writelayer.
     bool isDir = (rr.kind == HitKind::ImplicitDir) ||
-                 (rr.kind == HitKind::DirLayer && ::lstat(rr.hostPath.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) ||
+                 (rr.kind == HitKind::DirLayer && HostIO::Lstat(rr.hostPath, st) == 0 && st.isDir) ||
                  (rr.kind == HitKind::ZipEntry && (rr.zipEntry == nullptr || rr.zipEntry->isDir));
     if (isDir)
     {
@@ -374,21 +373,19 @@ int CopyUp(VfsState &S, const std::string &vrel, const ResolveResult &rr)
         int got = ReadZipEntry(zr, tgt.data(), tgt.size(), 0);
         if (got < 0) return got;
         tgt.resize(got);
-        return ::symlink(tgt.c_str(), dst.c_str()) == 0 ? 0 : -errno;
+        return HostIO::Symlink(tgt, dst);
     }
     if ((rr.kind == HitKind::DirLayer || rr.kind == HitKind::FileLayer) &&
-        ::lstat(rr.hostPath.c_str(), &st) == 0 && S_ISLNK(st.st_mode))
+        HostIO::Lstat(rr.hostPath, st) == 0 && st.isSymlink)
     {
-        char tgt[4096];
-        ssize_t n = ::readlink(rr.hostPath.c_str(), tgt, sizeof tgt - 1);
-        if (n < 0) return -errno;
-        tgt[n] = '\0';
-        return ::symlink(tgt, dst.c_str()) == 0 ? 0 : -errno;
+        std::string tgt;
+        if (int e = HostIO::Readlink(rr.hostPath, tgt); e != 0) return e;
+        return HostIO::Symlink(tgt, dst);
     }
 
     // File copy-up: materialize full content into the writelayer.
-    int out = ::open(dst.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    if (out < 0) return -errno;
+    HostIO::Fd out = HostIO::Open(dst, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (out < 0) return out;
 
     int rc = 0;
     if (rr.kind == HitKind::ZipEntry && rr.zipEntry)
@@ -404,27 +401,27 @@ int CopyUp(VfsState &S, const std::string &vrel, const ResolveResult &rr)
                 int got = ReadZipEntry(zr, buf, sizeof buf, off);
                 if (got < 0) { rc = got; break; }
                 if (got == 0) break;
-                if (::write(out, buf, (size_t)got) != got) { rc = -EIO; break; }
+                if (HostIO::Write(out, buf, (size_t)got) != got) { rc = -EIO; break; }
                 off += got;
             }
         }
     }
     else // DirLayer or FileLayer host file
     {
-        int in = ::open(rr.hostPath.c_str(), O_RDONLY);
-        if (in < 0) { rc = -errno; }
+        HostIO::Fd in = HostIO::Open(rr.hostPath, O_RDONLY);
+        if (in < 0) { rc = (int)in; }
         else
         {
             char buf[256 * 1024];
             ssize_t got;
-            while ((got = ::read(in, buf, sizeof buf)) > 0)
-                if (::write(out, buf, (size_t)got) != got) { rc = -EIO; break; }
-            if (got < 0 && rc == 0) rc = -errno;
-            ::close(in);
-            if (::lstat(rr.hostPath.c_str(), &st) == 0) ::fchmod(out, st.st_mode & 0777);
+            while ((got = HostIO::Read(in, buf, sizeof buf)) > 0)
+                if (HostIO::Write(out, buf, (size_t)got) != got) { rc = -EIO; break; }
+            if (got < 0 && rc == 0) rc = (int)got;
+            HostIO::Close(in);
+            if (HostIO::Lstat(rr.hostPath, st) == 0) HostIO::Fchmod(out, st.mode & 0777);
         }
     }
-    ::close(out);
-    if (rc != 0) ::unlink(dst.c_str());
+    HostIO::Close(out);
+    if (rc != 0) HostIO::Unlink(dst);
     return rc;
 }

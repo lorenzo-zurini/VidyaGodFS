@@ -8,7 +8,7 @@
 #include <vector>
 #include <memory>
 #include <sys/types.h>
-#include <unistd.h>
+#include "hostio.h"    // host fd I/O behind the backend-neutral shim (Pread/Close)
 
 // ---------------------------------------------------------------------------
 // ByteSource — a random-access, read-only, thread-safe byte stream. This is the ONE abstraction the zip
@@ -44,10 +44,9 @@ struct FdByteSource : ByteSource {
     bool     own = false;
     uint64_t sz  = 0;
     FdByteSource(int f, uint64_t s, bool owns = false) : fd(f), own(owns), sz(s) {}
-    ~FdByteSource() override { if (own && fd >= 0) ::close(fd); }
+    ~FdByteSource() override { if (own && fd >= 0) HostIO::Close(fd); }
     ssize_t pread(void *buf, size_t n, uint64_t off) override {
-        ssize_t r = ::pread(fd, buf, n, static_cast<off_t>(off));
-        return r < 0 ? -errno : r;
+        return HostIO::Pread(fd, buf, n, off);   // returns bytes read (>=0) or -errno
     }
     uint64_t size() const override { return sz; }
 };
