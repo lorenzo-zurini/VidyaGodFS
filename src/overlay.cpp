@@ -279,6 +279,13 @@ ResolveResult Resolve(VfsState &S, const std::string &vrel)
             HostIO::Stat st;
             if (HostIO::Lstat(host, st) == 0)
             {
+                // Symlink abolition: a DATA layer never serves a link. Followable on the host (the layer
+                // source tree is complete there) → serve as the target; dangling → this layer doesn't have
+                // the path (fall through to lower layers). rw (passthrough) layers are EXEMPT like the
+                // writelayer: they hold live guest-written state (persisted user dirs where proton keeps
+                // its own user-path links), which must round-trip as authored.
+                if (S.flattenSymlinks && !L.rw && st.isSymlink && HostIO::StatFollow(host, st) != 0)
+                    continue;
                 R.kind = HitKind::DirLayer; R.hostPath = host; R.layer = &L; R.rwPassthrough = L.rw;
                 return R;
             }
@@ -288,6 +295,8 @@ ResolveResult Resolve(VfsState &S, const std::string &vrel)
             HostIO::Stat st;
             if (HostIO::Lstat(L.source, st) == 0)
             {
+                if (S.flattenSymlinks && st.isSymlink && HostIO::StatFollow(L.source, st) != 0)
+                    continue;
                 R.kind = HitKind::FileLayer; R.hostPath = L.source; R.layer = &L;
                 return R;
             }
@@ -299,8 +308,21 @@ ResolveResult Resolve(VfsState &S, const std::string &vrel)
             bool isDir = (fit != L.zip->byName.end() && fit->second.isDir) || L.zip->dirChildren.count(rel);
             if (fit != L.zip->byName.end() || isDir)
             {
-                R.kind = HitKind::ZipEntry; R.layer = &L;
-                R.zipEntry = (fit != L.zip->byName.end()) ? &fit->second : nullptr; // null → synthesized dir
+                const ZipEntry *e = (fit != L.zip->byName.end()) ? &fit->second : nullptr; // null → synthesized dir
+                // Symlink abolition: chase an archive link to its in-archive target file; a link that
+                // escapes the archive, dangles, or targets a directory simply does not exist in this
+                // layer (fall through — e.g. dosdevices/c: vanishes and wine recreates it at boot in
+                // the writelayer, where runtime symlinks legitimately live).
+                if (S.flattenSymlinks && e && e->symlink)
+                {
+                    e = ResolveZipSymlink(*L.zip, *e);
+                    if (e == nullptr)
+                    {
+                        if (L.opaque) return R;
+                        continue;
+                    }
+                }
+                R.kind = HitKind::ZipEntry; R.layer = &L; R.zipEntry = e;
                 return R;
             }
             // Miss on an opaque (delta-reconstructed, complete) archive → the path does not exist; the older
@@ -364,23 +386,29 @@ int CopyUp(VfsState &S, const std::string &vrel, const ResolveResult &rr)
         return ec ? -EIO : 0;
     }
 
-    // Symlink copy-up: recreate the link itself; never dereference it into a regular file.
-    if (rr.kind == HitKind::ZipEntry && rr.zipEntry && rr.zipEntry->symlink)
+    // Symlink copy-up: recreate the link itself; never dereference it into a regular file. Under symlink
+    // abolition these branches are dead by construction — Resolve already flattened archive links to their
+    // target entries and host-layer links are followed (the generic file copy-up below then copies the
+    // TARGET's content, which is exactly the abolition semantics).
+    if (!S.flattenSymlinks)
     {
-        ZipReader zr;
-        if (int e = OpenZipEntry(*const_cast<ZipIndex *>(rr.layer->zip.get()), *rr.zipEntry, zr); e != 0) return e;
-        std::string tgt(rr.zipEntry->size, '\0');
-        int got = ReadZipEntry(zr, tgt.data(), tgt.size(), 0);
-        if (got < 0) return got;
-        tgt.resize(got);
-        return HostIO::Symlink(tgt, dst);
-    }
-    if ((rr.kind == HitKind::DirLayer || rr.kind == HitKind::FileLayer) &&
-        HostIO::Lstat(rr.hostPath, st) == 0 && st.isSymlink)
-    {
-        std::string tgt;
-        if (int e = HostIO::Readlink(rr.hostPath, tgt); e != 0) return e;
-        return HostIO::Symlink(tgt, dst);
+        if (rr.kind == HitKind::ZipEntry && rr.zipEntry && rr.zipEntry->symlink)
+        {
+            ZipReader zr;
+            if (int e = OpenZipEntry(*const_cast<ZipIndex *>(rr.layer->zip.get()), *rr.zipEntry, zr); e != 0) return e;
+            std::string tgt(rr.zipEntry->size, '\0');
+            int got = ReadZipEntry(zr, tgt.data(), tgt.size(), 0);
+            if (got < 0) return got;
+            tgt.resize(got);
+            return HostIO::Symlink(tgt, dst);
+        }
+        if ((rr.kind == HitKind::DirLayer || rr.kind == HitKind::FileLayer) &&
+            HostIO::Lstat(rr.hostPath, st) == 0 && st.isSymlink)
+        {
+            std::string tgt;
+            if (int e = HostIO::Readlink(rr.hostPath, tgt); e != 0) return e;
+            return HostIO::Symlink(tgt, dst);
+        }
     }
 
     // File copy-up: materialize full content into the writelayer.

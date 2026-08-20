@@ -80,6 +80,14 @@ int Lstat(const std::string &path, Stat &out)
     return 0;
 }
 
+int StatFollow(const std::string &path, Stat &out)
+{
+    struct stat st;
+    if (::stat(path.c_str(), &st) != 0) return -errno;
+    FromStat(st, out);
+    return 0;
+}
+
 int Mkdir(const std::string &path, uint32_t mode) { return ::mkdir(path.c_str(), static_cast<mode_t>(mode)) == 0 ? 0 : -errno; }
 int Unlink(const std::string &path)               { return ::unlink(path.c_str()) == 0 ? 0 : -errno; }
 int Rmdir(const std::string &path)                { return ::rmdir(path.c_str()) == 0 ? 0 : -errno; }

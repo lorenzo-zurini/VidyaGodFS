@@ -25,13 +25,18 @@ int main(int argc, char **argv)
     std::string specPath   = argv[1];
     std::string mountpoint = argv[2];
 
-    // Pull out --watch-pid <pid> (not a backend option); everything else passes through to the backend.
+    // Pull out --watch-pid <pid> and `-o keep-symlinks` (ours, not backend options); everything else
+    // passes through to the backend. keep-symlinks restores pre-abolition behavior: data layers serve
+    // symlink entries as symlinks instead of flattening them to their targets (default: flatten).
     long long watchPid = 0;
+    bool keepSymlinks = false;
     std::vector<std::string> backendArgs;
     for (int i = 3; i < argc; ++i)
     {
         std::string a = argv[i];
         if (a == "--watch-pid" && i + 1 < argc) { watchPid = std::stoll(argv[++i]); continue; }
+        if (a == "-o" && i + 1 < argc && std::string(argv[i + 1]) == "keep-symlinks") { keepSymlinks = true; ++i; continue; }
+        if (a == "keep-symlinks") { keepSymlinks = true; continue; }
         backendArgs.push_back(a);
     }
 
@@ -41,6 +46,7 @@ int main(int argc, char **argv)
     if (spec.mountpoint.empty()) spec.mountpoint = mountpoint;
 
     static VfsState state;
+    state.flattenSymlinks = !keepSymlinks;
     if (!state.Init(spec, err)) { std::cerr << "[vidyagodfs] init: " << err << "\n"; return 1; }
 
     return MountSession::Run(state, mountpoint, watchPid, backendArgs);

@@ -64,9 +64,22 @@ static void CollectChildren(VfsState &S, const std::string &v, std::set<std::str
             }
             else if (L.type == LayerType::Zip)
             {
-                auto it = L.zip->dirChildren.find(SourceRel(L, v));
+                std::string rel = SourceRel(L, v);
+                auto it = L.zip->dirChildren.find(rel);
                 if (it != L.zip->dirChildren.end())
-                    for (const std::string &c : it->second) out.insert(c);
+                    for (const std::string &c : it->second)
+                    {
+                        // Symlink abolition: don't list archive links that flatten to nothing (escaping /
+                        // dangling / directory-target) — they don't exist through this filesystem.
+                        if (S.flattenSymlinks)
+                        {
+                            auto eit = L.zip->byName.find(rel.empty() ? c : rel + "/" + c);
+                            if (eit != L.zip->byName.end() && eit->second.symlink
+                                && ResolveZipSymlink(*L.zip, eit->second) == nullptr)
+                                continue;
+                        }
+                        out.insert(c);
+                    }
             }
         }
         // File layer: its basename is a child of its containing dir.
@@ -135,8 +148,12 @@ int VfsGetattr(VfsState &S, const std::string &v, VfsAttr &out)
         case HitKind::DirLayer:
         case HitKind::FileLayer:
         {
+            // Symlink abolition: DATA layers present a link as its target (follow); the writelayer and rw
+            // passthrough layers — live guest-written runtime state — still present symlinks as such.
+            const bool follow = S.flattenSymlinks && rr.kind != HitKind::WriteLayer && !rr.rwPassthrough;
             HostIO::Stat st;
-            if (int e = HostIO::Lstat(rr.hostPath, st); e != 0) return e;
+            if (int e = follow ? HostIO::StatFollow(rr.hostPath, st) : HostIO::Lstat(rr.hostPath, st); e != 0)
+                return e;
             out.isDir = st.isDir; out.isSymlink = st.isSymlink;
             out.perms = st.mode & 0777; out.size = st.size; out.mtime = st.mtime; out.nlink = st.nlink;
             return 0;
@@ -357,6 +374,11 @@ int VfsUtimens(VfsState &S, const std::string &v, int64_t atimeSec, int64_t mtim
 int VfsReadlink(VfsState &S, const std::string &v, std::string &target)
 {
     ResolveResult rr = Resolve(S, v);
+    // Under symlink abolition only the writelayer / rw passthrough layers (guest-written runtime state)
+    // can hold a link; data layers present targets/nothing, so readlink on them is -EINVAL by construction.
+    if (S.flattenSymlinks)
+        return (rr.kind == HitKind::WriteLayer || rr.rwPassthrough) ? HostIO::Readlink(rr.hostPath, target)
+                                                                    : -EINVAL;
     if (rr.kind == HitKind::WriteLayer || rr.kind == HitKind::DirLayer || rr.kind == HitKind::FileLayer)
         return HostIO::Readlink(rr.hostPath, target);
     // Zip symlink entry: the link target IS the entry content. Read it (STORED → zero-copy pread).

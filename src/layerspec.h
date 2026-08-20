@@ -23,9 +23,12 @@ struct LayerSpec {
                              // exact order) of the composed views at these targets — one delta dedups against several
                              // sources at once (e.g. a prefix over [wine, dxvk, prev-prefix]). Non-empty overrides
                              // `baseTarget`. A single entry == a plain cross-target delta.
-    // SUBMOUNTS (dir/zip only): Docker-style "src:dst" mounts of paths WITHIN source. Each (source,target)
+    // SUBMOUNTS (dir/zip/DELTA): Docker-style "src:dst" mounts of paths WITHIN source. Each (source,target)
     // pair is normalized and fanned out into its own single-subpath internal layer at Init. Empty → mount the
     // whole source at `target`. A pair's `first` is the in-source path ("" == whole source), `second` the dest.
+    // A Delta layer reconstructs to a flat archive first (see overlay.cpp), then submounts fan out over that
+    // exactly like a zip — so ONE delta can present the whole build at root ("":target) AND re-rooted subpaths
+    // (e.g. share/default_pfx:pfx) in a single self-contained mount, zero-copy.
     std::vector<std::pair<std::string,std::string>> submounts;
     bool        rw = false;  // rw:true dir layer = RW passthrough straight to source (durable persist)
 };

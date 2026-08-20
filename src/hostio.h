@@ -73,6 +73,7 @@ int     Fchmod(Fd fd, uint32_t mode);
 
 // ---- path-based ------------------------------------------------------------
 int     Lstat   (const std::string &path, Stat &out);            // does NOT follow a trailing symlink
+int     StatFollow(const std::string &path, Stat &out);          // follows a trailing symlink (dangling → error)
 int     Mkdir   (const std::string &path, uint32_t mode);
 int     Unlink  (const std::string &path);
 int     Rmdir   (const std::string &path);

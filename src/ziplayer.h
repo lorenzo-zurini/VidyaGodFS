@@ -55,6 +55,14 @@ struct ZipReader {
 //non-STORE zips up front; this guards the fallback path).
 int OpenZipEntry(ZipIndex &Z, const ZipEntry &E, ZipReader &Out);
 
+//Symlink flattening: chases a symlink entry to its final NON-symlink target WITHIN the same archive
+//(targets resolve against the entry's own directory, using the zip's INTERNAL names — i.e. the tree as
+//authored, before any submount re-rooting; that is the namespace the links were written for). Returns the
+//final entry, or nullptr when the chain leaves the archive (e.g. "-> /"), targets a directory, dangles, or
+//exceeds the hop limit — callers treat that as "entry does not exist". Serving symlinks is thereby
+//abolished for archive layers: a link either becomes its target file or disappears.
+const ZipEntry *ResolveZipSymlink(ZipIndex &Z, const ZipEntry &E);
+
 //Serves a read from an opened ZipReader. Returns bytes read (>=0) or -errno.
 int ReadZipEntry(ZipReader &R, char *Buf, size_t Size, off_t Off);
 

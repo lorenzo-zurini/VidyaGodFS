@@ -211,6 +211,22 @@ int Lstat(const std::string &path, Stat &out)
     return 0;
 }
 
+int StatFollow(const std::string &path, Stat &out)
+{
+    // Open WITHOUT OPEN_REPARSE_POINT so the handle refers to the link's TARGET; a dangling link fails.
+    HANDLE h = ::CreateFileW(Wide(path).c_str(), FILE_READ_ATTRIBUTES,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                             OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return Err();
+    BY_HANDLE_FILE_INFORMATION bi;
+    BOOL ok = ::GetFileInformationByHandle(h, &bi);
+    ::CloseHandle(h);
+    if (!ok) return Err();
+    uint64_t size = ((uint64_t)bi.nFileSizeHigh << 32) | bi.nFileSizeLow;
+    FillStat(bi.dwFileAttributes, size, bi.ftLastWriteTime, out);
+    return 0;
+}
+
 int Mkdir(const std::string &path, uint32_t) { return ::CreateDirectoryW(Wide(path).c_str(), nullptr) ? 0 : Err(); }
 int Unlink(const std::string &path)          { return ::DeleteFileW(Wide(path).c_str()) ? 0 : Err(); }
 int Rmdir(const std::string &path)           { return ::RemoveDirectoryW(Wide(path).c_str()) ? 0 : Err(); }

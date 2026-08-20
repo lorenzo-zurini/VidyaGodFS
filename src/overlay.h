@@ -35,6 +35,12 @@ struct Layer {
 struct VfsState {
     std::string           writelayer;   // empty when readOnly
     bool                  readOnly = false;
+    // Symlink abolition (default ON, `-o keep-symlinks` restores the old behavior): DATA layers (zip/delta/
+    // dir/file) never serve a symlink — an archive link is chased to its in-archive target file
+    // (ResolveZipSymlink) or hidden; a host-layer link is followed on the host or hidden. Only the
+    // WRITELAYER still presents symlinks: that's live runtime state written by the guest itself (e.g. wine
+    // creating dosdevices/ at boot), on a real filesystem where they belong.
+    bool                  flattenSymlinks = true;
     uint32_t              uid = 1000;    // forced ownership presented by getattr (POSIX uid/gid; inert on Windows)
     uint32_t              gid = 1000;
     std::vector<Layer>    layers;        // ascending priority (index 0 lowest)

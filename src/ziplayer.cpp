@@ -287,3 +287,52 @@ int ReadZipEntry(ZipReader &R, char *Buf, size_t Size, off_t Off)
     ssize_t got = R.src->pread(Buf, want, R.dataOffset + (uint64_t)Off);
     return (int)got;   // >=0 bytes, or a negative -errno propagated from the ByteSource
 }
+
+// ---- symlink flattening --------------------------------------------------
+
+// Joins `base` (a directory path, internal zip name) with a relative `target`, normalizing "." / "..".
+// Returns false when the walk escapes the archive root (more ".." than segments).
+static bool JoinNormalized(const std::string &base, const std::string &target, std::string &out)
+{
+    std::vector<std::string> segs;
+    auto push = [&](const std::string &p) {
+        size_t s = 0;
+        while (s <= p.size())
+        {
+            size_t e = p.find('/', s);
+            std::string seg = p.substr(s, e == std::string::npos ? std::string::npos : e - s);
+            if (seg == "..") { if (segs.empty()) return false; segs.pop_back(); }
+            else if (!seg.empty() && seg != ".") segs.push_back(seg);
+            if (e == std::string::npos) break;
+            s = e + 1;
+        }
+        return true;
+    };
+    if (!push(base) || !push(target)) return false;
+    out.clear();
+    for (const std::string &s : segs) { if (!out.empty()) out += '/'; out += s; }
+    return true;
+}
+
+const ZipEntry *ResolveZipSymlink(ZipIndex &Z, const ZipEntry &E)
+{
+    const ZipEntry *cur = &E;
+    for (int hop = 0; hop < 8 && cur->symlink; ++hop)
+    {
+        // The link target IS the entry content (STORE archives keep it contiguous — plain pread).
+        if (!cur->stored || cur->size == 0 || cur->size > 4096) return nullptr;
+        std::string tgt(cur->size, '\0');
+        if (Z.src->pread(tgt.data(), tgt.size(), cur->dataOffset) != (ssize_t)tgt.size()) return nullptr;
+        if (!tgt.empty() && tgt[0] == '/') return nullptr;      // absolute → leaves the archive
+
+        std::string dir = cur->name.substr(0, cur->name.find_last_of('/') == std::string::npos
+                                                  ? 0 : cur->name.find_last_of('/'));
+        std::string resolved;
+        if (!JoinNormalized(dir, tgt, resolved)) return nullptr; // escapes the archive root
+        auto it = Z.byName.find(resolved);
+        if (it == Z.byName.end()) return nullptr;                // dangling
+        cur = &it->second;
+    }
+    if (cur->symlink || cur->isDir) return nullptr;              // loop guard hit, or a directory target
+    return cur;
+}
