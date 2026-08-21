@@ -43,7 +43,8 @@ static void CollectChildren(VfsState &S, const std::string &v, std::set<std::str
             if (n.rfind(".wh.", 0) == 0)    { whiteouts.insert(n.substr(4)); return; }
             out.insert(n);
         });
-    if (opaque) S.hasOpaque.store(true, std::memory_order_relaxed); // enable Resolve masking lazily
+    // (No lazy mask enabling here anymore: Init seeds the in-memory masks from the persisted writelayer,
+    // and every runtime marker mutation updates them — the listing above is just this dir's disk view.)
 
     // A delta-backed (opaque) layer covering v masks every LOWER same-subtree layer's children.
     int opaquePrio = -1;
@@ -309,9 +310,14 @@ int VfsRmdir(VfsState &S, const std::string &v)
     if (!S.writelayer.empty())
     {
         // The writelayer dir may still hold child whiteouts / an opaque marker (all ".wh."-prefixed),
-        // which make it non-empty on disk even though the merged view is empty. Clear them so rmdir works.
+        // which make it non-empty on disk even though the merged view is empty. Clear them so rmdir works —
+        // and mirror each removal in the in-memory masks.
         std::string wl = WLPath(S, v);
-        HostIO::ReadDir(wl, [&](const std::string &n) { if (n.rfind(".wh.", 0) == 0) HostIO::Unlink(wl + "/" + n); });
+        HostIO::ReadDir(wl, [&](const std::string &n) {
+            if (n.rfind(".wh.", 0) != 0) return;
+            if (n == ".wh..wh..opq") { HostIO::Unlink(wl + "/" + n); UnmarkOpaque(S, v); }
+            else RemoveWhiteout(S, v.empty() ? n.substr(4) : v + "/" + n.substr(4)); // unlinks marker + mask erase
+        });
         HostIO::Rmdir(wl);
     }
     if (Resolve(S, v).kind != HitKind::None) CreateWhiteout(S, v);
@@ -332,12 +338,14 @@ int VfsRename(VfsState &S, const std::string &vf, const std::string &vt)
         if (HostIO::Lstat(rr.hostPath, st) == 0 && st.isDir) isDir = true;
     }
 
-    // Bring the source fully into the writelayer first: a cross-layer DIRECTORY needs the whole
-    // subtree copied up (so it can then be moved with one Rename); a file is a single copy-up.
-    if (rr.kind != HitKind::WriteLayer && !rr.rwPassthrough)
+    // Bring the source fully into the writelayer first, so it can then be moved with one Rename.
+    // A DIRECTORY is a MERGED entity: even when a writelayer copy already exists (it may hold only a
+    // whiteout from an earlier delete), lower layers can still contribute children — always deep-copy
+    // the merged subtree up. A file needs a copy-up only when it isn't already writable.
+    if (!rr.rwPassthrough)
     {
-        int e = isDir ? DeepCopyUp(S, vf) : CopyUp(S, vf, rr);
-        if (e != 0) return e;
+        if (isDir) { if (int e = DeepCopyUp(S, vf); e != 0) return e; }
+        else if (rr.kind != HitKind::WriteLayer) { if (int e = CopyUp(S, vf, rr); e != 0) return e; }
     }
 
     std::string src = rr.rwPassthrough ? rr.hostPath : WLPath(S, vf);
@@ -346,6 +354,9 @@ int VfsRename(VfsState &S, const std::string &vf, const std::string &vt)
     else { if (int e = EnsureWriteParent(S, vt); e != 0) return e; RemoveWhiteout(S, vt); dst = WLPath(S, vt); }
     if (int e = HostIO::Rename(src, dst); e != 0) return e;
 
+    // A moved DIRECTORY takes its writelayer `.wh.*` markers with it — rewrite the in-memory masks to the
+    // new prefix so they keep matching the relocated disk markers.
+    if (isDir) RenameMaskPrefix(S, vf, vt);
     if (Resolve(S, vf).kind != HitKind::None) CreateWhiteout(S, vf); // old name still below → hide it
     return 0;
 }

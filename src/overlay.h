@@ -47,13 +47,16 @@ struct VfsState {
     std::vector<Layer>    layers;        // ascending priority (index 0 lowest)
     std::set<std::string> implicitDirs;  // synthesized structural dirs (target parents)
 
-    // Set once any opaque-dir marker (.wh..wh..opq) is seen (created here, or encountered in a readdir).
-    // release/acquire so the marker-file creation happens-before a later thread's masking observes the flag.
-    // Gates the per-Resolve ancestor-opacity check so the hot path stays free when no opaque dirs exist.
-    std::atomic<bool>     hasOpaque{false};
-    // Same gate for directory whiteouts: a deleted directory masks its whole subtree, so Resolve must check
-    // whether any ANCESTOR is whiteouted. Set on the first CreateWhiteout; skips the ancestor walk otherwise.
-    std::atomic<bool>     hasWhiteout{false};
+    // Deletion masks, mirrored in memory: the set of whiteouted names and the set of opaque dirs. Resolve
+    // consults ONLY these (pure lock-free set lookups — no host Lstat per path or per ancestor on the hot
+    // path). The on-disk `.wh.*` markers remain the durable truth for persisted writelayers: Init re-scans
+    // the writelayer into the sets, and every runtime mutation (Create/RemoveWhiteout, MarkOpaque, the
+    // rmdir marker sweep, dir renames) updates disk AND swaps the set copy-on-write under maskWriteMtx.
+    // Known seam: a guest literally creating a `.wh.foo` file through the mount lands on disk but not in
+    // the set, so it masks only from the NEXT mount — no real guest does this.
+    std::atomic<std::shared_ptr<const std::set<std::string>>> whiteoutSet;
+    std::atomic<std::shared_ptr<const std::set<std::string>>> opaqueSet;
+    std::mutex                                                maskWriteMtx;   // serializes set writers
 
     // Fixed shard array of copy-up locks keyed by hash(vrel) % N — avoids the old per-path map that grew
     // unboundedly for the life of the mount. Collisions only serialize unrelated copy-ups (harmless).
@@ -80,15 +83,19 @@ std::string RelUnder(const Layer &L, const std::string &vrel);   // path under t
 std::string SourceRel(const Layer &L, const std::string &vrel);  // subpath-prefixed: the source/zip side
 std::string WLPath(const VfsState &S, const std::string &vrel);   // writelayer host path for vrel
 std::string WhiteoutPath(const VfsState &S, const std::string &vrel);
-bool        IsWhiteouted(const VfsState &S, const std::string &vrel);
+bool        IsWhiteouted(const VfsState &S, const std::string &vrel);      // in-memory set lookup
 bool        IsUnderWhiteout(const VfsState &S, const std::string &vrel);   // any ancestor deleted
-void        CreateWhiteout(VfsState &S, const std::string &vrel);          // sets hasWhiteout
-void        RemoveWhiteout(const VfsState &S, const std::string &vrel);
+void        CreateWhiteout(VfsState &S, const std::string &vrel);          // disk marker + set insert
+void        RemoveWhiteout(VfsState &S, const std::string &vrel);          // disk unlink + set erase
+// A directory rename relocates the .wh. markers stored inside its writelayer subtree; mirror that in the
+// in-memory sets by rewriting every entry under oldv to the newv prefix (both whiteouts and opaque dirs).
+void        RenameMaskPrefix(VfsState &S, const std::string &oldv, const std::string &newv);
 
 //Opaque directories: a writelayer dir holding a `.wh..wh..opq` marker fully masks the lower layers for
 //its whole subtree (used when a lower-backed dir is deleted then recreated — the new one is empty).
 bool        IsOpaqueDir(const VfsState &S, const std::string &vrel);
 void        MarkOpaque(VfsState &S, const std::string &vrel);
+void        UnmarkOpaque(VfsState &S, const std::string &vrel);   // mask erase only (caller owns the disk marker)
 bool        IsUnderOpaque(const VfsState &S, const std::string &vrel);
 
 //Resolve a vrel: whiteout → None; writelayer entry → WriteLayer; covering layer (highest priority

@@ -59,6 +59,8 @@ static void AddAncestors(std::set<std::string> &dst, const std::string &leaf)
     while (!cur.empty()) { dst.insert(cur); cur = ParentVRel(cur); }
 }
 
+static void SeedMasksFromWritelayer(VfsState &S);   // defined with the mask machinery below
+
 bool VfsState::Init(const Spec &S, std::string &Err)
 {
     writelayer = S.writelayer;
@@ -68,6 +70,9 @@ bool VfsState::Init(const Spec &S, std::string &Err)
 
     std::error_code ec;
     if (!writelayer.empty()) fs::create_directories(writelayer, ec);
+    // Persisted writelayers carry `.wh.*` markers from earlier sessions — rebuild the in-memory masks
+    // from disk so deletions keep masking across remounts.
+    SeedMasksFromWritelayer(*this);
 
     int prio = 0;
     // Delta chaining + folding: within a run of same-target layers ending in delta(s), the base zip and any
@@ -205,7 +210,29 @@ std::string SourceRel(const Layer &L, const std::string &vrel)
     return L.subpath + "/" + rel;
 }
 
-// ---- whiteouts -----------------------------------------------------------
+// ---- whiteouts + opaque dirs ---------------------------------------------
+// The masks live TWICE: as `.wh.*` files in the writelayer (durable truth, survives remounts of persisted
+// writelayers) and as immutable in-memory sets swapped copy-on-write (what the hot Resolve path reads —
+// pure lock-free lookups, zero host syscalls per path/ancestor). Every mutation writes disk first, then
+// swaps the set, so a reader that observes the new set finds the marker already durable.
+
+using MaskSet = std::set<std::string>;
+using MaskPtr = std::shared_ptr<const MaskSet>;
+
+static MaskPtr LoadMask(const std::atomic<MaskPtr> &a)
+{
+    return a.load(std::memory_order_acquire);
+}
+
+//Clone-modify-swap under maskWriteMtx. `mut` edits the writable clone.
+static void MutateMask(VfsState &S, std::atomic<MaskPtr> &a, const std::function<void(MaskSet &)> &mut)
+{
+    std::lock_guard<std::mutex> g(S.maskWriteMtx);
+    MaskPtr cur = a.load(std::memory_order_acquire);
+    auto next = std::make_shared<MaskSet>(cur ? *cur : MaskSet{});
+    mut(*next);
+    a.store(std::move(next), std::memory_order_release);
+}
 
 std::string WhiteoutPath(const VfsState &S, const std::string &vrel)
 {
@@ -215,8 +242,8 @@ std::string WhiteoutPath(const VfsState &S, const std::string &vrel)
 bool IsWhiteouted(const VfsState &S, const std::string &vrel)
 {
     if (S.writelayer.empty() || vrel.empty()) return false;
-    HostIO::Stat st;
-    return HostIO::Lstat(WhiteoutPath(S, vrel), st) == 0;
+    MaskPtr m = LoadMask(S.whiteoutSet);
+    return m && m->count(vrel) != 0;
 }
 
 void CreateWhiteout(VfsState &S, const std::string &vrel)
@@ -226,18 +253,15 @@ void CreateWhiteout(VfsState &S, const std::string &vrel)
     fs::create_directories(WLPath(S, ParentVRel(vrel)), ec);
     HostIO::Fd fd = HostIO::Open(WhiteoutPath(S, vrel), O_CREAT | O_WRONLY, 0644);
     if (fd >= 0) HostIO::Close(fd);
-    // release: the whiteout file exists on disk before any other thread observes hasWhiteout==true and
-    // starts masking subtrees against it.
-    S.hasWhiteout.store(true, std::memory_order_release);
+    MutateMask(S, S.whiteoutSet, [&](MaskSet &m) { m.insert(vrel); });
 }
 
-void RemoveWhiteout(const VfsState &S, const std::string &vrel)
+void RemoveWhiteout(VfsState &S, const std::string &vrel)
 {
     if (S.writelayer.empty()) return;
     HostIO::Unlink(WhiteoutPath(S, vrel));
+    MutateMask(S, S.whiteoutSet, [&](MaskSet &m) { m.erase(vrel); });
 }
-
-// ---- opaque directories --------------------------------------------------
 
 static std::string OpaqueMarker(const VfsState &S, const std::string &vrel)
 {
@@ -247,8 +271,8 @@ static std::string OpaqueMarker(const VfsState &S, const std::string &vrel)
 bool IsOpaqueDir(const VfsState &S, const std::string &vrel)
 {
     if (S.writelayer.empty()) return false;
-    HostIO::Stat st;
-    return HostIO::Lstat(OpaqueMarker(S, vrel), st) == 0;
+    MaskPtr m = LoadMask(S.opaqueSet);
+    return m && m->count(vrel) != 0;
 }
 
 void MarkOpaque(VfsState &S, const std::string &vrel)
@@ -256,29 +280,81 @@ void MarkOpaque(VfsState &S, const std::string &vrel)
     if (S.writelayer.empty()) return;
     HostIO::Fd fd = HostIO::Open(OpaqueMarker(S, vrel), O_CREAT | O_WRONLY, 0644);
     if (fd >= 0) HostIO::Close(fd);
-    // release: the marker file exists before another thread's IsUnderOpaque (acquire) can observe the flag
-    // and rely on the marker being present (Bug #5: relaxed gave no happens-before → transient masking miss).
-    S.hasOpaque.store(true, std::memory_order_release);
+    MutateMask(S, S.opaqueSet, [&](MaskSet &m) { m.insert(vrel); });
 }
 
-//True if any ANCESTOR directory of vrel is whiteouted (deleted) — so a deleted directory masks its entire
-//subtree, not just its own name. Gated by hasWhiteout so it costs nothing until a whiteout exists.
+void UnmarkOpaque(VfsState &S, const std::string &vrel)
+{
+    if (S.writelayer.empty()) return;
+    // Disk marker removal is the caller's business (the rmdir sweep already unlinks it); just drop the mask.
+    MutateMask(S, S.opaqueSet, [&](MaskSet &m) { m.erase(vrel); });
+}
+
+void RenameMaskPrefix(VfsState &S, const std::string &oldv, const std::string &newv)
+{
+    if (S.writelayer.empty() || oldv == newv) return;
+    auto rewrite = [&](MaskSet &m) {
+        MaskSet moved;
+        std::string pfx = oldv + "/";
+        for (auto it = m.begin(); it != m.end();)
+        {
+            if (*it == oldv || it->rfind(pfx, 0) == 0)
+            {
+                moved.insert(*it == oldv ? newv : newv + "/" + it->substr(pfx.size()));
+                it = m.erase(it);
+            }
+            else ++it;
+        }
+        m.merge(moved);
+    };
+    MutateMask(S, S.whiteoutSet, rewrite);
+    MutateMask(S, S.opaqueSet, rewrite);
+}
+
+//True if any ANCESTOR directory of vrel is whiteouted (deleted) — a deleted directory masks its entire
+//subtree, not just its own name. Empty-set fast path; pure in-memory lookups.
 bool IsUnderWhiteout(const VfsState &S, const std::string &vrel)
 {
-    if (!S.hasWhiteout.load(std::memory_order_acquire) || S.writelayer.empty()) return false;
+    if (S.writelayer.empty()) return false;
+    MaskPtr m = LoadMask(S.whiteoutSet);
+    if (!m || m->empty()) return false;
     for (std::string cur = ParentVRel(vrel); !cur.empty(); cur = ParentVRel(cur))
-        if (IsWhiteouted(S, cur)) return true;
+        if (m->count(cur) != 0) return true;
     return false;
 }
 
 //True if any ancestor directory of vrel (including the root) is opaque — meaning the lower layers are
-//masked here. Gated by hasOpaque so it costs nothing until an opaque dir actually exists.
+//masked here. Empty-set fast path; pure in-memory lookups.
 bool IsUnderOpaque(const VfsState &S, const std::string &vrel)
 {
-    if (!S.hasOpaque.load(std::memory_order_acquire) || S.writelayer.empty()) return false;
+    if (S.writelayer.empty()) return false;
+    MaskPtr m = LoadMask(S.opaqueSet);
+    if (!m || m->empty()) return false;
     for (std::string cur = ParentVRel(vrel); !cur.empty(); cur = ParentVRel(cur))
-        if (IsOpaqueDir(S, cur)) return true;
-    return IsOpaqueDir(S, ""); // root opaque masks everything
+        if (m->count(cur) != 0) return true;
+    return m->count(std::string{}) != 0; // root opaque masks everything
+}
+
+//Init-time seeding: rebuild both masks from the persisted writelayer's `.wh.*` markers so masks survive
+//remounts (persist keeps writelayers). One bounded walk of what the guest actually wrote.
+static void SeedMasksFromWritelayer(VfsState &S)
+{
+    if (S.writelayer.empty()) return;
+    auto wh  = std::make_shared<MaskSet>();
+    auto opq = std::make_shared<MaskSet>();
+    std::function<void(const std::string &)> walk = [&](const std::string &vdir) {
+        std::string host = WLPath(S, vdir);
+        HostIO::ReadDir(host, [&](const std::string &n) {
+            std::string childV = vdir.empty() ? n : vdir + "/" + n;
+            if (n == ".wh..wh..opq") { opq->insert(vdir); return; }
+            if (n.rfind(".wh.", 0) == 0) { wh->insert(vdir.empty() ? n.substr(4) : vdir + "/" + n.substr(4)); return; }
+            HostIO::Stat st;
+            if (HostIO::Lstat(host + "/" + n, st) == 0 && st.isDir) walk(childV);
+        });
+    };
+    walk("");
+    S.whiteoutSet.store(std::move(wh), std::memory_order_release);
+    S.opaqueSet.store(std::move(opq), std::memory_order_release);
 }
 
 // ---- resolution ----------------------------------------------------------

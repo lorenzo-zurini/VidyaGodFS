@@ -279,6 +279,38 @@ TEST(dir_delete_then_recreate) {
     CHECK_EQ(VfsGetattr(S, "d/old.txt", a), -ENOENT);   // old content stays masked
 }
 
+// Masks must survive a remount: a persisted writelayer's .wh. markers are re-seeded into the in-memory
+// sets at Init (deletions keep masking across sessions).
+TEST(masks_survive_remount) {
+    TmpDir t;
+    writeStoreZip(t / "base.zip", { { "gone.txt", "bye", false }, { "d/", "", false }, { "d/c.txt", "c", false } });
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { zipLayer(t.str("base.zip")) };
+    {
+        VfsState S; std::string err; CHECK(S.Init(sp, err));
+        CHECK_EQ(VfsUnlink(S, "gone.txt"), 0);
+        CHECK_EQ(VfsRename(S, "d", "d2"), 0);
+    }
+    // fresh mount over the SAME writelayer
+    VfsState S2; std::string err2; CHECK(S2.Init(sp, err2));
+    VfsAttr a;
+    CHECK_EQ(VfsGetattr(S2, "gone.txt", a), -ENOENT);      // whiteout re-seeded
+    CHECK_EQ(VfsGetattr(S2, "d/c.txt", a), -ENOENT);       // subtree mask re-seeded
+    CHECK_EQ(VfsGetattr(S2, "d2/c.txt", a), 0);            // moved content still there
+}
+
+// Renaming a directory that CONTAINS whiteouts must keep those deletions working at the new path.
+TEST(rename_carries_inner_whiteouts) {
+    TmpDir t;
+    writeStoreZip(t / "base.zip", { { "d/", "", false }, { "d/keep.txt", "k", false }, { "d/del.txt", "x", false } });
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { zipLayer(t.str("base.zip")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK_EQ(VfsUnlink(S, "d/del.txt"), 0);                // whiteout INSIDE d
+    CHECK_EQ(VfsRename(S, "d", "d2"), 0);                  // markers travel with the wl dir
+    VfsAttr a;
+    CHECK_EQ(VfsGetattr(S, "d2/keep.txt", a), 0);
+    CHECK_EQ(VfsGetattr(S, "d2/del.txt", a), -ENOENT);     // deletion still masks at the NEW path
+}
+
 // ---- delta round-trip (moved here from parent test intent for FS coverage) ----
 TEST(delta_roundtrip_basic) {
     std::string base(4096, 'A'); for (int i = 0; i < 4096; i += 7) base[i] = 'a' + (i % 26);
