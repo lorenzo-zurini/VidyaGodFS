@@ -4,10 +4,83 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <unordered_map>
 
+#ifndef _WIN32
+#include <fcntl.h>      // SpillFile: open/posix_fadvise
+#include <unistd.h>     //   … write/fdatasync/close
+#endif
+
 namespace vgdelta {
+
+// ---- gentle spill file --------------------------------------------------------------------------
+// A sequential scratch writer that FORCES its own writeback in small increments. Naively streaming
+// gigabytes through the page cache lets dirty pages pile up to vm.dirty_ratio (~20% of RAM), at which
+// point the kernel stalls the WHOLE machine in synchronous flushing — that froze a desktop while this
+// generator spilled its literal stream. Every FLUSH_EVERY bytes we fdatasync the window and then drop
+// it from the cache (POSIX_FADV_DONTNEED), so at any instant only ~one window of dirty data exists and
+// the rest of the system never feels the spill. Windows: plain buffered writes (its conversions are
+// small; no equivalent stall mechanism in play).
+class SpillFile {
+    static constexpr uint64_t FLUSH_EVERY = 64ull << 20;   // 64 MB windows
+public:
+    bool Open(const std::filesystem::path &p) {
+#ifndef _WIN32
+        fd_ = ::open(p.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        return fd_ >= 0;
+#else
+        f_.open(p, std::ios::binary | std::ios::trunc);
+        return (bool)f_;
+#endif
+    }
+    bool Write(const void *b, size_t n) {
+#ifndef _WIN32
+        const uint8_t *q = (const uint8_t *)b;
+        while (n) {
+            ssize_t w = ::write(fd_, q, n);
+            if (w <= 0) return false;
+            q += w; n -= (size_t)w; off_ += (uint64_t)w;
+        }
+        if (off_ - synced_ >= FLUSH_EVERY) Drain();
+        return true;
+#else
+        f_.write((const char *)b, (std::streamsize)n); off_ += n; return (bool)f_;
+#endif
+    }
+    bool Close() {   // final drain + close; returns false on any write error
+#ifndef _WIN32
+        if (fd_ < 0) return false;
+        Drain();
+        return ::close(fd_) == 0 ? (fd_ = -1, true) : (fd_ = -1, false);
+#else
+        f_.flush(); bool ok = (bool)f_; f_.close(); return ok;
+#endif
+    }
+    uint64_t Size() const { return off_; }
+    ~SpillFile() {
+#ifndef _WIN32
+        if (fd_ >= 0) ::close(fd_);
+#endif
+    }
+private:
+#ifndef _WIN32
+    void Drain() {
+        ::fdatasync(fd_);
+        ::posix_fadvise(fd_, 0, (off_t)off_, POSIX_FADV_DONTNEED);
+        synced_ = off_;
+    }
+    int fd_ = -1;
+    uint64_t synced_ = 0;
+#else
+    std::ofstream f_;
+#endif
+    uint64_t off_ = 0;
+};
 
 // ---- little-endian (de)serialization ------------------------------------------------------------
 
@@ -251,17 +324,34 @@ static uint64_t HashWin(const uint8_t *p) { uint64_t h = 0; for (uint32_t i = 0;
 
 std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
                                    const uint8_t *target, size_t targetLen,
-                                   uint32_t blockSize) {
+                                   uint32_t blockSize, const std::string &scratchDir) {
     if (blockSize == 0) blockSize = DEFAULT_BLOCK;
+
+    // Scratch files (see the header): the raw literal stream and the compressed ADD region are written out as
+    // they are produced, so neither is ever fully resident. Removed on every exit path by this guard.
+    std::error_code sec;
+    const std::filesystem::path scratch =
+        scratchDir.empty() ? std::filesystem::temp_directory_path(sec) : std::filesystem::path(scratchDir);
+    const auto uniq = std::to_string(
+        (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count());
+    const std::filesystem::path litPath = scratch / ("vgdelta_lit_" + uniq + ".tmp");
+    const std::filesystem::path cmpPath = scratch / ("vgdelta_cmp_" + uniq + ".tmp");
+    struct Cleanup {
+        std::filesystem::path a, b;
+        ~Cleanup() { std::error_code e; std::filesystem::remove(a, e); std::filesystem::remove(b, e); }
+    } cleanup{ litPath, cmpPath };
 
     struct Seg { uint8_t kind; uint64_t len; uint64_t srcOff; };
     std::vector<Seg> segs;
-    std::vector<uint8_t> addStream;
+
+    SpillFile lit;
+    if (!lit.Open(litPath)) return {};
+    bool spillOk = true;
 
     auto emitAdd = [&](size_t from, size_t to) {
         if (to <= from) return;
-        segs.push_back({ KIND_ADD, (uint64_t)(to - from), (uint64_t)addStream.size() });
-        addStream.insert(addStream.end(), target + from, target + to);
+        segs.push_back({ KIND_ADD, (uint64_t)(to - from), lit.Size() });
+        spillOk = lit.Write(target + from, to - from) && spillOk;
     };
 
     // Index the base at ANCHOR-aligned windows (first offset wins per hash). u64 offset: bases can be >4 GB.
@@ -302,16 +392,31 @@ std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
     emitAdd(litStart, targetLen);   // tail literals
 
     // ---- serialize ----
-    // ADD region: split addStream into blockSize chunks, zstd each.
+    // ADD region: stream the literal file back in blockSize chunks, zstd each, and write the compressed bytes
+    // straight to the second scratch file. Only ONE uncompressed block (blockSize) and its compressed form are
+    // resident at a time, so this scales to any archive size.
+    const uint64_t addTotal = lit.Size();
+    if (!lit.Close() || !spillOk) return {};
     std::vector<BlockRec> blocks;
-    std::vector<uint8_t>  addRegion;
-    for (size_t o = 0; o < addStream.size(); o += blockSize) {
-        uint32_t ul = (uint32_t)std::min<size_t>(blockSize, addStream.size() - o);
-        std::vector<uint8_t> c = ZCompress(addStream.data() + o, ul, 19);   // ADD blocks + tables both at 19 (decode
-                                                                            // cost is level-independent, so max the ratio)
-        blocks.push_back({ (uint64_t)addRegion.size(), (uint32_t)c.size(), ul });
-        addRegion.insert(addRegion.end(), c.begin(), c.end());
+    uint64_t addRegionSize = 0;
+    {
+        std::ifstream in(litPath, std::ios::binary);
+        SpillFile out;
+        if (!in || !out.Open(cmpPath)) return {};
+        std::vector<uint8_t> buf(blockSize);
+        for (uint64_t o = 0; o < addTotal; o += blockSize) {
+            const uint32_t ul = (uint32_t)std::min<uint64_t>(blockSize, addTotal - o);
+            in.read(reinterpret_cast<char *>(buf.data()), (std::streamsize)ul);
+            if ((uint64_t)in.gcount() != ul) return {};
+            std::vector<uint8_t> c = ZCompress(buf.data(), ul, 19);   // ADD blocks + tables both at 19 (decode
+                                                                     // cost is level-independent, so max the ratio)
+            blocks.push_back({ addRegionSize, (uint32_t)c.size(), ul });
+            if (!out.Write(c.data(), c.size())) return {};
+            addRegionSize += c.size();
+        }
+        if (!out.Close()) return {};
     }
+    std::filesystem::remove(litPath, sec);   // literals no longer needed — free the space before building `out`
 
     // Segment records: kind(1) len(8) srcOff(8) = 17 bytes each.
     std::vector<uint8_t> segRaw;
@@ -326,6 +431,9 @@ std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
     std::vector<uint8_t> blkComp = ZCompress(blkRaw.data(), blkRaw.size());
 
     std::vector<uint8_t> out;
+    // Exact reserve: the returned buffer is the ONLY multi-GB allocation left, and letting it grow by doubling
+    // would transiently need twice its size — the spike that used to OOM on large archives.
+    out.reserve(4 + 4 + 4 + 8 + 8 + 8 + 4 + 4 + 16 + segComp.size() + 16 + blkComp.size() + addRegionSize);
     out.insert(out.end(), MAGIC, MAGIC + 4);
     put32(out, VERSION);
     put32(out, blockSize);
@@ -338,7 +446,14 @@ std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
     out.insert(out.end(), segComp.begin(), segComp.end());
     put64(out, blkComp.size()); put64(out, blkRaw.size());
     out.insert(out.end(), blkComp.begin(), blkComp.end());
-    out.insert(out.end(), addRegion.begin(), addRegion.end());
+    {   // append the compressed ADD region straight from its scratch file
+        std::ifstream in(cmpPath, std::ios::binary);
+        if (!in) return {};
+        const size_t addStart = out.size();
+        out.resize(addStart + addRegionSize);
+        in.read(reinterpret_cast<char *>(out.data() + addStart), (std::streamsize)addRegionSize);
+        if ((uint64_t)in.gcount() != addRegionSize) return {};
+    }
     return out;
 }
 

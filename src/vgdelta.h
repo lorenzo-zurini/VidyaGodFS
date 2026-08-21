@@ -100,11 +100,19 @@ private:
     static constexpr size_t                                          CacheCap = 64;   // 64 blocks (~16 MB at 256K)
 };
 
-// Generates a .vgdelta reconstructing `target` from `base` (both fully in memory — authoring is a one-shot
-// desktop op). Uses a rolling-hash + greedy-extend matcher; literal runs are stored as per-block zstd.
+// Generates a .vgdelta reconstructing `target` from `base` (both addressable as flat memory — mmap them, they
+// are read once and sequentially). Uses a rolling-hash + greedy-extend matcher; literal runs are stored as
+// per-block zstd.
+//
+// Memory: the matched-literal stream and the compressed ADD region are SPILLED to two scratch files instead of
+// being accumulated in RAM — on a big archive the literals alone can be several GB, and holding them plus the
+// compressed copy plus the returned buffer used to blow past the machine's RAM. Only the returned delta (and the
+// base index) stay resident. `scratchDir` says where those files go; empty = the system temp dir — pass a real
+// on-disk directory when that is a tmpfs (spilling to RAM-backed /tmp would defeat the whole point).
 std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
                                    const uint8_t *target, size_t targetLen,
-                                   uint32_t blockSize = DEFAULT_BLOCK);
+                                   uint32_t blockSize = DEFAULT_BLOCK,
+                                   const std::string &scratchDir = std::string());
 
 } // namespace vgdelta
 
