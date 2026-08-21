@@ -43,7 +43,8 @@ public:
         const uint8_t *q = (const uint8_t *)b;
         while (n) {
             ssize_t w = ::write(fd_, q, n);
-            if (w <= 0) return false;
+            if (w < 0) { if (errno == EINTR) continue; return false; }  // retry signal-interrupted writes
+            if (w == 0) return false;
             q += w; n -= (size_t)w; off_ += (uint64_t)w;
         }
         if (off_ - synced_ >= FLUSH_EVERY) Drain();

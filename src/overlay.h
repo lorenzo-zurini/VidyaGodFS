@@ -4,14 +4,15 @@
 #include "layerspec.h"
 #include "ziplayer.h"
 
+#include <array>
 #include <string>
 #include <vector>
 #include <set>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 
 //A resolved layer in the running filesystem.
 struct Layer {
@@ -47,14 +48,20 @@ struct VfsState {
     std::set<std::string> implicitDirs;  // synthesized structural dirs (target parents)
 
     // Set once any opaque-dir marker (.wh..wh..opq) is seen (created here, or encountered in a readdir).
+    // release/acquire so the marker-file creation happens-before a later thread's masking observes the flag.
     // Gates the per-Resolve ancestor-opacity check so the hot path stays free when no opaque dirs exist.
     std::atomic<bool>     hasOpaque{false};
+    // Same gate for directory whiteouts: a deleted directory masks its whole subtree, so Resolve must check
+    // whether any ANCESTOR is whiteouted. Set on the first CreateWhiteout; skips the ancestor walk otherwise.
+    std::atomic<bool>     hasWhiteout{false};
 
-    std::mutex                                         copyUpMapMtx;
-    std::map<std::string, std::shared_ptr<std::mutex>> copyUpLocks;
+    // Fixed shard array of copy-up locks keyed by hash(vrel) % N — avoids the old per-path map that grew
+    // unboundedly for the life of the mount. Collisions only serialize unrelated copy-ups (harmless).
+    static constexpr size_t                            kCopyUpShards = 256;
+    std::array<std::mutex, kCopyUpShards>              copyUpShards;
 
     bool Init(const Spec &S, std::string &Err);
-    std::shared_ptr<std::mutex> CopyUpLock(const std::string &vrel);
+    std::mutex &CopyUpLock(const std::string &vrel);   // sharded by hash(vrel); see copyUpShards
 };
 
 enum class HitKind { None, ImplicitDir, WriteLayer, DirLayer, FileLayer, ZipEntry };
@@ -74,7 +81,8 @@ std::string SourceRel(const Layer &L, const std::string &vrel);  // subpath-pref
 std::string WLPath(const VfsState &S, const std::string &vrel);   // writelayer host path for vrel
 std::string WhiteoutPath(const VfsState &S, const std::string &vrel);
 bool        IsWhiteouted(const VfsState &S, const std::string &vrel);
-void        CreateWhiteout(const VfsState &S, const std::string &vrel);
+bool        IsUnderWhiteout(const VfsState &S, const std::string &vrel);   // any ancestor deleted
+void        CreateWhiteout(VfsState &S, const std::string &vrel);          // sets hasWhiteout
 void        RemoveWhiteout(const VfsState &S, const std::string &vrel);
 
 //Opaque directories: a writelayer dir holding a `.wh..wh..opq` marker fully masks the lower layers for

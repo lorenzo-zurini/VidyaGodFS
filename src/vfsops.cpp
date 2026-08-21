@@ -82,16 +82,23 @@ static void CollectChildren(VfsState &S, const std::string &v, std::set<std::str
                     }
             }
         }
-        // File layer: its basename is a child of its containing dir.
-        if (L.type == LayerType::File && SegmentAfter(v, L.fileVPath) == L.fileBase)
-            out.insert(L.fileBase);
-        // Structural child dir from a deeper layer presence (target / fileVPath).
-        const std::string &pp = (L.type == LayerType::File) ? L.fileVPath : L.target;
-        if (std::string seg = SegmentAfter(v, pp); !seg.empty()) out.insert(seg);
+        // File-layer basename and structural child-dir contributions come from LOWER layers too, so an
+        // opaque writelayer dir must suppress them exactly like the Dir/Zip content above — otherwise readdir
+        // lists names that Resolve (via IsUnderOpaque) reports ENOENT for.
+        if (!opaque)
+        {
+            // File layer: its basename is a child of its containing dir.
+            if (L.type == LayerType::File && SegmentAfter(v, L.fileVPath) == L.fileBase)
+                out.insert(L.fileBase);
+            // Structural child dir from a deeper layer presence (target / fileVPath).
+            const std::string &pp = (L.type == LayerType::File) ? L.fileVPath : L.target;
+            if (std::string seg = SegmentAfter(v, pp); !seg.empty()) out.insert(seg);
+        }
     }
 
-    for (const std::string &d : S.implicitDirs)
-        if (std::string seg = SegmentAfter(v, d); !seg.empty()) out.insert(seg);
+    if (!opaque)
+        for (const std::string &d : S.implicitDirs)
+            if (std::string seg = SegmentAfter(v, d); !seg.empty()) out.insert(seg);
 
     for (const std::string &w : whiteouts) out.erase(w);
 }
@@ -280,7 +287,13 @@ int VfsUnlink(VfsState &S, const std::string &v)
     if (S.readOnly) return -EROFS;
     std::string host;
     if (PassthroughHost(S, v, host)) return HostIO::Unlink(host); // straight to source
-    if (!S.writelayer.empty()) HostIO::Unlink(WLPath(S, v));
+    // Removing the writelayer copy (if any): tolerate ENOENT (it may only exist below), fail loudly on
+    // anything else rather than silently returning success.
+    if (!S.writelayer.empty())
+    {
+        int e = HostIO::Unlink(WLPath(S, v));
+        if (e != 0 && e != -ENOENT) return e;
+    }
     if (Resolve(S, v).kind != HitKind::None) CreateWhiteout(S, v); // still visible below → hide it
     return 0;
 }

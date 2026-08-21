@@ -14,6 +14,25 @@ namespace fs = std::filesystem;
 
 // ---- small path helpers --------------------------------------------------
 
+// Symlink abolition containment: a followed DATA-layer symlink must resolve to a real path that stays
+// INSIDE the layer's source root. A zip layer already rejects absolute targets; a dir layer's host symlink
+// could point at an absolute path (`-> /etc/passwd`) or `../..`-escape the source, which would make the FS
+// serve an arbitrary host file. Returns true iff the followed `host` path is contained in `layerSource`.
+static bool SymlinkContained(const std::string &host, const std::string &layerSource)
+{
+    std::error_code ec;
+    std::filesystem::path resolved = std::filesystem::weakly_canonical(host, ec);
+    if (ec) return false;
+    std::filesystem::path rootc = std::filesystem::weakly_canonical(layerSource, ec);
+    if (ec) return false;
+    // Lexical prefix check on canonical paths (both absolute, no symlinks remaining).
+    auto rit = rootc.begin(), rend = rootc.end();
+    auto pit = resolved.begin(), pend = resolved.end();
+    for (; rit != rend; ++rit, ++pit)
+        if (pit == pend || *pit != *rit) return false;
+    return true;   // resolved == rootc or a descendant
+}
+
 static std::string ParentVRel(const std::string &vrel)
 {
     size_t s = vrel.find_last_of('/');
@@ -155,12 +174,9 @@ bool VfsState::Init(const Spec &S, std::string &Err)
     (void)Err;
 }
 
-std::shared_ptr<std::mutex> VfsState::CopyUpLock(const std::string &vrel)
+std::mutex &VfsState::CopyUpLock(const std::string &vrel)
 {
-    std::lock_guard<std::mutex> g(copyUpMapMtx);
-    auto &slot = copyUpLocks[vrel];
-    if (!slot) slot = std::make_shared<std::mutex>();
-    return slot;
+    return copyUpShards[std::hash<std::string>{}(vrel) % kCopyUpShards];
 }
 
 // ---- coverage / relative path --------------------------------------------
@@ -203,13 +219,16 @@ bool IsWhiteouted(const VfsState &S, const std::string &vrel)
     return HostIO::Lstat(WhiteoutPath(S, vrel), st) == 0;
 }
 
-void CreateWhiteout(const VfsState &S, const std::string &vrel)
+void CreateWhiteout(VfsState &S, const std::string &vrel)
 {
     if (S.writelayer.empty()) return;
     std::error_code ec;
     fs::create_directories(WLPath(S, ParentVRel(vrel)), ec);
     HostIO::Fd fd = HostIO::Open(WhiteoutPath(S, vrel), O_CREAT | O_WRONLY, 0644);
     if (fd >= 0) HostIO::Close(fd);
+    // release: the whiteout file exists on disk before any other thread observes hasWhiteout==true and
+    // starts masking subtrees against it.
+    S.hasWhiteout.store(true, std::memory_order_release);
 }
 
 void RemoveWhiteout(const VfsState &S, const std::string &vrel)
@@ -237,14 +256,26 @@ void MarkOpaque(VfsState &S, const std::string &vrel)
     if (S.writelayer.empty()) return;
     HostIO::Fd fd = HostIO::Open(OpaqueMarker(S, vrel), O_CREAT | O_WRONLY, 0644);
     if (fd >= 0) HostIO::Close(fd);
-    S.hasOpaque.store(true, std::memory_order_relaxed);
+    // release: the marker file exists before another thread's IsUnderOpaque (acquire) can observe the flag
+    // and rely on the marker being present (Bug #5: relaxed gave no happens-before → transient masking miss).
+    S.hasOpaque.store(true, std::memory_order_release);
+}
+
+//True if any ANCESTOR directory of vrel is whiteouted (deleted) — so a deleted directory masks its entire
+//subtree, not just its own name. Gated by hasWhiteout so it costs nothing until a whiteout exists.
+bool IsUnderWhiteout(const VfsState &S, const std::string &vrel)
+{
+    if (!S.hasWhiteout.load(std::memory_order_acquire) || S.writelayer.empty()) return false;
+    for (std::string cur = ParentVRel(vrel); !cur.empty(); cur = ParentVRel(cur))
+        if (IsWhiteouted(S, cur)) return true;
+    return false;
 }
 
 //True if any ancestor directory of vrel (including the root) is opaque — meaning the lower layers are
 //masked here. Gated by hasOpaque so it costs nothing until an opaque dir actually exists.
 bool IsUnderOpaque(const VfsState &S, const std::string &vrel)
 {
-    if (!S.hasOpaque.load(std::memory_order_relaxed) || S.writelayer.empty()) return false;
+    if (!S.hasOpaque.load(std::memory_order_acquire) || S.writelayer.empty()) return false;
     for (std::string cur = ParentVRel(vrel); !cur.empty(); cur = ParentVRel(cur))
         if (IsOpaqueDir(S, cur)) return true;
     return IsOpaqueDir(S, ""); // root opaque masks everything
@@ -262,8 +293,9 @@ ResolveResult Resolve(VfsState &S, const std::string &vrel)
         std::string wp = WLPath(S, vrel);
         HostIO::Stat st;
         if (HostIO::Lstat(wp, st) == 0) { R.kind = HitKind::WriteLayer; R.hostPath = wp; return R; }
-        // Not in the writelayer, but masked by an opaque ancestor → the lower layers don't show here.
-        if (IsUnderOpaque(S, vrel)) return R;
+        // Not in the writelayer, but masked by an opaque ancestor OR under a deleted (whiteouted) directory
+        // → the lower layers don't show here (recreating an ancestor removes its whiteout, so no conflict).
+        if (IsUnderOpaque(S, vrel) || IsUnderWhiteout(S, vrel)) return R;
     }
 
     // Highest priority first.
@@ -284,8 +316,9 @@ ResolveResult Resolve(VfsState &S, const std::string &vrel)
                 // the path (fall through to lower layers). rw (passthrough) layers are EXEMPT like the
                 // writelayer: they hold live guest-written state (persisted user dirs where proton keeps
                 // its own user-path links), which must round-trip as authored.
-                if (S.flattenSymlinks && !L.rw && st.isSymlink && HostIO::StatFollow(host, st) != 0)
-                    continue;
+                if (S.flattenSymlinks && !L.rw && st.isSymlink &&
+                    (HostIO::StatFollow(host, st) != 0 || !SymlinkContained(host, L.source)))
+                    continue;   // dangling OR escapes the layer source → not served by this layer
                 R.kind = HitKind::DirLayer; R.hostPath = host; R.layer = &L; R.rwPassthrough = L.rw;
                 return R;
             }
@@ -366,8 +399,7 @@ int CopyUp(VfsState &S, const std::string &vrel, const ResolveResult &rr)
     if (rr.kind == HitKind::WriteLayer) return 0;       // already writable
     if (rr.rwPassthrough) return 0;                     // writes pass straight to source
 
-    auto lock = S.CopyUpLock(vrel);
-    std::lock_guard<std::mutex> g(*lock);
+    std::lock_guard<std::mutex> g(S.CopyUpLock(vrel));
 
     std::string dst = WLPath(S, vrel);
     HostIO::Stat st;
@@ -375,9 +407,17 @@ int CopyUp(VfsState &S, const std::string &vrel, const ResolveResult &rr)
 
     if (int e = EnsureWriteParent(S, vrel); e != 0) return e;
 
-    // Directory copy-up: just create the dir in the writelayer.
+    // Directory copy-up: just create the dir in the writelayer. Classify with the SAME follow semantics
+    // Resolve used to serve this hit: under flatten a data dir-layer symlink to a directory is served as a
+    // dir (getattr uses StatFollow), so copy-up must see a dir too — else it would open the link as a file
+    // and stream a directory's bytes. rw/writelayer hits keep the link-itself (Lstat) view.
+    const bool followSyms = S.flattenSymlinks && !rr.rwPassthrough && rr.kind == HitKind::DirLayer;
+    auto dirStat = [&](const std::string &p) {
+        return followSyms ? HostIO::StatFollow(p, st) == 0 && st.isDir
+                          : HostIO::Lstat(p, st) == 0 && st.isDir;
+    };
     bool isDir = (rr.kind == HitKind::ImplicitDir) ||
-                 (rr.kind == HitKind::DirLayer && HostIO::Lstat(rr.hostPath, st) == 0 && st.isDir) ||
+                 (rr.kind == HitKind::DirLayer && dirStat(rr.hostPath)) ||
                  (rr.kind == HitKind::ZipEntry && (rr.zipEntry == nullptr || rr.zipEntry->isDir));
     if (isDir)
     {
@@ -429,7 +469,7 @@ int CopyUp(VfsState &S, const std::string &vrel, const ResolveResult &rr)
                 int got = ReadZipEntry(zr, buf, sizeof buf, off);
                 if (got < 0) { rc = got; break; }
                 if (got == 0) break;
-                if (HostIO::Write(out, buf, (size_t)got) != got) { rc = -EIO; break; }
+                if (int we = HostIO::FullWrite(out, buf, (size_t)got); we != 0) { rc = we; break; }
                 off += got;
             }
         }
@@ -443,7 +483,7 @@ int CopyUp(VfsState &S, const std::string &vrel, const ResolveResult &rr)
             char buf[256 * 1024];
             ssize_t got;
             while ((got = HostIO::Read(in, buf, sizeof buf)) > 0)
-                if (HostIO::Write(out, buf, (size_t)got) != got) { rc = -EIO; break; }
+                if (int we = HostIO::FullWrite(out, buf, (size_t)got); we != 0) { rc = we; break; }
             if (got < 0 && rc == 0) rc = (int)got;
             HostIO::Close(in);
             if (HostIO::Lstat(rr.hostPath, st) == 0) HostIO::Fchmod(out, st.mode & 0777);

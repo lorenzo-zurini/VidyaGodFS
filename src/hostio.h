@@ -21,6 +21,7 @@
 // impl maps to a HANDLE. The core treats it opaquely (open → use → close).
 // ---------------------------------------------------------------------------
 
+#include <cerrno>
 #include <cstdint>
 #include <cstddef>
 #include <string>
@@ -66,6 +67,21 @@ ssize_t Pread (Fd fd, void *buf, size_t n, uint64_t off);        // positioned, 
 ssize_t Pwrite(Fd fd, const void *buf, size_t n, uint64_t off);
 ssize_t Read (Fd fd, void *buf, size_t n);                       // sequential (copy-up stream loop)
 ssize_t Write(Fd fd, const void *buf, size_t n);
+// Writes exactly n bytes, looping over short writes and retrying signal-interrupted ones (Write returns
+// -EINTR). Returns 0 on success or a negative -errno. Copy-up and any full-buffer sink must use this
+// rather than treating a short write as a hard error.
+inline int FullWrite(Fd fd, const void *buf, size_t n)
+{
+    const char *p = static_cast<const char *>(buf);
+    while (n > 0)
+    {
+        ssize_t w = Write(fd, p, n);
+        if (w < 0) { if (w == -EINTR) continue; return (int)w; }
+        if (w == 0) return -EIO;
+        p += w; n -= (size_t)w;
+    }
+    return 0;
+}
 int     Fsync(Fd fd);
 int     Ftruncate(Fd fd, uint64_t size);
 int     Fstat(Fd fd, Stat &out);

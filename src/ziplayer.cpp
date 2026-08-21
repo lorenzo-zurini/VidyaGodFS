@@ -1,5 +1,6 @@
 #include "ziplayer.h"
 #include "layerspec.h"   // NormalizeVPath
+#include "zipscan.h"     // CentralDirOffsets / LocalDataOffset (the shared ZIP64 CD walker)
 
 #include <zip.h>
 #include <cstring>
@@ -7,105 +8,6 @@
 #include <algorithm>
 #include <sys/stat.h>
 #include <iostream>
-
-// ---- little-endian readers -----------------------------------------------
-
-static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
-static uint32_t rd32(const uint8_t *p) { return (uint32_t)(p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24)); }
-static uint64_t rd64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; --i) v = (v << 8) | p[i]; return v; }
-
-// ---- zip central-directory parsing (for STORED data offsets) --------------
-// Reads through a ByteSource so a delta-backed archive parses exactly like a plain file.
-
-//Walks the central directory and returns normalized-name → local-header offset (ZIP64-aware).
-//Empty on any parse failure (callers then fall back to libzip extraction — no STORED zero-copy).
-static std::unordered_map<std::string, uint64_t> ParseCentralDirOffsets(ByteSource &src)
-{
-    std::unordered_map<std::string, uint64_t> out;
-    uint64_t fsize = src.size();
-    if (fsize < 22) return out;
-
-    // Locate the End Of Central Directory by scanning the tail for its signature.
-    uint64_t tail = std::min<uint64_t>(fsize, 22 + 65535);
-    std::vector<uint8_t> buf(tail);
-    if (!src.preadAll(buf.data(), tail, fsize - tail)) return out;
-    long eocd = -1;
-    for (long i = (long)tail - 22; i >= 0; --i)
-        if (rd32(&buf[i]) == 0x06054b50u) { eocd = i; break; }
-    if (eocd < 0) return out;
-
-    const uint8_t *E = &buf[eocd];
-    uint64_t totalEntries = rd16(E + 10);
-    uint64_t cdOffset     = rd32(E + 16);
-    uint64_t eocdFileOff  = fsize - tail + (uint64_t)eocd;
-
-    // ZIP64: the 32-bit fields are sentinels (>4 GB archive). Follow the locator → ZIP64 EOCD.
-    if (cdOffset == 0xFFFFFFFFu || totalEntries == 0xFFFFu)
-    {
-        if (eocdFileOff < 20) return out;
-        uint8_t loc[20];
-        if (!src.preadAll(loc, 20, eocdFileOff - 20) || rd32(loc) != 0x07064b50u) return out;
-        uint64_t z64off = rd64(loc + 8);
-        uint8_t z64[56];
-        if (!src.preadAll(z64, 56, z64off) || rd32(z64) != 0x06064b50u) return out;
-        totalEntries = rd64(z64 + 32);
-        cdOffset     = rd64(z64 + 48);
-    }
-
-    uint64_t pos = cdOffset;
-    for (uint64_t i = 0; i < totalEntries; ++i)
-    {
-        uint8_t rec[46];
-        if (!src.preadAll(rec, 46, pos) || rd32(rec) != 0x02014b50u) break;
-        uint16_t nameLen  = rd16(rec + 28);
-        uint16_t extraLen = rd16(rec + 30);
-        uint16_t commLen  = rd16(rec + 32);
-        uint32_t compSize32   = rd32(rec + 20);
-        uint32_t uncompSize32 = rd32(rec + 24);
-        uint64_t lhOffset     = rd32(rec + 42);
-
-        std::vector<uint8_t> name(nameLen);
-        if (nameLen && !src.preadAll(name.data(), nameLen, pos + 46)) break;
-
-        // Pull the 64-bit local-header offset from the ZIP64 extra when the 32-bit field is a sentinel.
-        if (lhOffset == 0xFFFFFFFFu)
-        {
-            std::vector<uint8_t> extra(extraLen);
-            if (extraLen && src.preadAll(extra.data(), extraLen, pos + 46 + nameLen))
-            {
-                size_t e = 0;
-                while (e + 4 <= (size_t)extraLen)
-                {
-                    uint16_t id = rd16(&extra[e]); uint16_t sz = rd16(&extra[e + 2]);
-                    if (e + 4 + sz > (size_t)extraLen) break;
-                    if (id == 0x0001) // ZIP64 extended info: present fields appear in order for each sentinel
-                    {
-                        size_t f = e + 4, end = e + 4 + sz;
-                        if (uncompSize32 == 0xFFFFFFFFu && f + 8 <= end) f += 8;
-                        if (compSize32   == 0xFFFFFFFFu && f + 8 <= end) f += 8;
-                        if (f + 8 <= end) lhOffset = rd64(&extra[f]);
-                        break;
-                    }
-                    e += 4 + sz;
-                }
-            }
-        }
-
-        std::string vrel = NormalizeVPath(std::string((const char *)name.data(), nameLen));
-        if (!vrel.empty()) out[vrel] = lhOffset;
-        pos += 46u + nameLen + extraLen + commLen;
-    }
-    return out;
-}
-
-//Returns the absolute data offset of the entry whose local header is at lhOffset, or UINT64_MAX.
-static uint64_t LocalDataOffset(ByteSource &src, uint64_t lhOffset)
-{
-    uint8_t lh[30];
-    if (!src.preadAll(lh, 30, lhOffset) || rd32(lh) != 0x04034b50u) return UINT64_MAX;
-    // The LOCAL header's name/extra lengths (which can differ from the central ones) set where data starts.
-    return lhOffset + 30 + rd16(lh + 26) + rd16(lh + 28);
-}
 
 // ---- libzip custom source over a ByteSource -------------------------------
 // Lets libzip enumerate entries of an archive whose bytes are not a plain file (a delta view). Read-only,
@@ -198,7 +100,7 @@ std::shared_ptr<ZipIndex> BuildZipIndex(std::shared_ptr<ByteSource> Src, const s
     Z->src = Src;
 
     // Local-header offsets for STORED zero-copy (empty if the CD parse is unavailable).
-    auto lhOffsets = ParseCentralDirOffsets(*Src);
+    auto lhOffsets = zipscan::CentralDirOffsets(*Src);
 
     zip_int64_t n = zip_get_num_entries(za, 0);
     for (zip_int64_t i = 0; i < n; ++i)
@@ -241,7 +143,7 @@ std::shared_ptr<ZipIndex> BuildZipIndex(std::shared_ptr<ByteSource> Src, const s
                 auto it = lhOffsets.find(vrel);
                 if (it != lhOffsets.end())
                 {
-                    uint64_t doff = LocalDataOffset(*Src, it->second);
+                    uint64_t doff = zipscan::LocalDataOffset(*Src, it->second);
                     if (doff != UINT64_MAX) { e.stored = true; e.dataOffset = doff; }
                 }
             }
