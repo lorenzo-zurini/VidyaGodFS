@@ -10,7 +10,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(VGFS_WERROR      "Treat C++ warnings as errors" OFF)
 option(VGFS_SANITIZE    "Build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
 option(VGFS_BUILD_TESTS "Build the vgfs_tests unit suite" ON)
-set(VGFS_WARNINGS -Wall -Wextra -Wshadow=local -Wnon-virtual-dtor)
+# array-bounds/stringop-overflow are warnings, not errors — newer GCC false-positives via shared_ptr
+# inplace control blocks in system headers (mirrors the parent's VG_WARNINGS rationale).
+set(VGFS_WARNINGS -Wall -Wextra -Wshadow=local -Wnon-virtual-dtor
+    -Wno-error=array-bounds -Wno-error=stringop-overflow)
 
 # vidyagodfs links libzip + libzstd + a mount backend (FUSE on Linux, WinFsp on Windows); the merged-tree
 # spec is parsed with nlohmann_json. libzstd backs the .vgdelta binary-delta layers (random-access,

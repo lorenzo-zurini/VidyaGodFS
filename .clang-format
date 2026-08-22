@@ -1,0 +1,19 @@
+# Tuned to the DOMINANT existing style (Allman-ish braces, 4-space indent, ~115 cols, right-aligned
+# pointers). Introduced config-first: no wholesale reformat — new/edited code adopts it; the CI gate
+# arrives only after a dedicated reformat commit (see .git-blame-ignore-revs when that lands).
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 115
+BreakBeforeBraces: Allman
+PointerAlignment: Right
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AlignConsecutiveAssignments: Consecutive
+AlignTrailingComments: true
+SpacesBeforeTrailingComments: 3
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 2
+SortIncludes: Never
+ReflowComments: false
+AccessModifierOffset: -4
