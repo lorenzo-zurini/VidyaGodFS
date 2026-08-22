@@ -5,10 +5,21 @@
 #include <cstddef>
 #include <cstring>
 #include <cerrno>
+#include <string>
 #include <vector>
 #include <memory>
 #include <sys/types.h>
 #include "hostio.h"    // host fd I/O behind the backend-neutral shim (Pread/Close)
+
+// MmapByteSource backing: raw mmap on POSIX, read-into-memory via ifstream on Windows.
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#else
+#include <fstream>
+#endif
 
 // ---------------------------------------------------------------------------
 // ByteSource — a random-access, read-only, thread-safe byte stream. This is the ONE abstraction the zip
@@ -73,6 +84,54 @@ struct MemByteSource : ByteSource {
 // pread dispatches to the part covering an offset and splits reads that straddle a boundary. Order + each
 // part's bytes must match what generation concatenated (deterministic reconstruction guarantees this).
 // ---------------------------------------------------------------------------
+// A whole file mapped read-only (POSIX mmap, MADV_SEQUENTIAL; Windows falls back to reading it into
+// memory — conversions there are small). Exposes the flat pointer (`p`/`n`) for callers that need
+// contiguous access (GenerateDelta's matcher, the convert tool's memcmp verify) while still being a
+// ByteSource for everything else. Replaces the app's former local `MapSrc`.
+struct MmapByteSource : ByteSource {
+    const uint8_t *p = nullptr;
+    uint64_t       n = 0;
+#ifndef _WIN32
+    int   fd = -1;
+    void *m  = nullptr;
+    bool Map(const std::string &path) {
+        fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) return false;
+        struct stat st{};
+        if (::fstat(fd, &st) != 0 || st.st_size <= 0) return false;
+        n = (uint64_t)st.st_size;
+        m = ::mmap(nullptr, (size_t)n, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (m == MAP_FAILED) { m = nullptr; return false; }
+        ::madvise(m, (size_t)n, MADV_SEQUENTIAL);
+        p = (const uint8_t *)m;
+        return true;
+    }
+    ~MmapByteSource() override { if (m) ::munmap(m, (size_t)n); if (fd >= 0) ::close(fd); }
+#else
+    std::vector<uint8_t> d;
+    bool Map(const std::string &path) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return false;
+        f.seekg(0, std::ios::end);
+        std::streamoff sz = f.tellg();
+        if (sz < 0) return false;
+        d.resize((size_t)sz);
+        f.seekg(0, std::ios::beg);
+        f.read((char *)d.data(), sz);
+        if ((std::streamoff)f.gcount() != sz) return false;
+        p = d.data(); n = (uint64_t)sz;
+        return true;
+    }
+#endif
+    ssize_t pread(void *b, size_t k, uint64_t o) override {
+        if (o >= n) return 0;
+        uint64_t a = n - o; size_t w = k < a ? k : a;
+        std::memcpy(b, p + o, w);
+        return (ssize_t)w;
+    }
+    uint64_t size() const override { return n; }
+};
+
 struct ConcatByteSource : ByteSource {
     struct Part { std::shared_ptr<ByteSource> src; uint64_t start; uint64_t len; };
     std::vector<Part> parts;

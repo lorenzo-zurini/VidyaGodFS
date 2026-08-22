@@ -459,3 +459,28 @@ std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
 }
 
 } // namespace vgdelta
+
+bool vgdelta::VerifyDelta(const std::vector<uint8_t> &delta, const std::shared_ptr<ByteSource> &base,
+                          ByteSource &target, std::string &Err)
+{
+    std::string derr;
+    auto ds = DeltaByteSource::Create(std::make_shared<MemByteSource>(delta), base, derr, false);
+    if (!ds) { Err = "compose failed: " + derr; return false; }
+    const uint64_t N = target.size();
+    if (ds->size() != N)
+    {
+        Err = "size mismatch: reconstructed " + std::to_string(ds->size()) + " vs target " + std::to_string(N);
+        return false;
+    }
+    constexpr size_t CH = size_t(8) << 20;
+    std::vector<uint8_t> a(CH), b(CH);
+    for (uint64_t off = 0; off < N;)
+    {
+        const size_t want = (size_t)std::min<uint64_t>(CH, N - off);
+        if (!ds->preadAll(a.data(), want, off))     { Err = "reconstruction read failed at " + std::to_string(off); return false; }
+        if (!target.preadAll(b.data(), want, off))  { Err = "target read failed at " + std::to_string(off); return false; }
+        if (std::memcmp(a.data(), b.data(), want) != 0) { Err = "byte mismatch in chunk at " + std::to_string(off); return false; }
+        off += want;
+    }
+    return true;
+}

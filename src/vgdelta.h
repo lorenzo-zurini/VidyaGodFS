@@ -114,6 +114,13 @@ std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
                                    uint32_t blockSize = DEFAULT_BLOCK,
                                    const std::string &scratchDir = std::string());
 
+// Byte-verifies a delta: composes it over `base`, then streams the reconstruction and compares it against
+// `target` chunk-by-chunk. True only on an exact byte-for-byte match; on failure Err says what diverged
+// (create/size/read/mismatch). THE one verify used by both the app's --convert-delta-chain and the tests —
+// production converts and the test suite must never hand-roll (and drift) their own reconstruct-compare.
+bool VerifyDelta(const std::vector<uint8_t> &delta, const std::shared_ptr<ByteSource> &base,
+                 ByteSource &target, std::string &Err);
+
 } // namespace vgdelta
 
 #endif // VIDYAGODFS_VGDELTA_H

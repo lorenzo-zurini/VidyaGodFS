@@ -10,20 +10,19 @@ uint16_t Rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 uint32_t Rd32(const uint8_t *p) { return (uint32_t)(p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24)); }
 uint64_t Rd64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; --i) v = (v << 8) | p[i]; return v; }
 
-std::unordered_map<std::string, uint64_t> CentralDirOffsets(ByteSource &src)
+bool WalkCentralDir(ByteSource &src, const EntryCb &cb)
 {
-    std::unordered_map<std::string, uint64_t> out;
     uint64_t fsize = src.size();
-    if (fsize < 22) return out;
+    if (fsize < 22) return false;
 
     // Locate the End Of Central Directory by scanning the tail for its signature.
     uint64_t tail = std::min<uint64_t>(fsize, 22 + 65535);
     std::vector<uint8_t> buf(tail);
-    if (!src.preadAll(buf.data(), tail, fsize - tail)) return out;
+    if (!src.preadAll(buf.data(), tail, fsize - tail)) return false;
     long eocd = -1;
     for (long i = (long)tail - 22; i >= 0; --i)
         if (Rd32(&buf[i]) == 0x06054b50u) { eocd = i; break; }
-    if (eocd < 0) return out;
+    if (eocd < 0) return false;
 
     const uint8_t *E = &buf[eocd];
     uint64_t totalEntries = Rd16(E + 10);
@@ -33,12 +32,12 @@ std::unordered_map<std::string, uint64_t> CentralDirOffsets(ByteSource &src)
     // ZIP64: the 32-bit fields are sentinels (>4 GB archive). Follow the locator → ZIP64 EOCD.
     if (cdOffset == 0xFFFFFFFFu || totalEntries == 0xFFFFu)
     {
-        if (eocdFileOff < 20) return out;
+        if (eocdFileOff < 20) return false;
         uint8_t loc[20];
-        if (!src.preadAll(loc, 20, eocdFileOff - 20) || Rd32(loc) != 0x07064b50u) return out;
+        if (!src.preadAll(loc, 20, eocdFileOff - 20) || Rd32(loc) != 0x07064b50u) return false;
         uint64_t z64off = Rd64(loc + 8);
         uint8_t z64[56];
-        if (!src.preadAll(z64, 56, z64off) || Rd32(z64) != 0x06064b50u) return out;
+        if (!src.preadAll(z64, 56, z64off) || Rd32(z64) != 0x06064b50u) return false;
         totalEntries = Rd64(z64 + 32);
         cdOffset     = Rd64(z64 + 48);
     }
@@ -47,7 +46,8 @@ std::unordered_map<std::string, uint64_t> CentralDirOffsets(ByteSource &src)
     for (uint64_t i = 0; i < totalEntries; ++i)
     {
         uint8_t rec[46];
-        if (!src.preadAll(rec, 46, pos) || Rd32(rec) != 0x02014b50u) break;
+        if (!src.preadAll(rec, 46, pos) || Rd32(rec) != 0x02014b50u) return false;
+        uint16_t method   = Rd16(rec + 10);
         uint16_t nameLen  = Rd16(rec + 28);
         uint16_t extraLen = Rd16(rec + 30);
         uint16_t commLen  = Rd16(rec + 32);
@@ -56,7 +56,7 @@ std::unordered_map<std::string, uint64_t> CentralDirOffsets(ByteSource &src)
         uint64_t lhOffset     = Rd32(rec + 42);
 
         std::vector<uint8_t> name(nameLen);
-        if (nameLen && !src.preadAll(name.data(), nameLen, pos + 46)) break;
+        if (nameLen && !src.preadAll(name.data(), nameLen, pos + 46)) return false;
 
         // Pull the 64-bit local-header offset from the ZIP64 extra when the 32-bit field is a sentinel.
         if (lhOffset == 0xFFFFFFFFu)
@@ -82,11 +82,32 @@ std::unordered_map<std::string, uint64_t> CentralDirOffsets(ByteSource &src)
             }
         }
 
-        std::string vrel = NormalizeVPath(std::string((const char *)name.data(), nameLen));
-        if (!vrel.empty()) out[vrel] = lhOffset;
+        if (!cb(std::string((const char *)name.data(), nameLen), method, lhOffset)) return true; // caller stopped
         pos += 46u + nameLen + extraLen + commLen;
     }
+    return true;
+}
+
+std::unordered_map<std::string, uint64_t> CentralDirOffsets(ByteSource &src)
+{
+    std::unordered_map<std::string, uint64_t> out;
+    WalkCentralDir(src, [&](const std::string &raw, uint16_t, uint64_t lhOffset) {
+        std::string vrel = NormalizeVPath(raw);
+        if (!vrel.empty()) out[vrel] = lhOffset;
+        return true;
+    });
     return out;
+}
+
+std::string FirstCompressedEntry(ByteSource &src)
+{
+    std::string result;
+    WalkCentralDir(src, [&](const std::string &raw, uint16_t method, uint64_t) {
+        if (method == 0) return true;                       // STORE — keep walking
+        result = raw.empty() ? "(entry)" : raw;
+        return false;                                       // found one — stop
+    });
+    return result;
 }
 
 uint64_t LocalDataOffset(ByteSource &src, uint64_t lhOffset)
