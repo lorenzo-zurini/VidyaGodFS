@@ -54,6 +54,29 @@ static int op_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t
                       [&](const std::string &n) { filler(buf, n.c_str(), nullptr, 0, (fuse_fill_dir_flags)0); });
 }
 
+static int op_opendir(const char *, struct fuse_file_info *fi)
+{
+    // Kernel-side directory caching. Without FOPEN_CACHE_DIR every getdents round-trips to
+    // userspace and re-merges the whole overlay; keep_cache preserves the cached listing across
+    // opendir calls (wine re-opens the directory on every case-insensitive lookup miss, so
+    // without it the cache would be dropped before it's ever reused). The kernel invalidates the
+    // cache itself on create/unlink/rename through this mount; external writes into passthrough
+    // sources can go stale for a bit — same trade-off auto_cache already makes for file data.
+    fi->cache_readdir = 1;
+    fi->keep_cache    = 1;
+    return 0;
+}
+
+static void *op_init(struct fuse_conn_info *, struct fuse_config *cfg)
+{
+    // Cache exact-name misses for a second (default 0 re-asks userspace on every negative
+    // lookup); attr/entry keep libfuse's 1s defaults, stated here so the choice is explicit.
+    cfg->negative_timeout = 1.0;
+    cfg->attr_timeout     = 1.0;
+    cfg->entry_timeout    = 1.0;
+    return fuse_get_context()->private_data;
+}
+
 static int op_open(const char *path, struct fuse_file_info *fi)
 {
     OpenFile *of = nullptr;
@@ -166,6 +189,8 @@ const struct fuse_operations *VidyagodfsOps()
     ops.release  = op_release;
     ops.fsync    = op_fsync;
     ops.readdir  = op_readdir;
+    ops.opendir  = op_opendir;
+    ops.init     = op_init;
     ops.create   = op_create;
     ops.utimens  = op_utimens;
     return &ops;
