@@ -339,3 +339,38 @@ int main() {
               << g_tests.size() << " tests\n";
     return g_fail ? 1 : 0;
 }
+
+// KEEP-subtree durability: MODIFYING a file that exists only in a LOWER layer, under an rw-passthrough
+// subtree, must copy up INTO the passthrough source (durable) — not the ephemeral writelayer. This was
+// the "seeded config never persists the game's changes" hole: creates went durable, edits vanished.
+TEST(passthrough_copyup_lands_durable) {
+    TmpDir t;
+    writeFile(t / "lower/cfg/settings.cfg", "xres 640\n");
+    fs::create_directories(t / "durable/cfg");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl");
+    LayerSpec lo = dirLayer(t.str("lower"));
+    LayerSpec keep = dirLayer(t.str("durable/cfg"), "cfg", /*rw=*/true);   // KEEP passthrough over cfg/
+    sp.layers = { lo, keep };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+
+    // the seeded file is visible through the union
+    VfsAttr a; CHECK_EQ(VfsGetattr(S, "cfg/settings.cfg", a), 0);
+
+    // open-for-write (the game's config rewrite) …
+    OpenFile *of = nullptr;
+    CHECK_EQ(VfsOpen(S, "cfg/settings.cfg", 0x241 /*O_WRONLY|O_CREAT|O_TRUNC*/, of), 0);
+    const char *nw = "xres 1920\n";
+    CHECK(VfsWrite(S, of, nw, 10, 0) == 10);
+    VfsRelease(of);
+
+    // … lands in the DURABLE passthrough source, not the writelayer
+    std::ifstream in(t / "durable/cfg/settings.cfg");
+    std::string got((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    CHECK_EQ(got, std::string("xres 1920\n"));
+    CHECK(!fs::exists(t / "wl/cfg/settings.cfg"));    // nothing leaked into the ephemeral layer
+
+    // and reads see the new content
+    OpenFile *rf = nullptr; CHECK_EQ(VfsOpen(S, "cfg/settings.cfg", 0, rf), 0);
+    char buf[32] = {0}; ssize_t r = VfsRead(rf, buf, sizeof buf, 0); VfsRelease(rf);
+    CHECK_EQ(std::string(buf, r), std::string("xres 1920\n"));
+}

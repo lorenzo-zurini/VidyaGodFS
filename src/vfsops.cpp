@@ -220,7 +220,10 @@ int VfsOpen(VfsState &S, const std::string &v, int flags, OpenFile *&out)
     {
         if (!rr.rwPassthrough && rr.kind != HitKind::WriteLayer)
             if (int e = CopyUp(S, v, rr); e != 0) return e;
-        host = rr.rwPassthrough ? rr.hostPath : WLPath(S, v);
+        //Post-copy-up destination: the passthrough source when the path lives under a KEEP subtree
+        //(CopyUp just landed the bytes THERE), else the writelayer copy.
+        if (rr.rwPassthrough) host = rr.hostPath;
+        else if (!PassthroughHost(S, v, host)) host = WLPath(S, v);
     }
     else
     {
@@ -369,7 +372,9 @@ int VfsTruncate(VfsState &S, const std::string &v, OpenFile *of, uint64_t size)
     if (rr.kind == HitKind::None) return -ENOENT;
     if (rr.kind != HitKind::WriteLayer && !rr.rwPassthrough)
         if (int e = CopyUp(S, v, rr); e != 0) return e;
-    std::string host = rr.rwPassthrough ? rr.hostPath : WLPath(S, v);
+    std::string host;
+    if (rr.rwPassthrough) host = rr.hostPath;
+    else if (!PassthroughHost(S, v, host)) host = WLPath(S, v);
     return HostIO::Truncate(host, size);
 }
 
@@ -380,7 +385,9 @@ int VfsChmod(VfsState &S, const std::string &v, uint32_t mode)
     if (rr.kind == HitKind::None) return -ENOENT;
     if (rr.kind != HitKind::WriteLayer && !rr.rwPassthrough)
         if (int e = CopyUp(S, v, rr); e != 0) return e;
-    std::string host = rr.rwPassthrough ? rr.hostPath : WLPath(S, v);
+    std::string host;
+    if (rr.rwPassthrough) host = rr.hostPath;
+    else if (!PassthroughHost(S, v, host)) host = WLPath(S, v);
     return HostIO::Chmod(host, mode);
 }
 

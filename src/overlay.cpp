@@ -477,11 +477,24 @@ int CopyUp(VfsState &S, const std::string &vrel, const ResolveResult &rr)
 
     std::lock_guard<std::mutex> g(S.CopyUpLock(vrel));
 
-    std::string dst = WLPath(S, vrel);
+    //A path under a KEEP (rw passthrough) subtree must copy up INTO the passthrough source — the durable
+    //store — not into the ephemeral writelayer. Without this, modifying a file that exists in a LOWER
+    //layer (e.g. a package-seeded config inside a persisted dir) landed in the writelayer and silently
+    //vanished at teardown, while newly-created files (VfsCreate → passthrough) persisted — the
+    //"seeded config never keeps the game's changes" hole.
+    std::string dst;
+    const bool ToPassthrough = PassthroughHost(S, vrel, dst);
+    if (!ToPassthrough) dst = WLPath(S, vrel);
     HostIO::Stat st;
     if (HostIO::Lstat(dst, st) == 0) return 0;          // another thread already copied it up
 
-    if (int e = EnsureWriteParent(S, vrel); e != 0) return e;
+    if (ToPassthrough)
+    {
+        std::error_code Pec;
+        fs::create_directories(fs::path(dst).parent_path(), Pec);   // durable parent chain (mirrors EnsureHostParent)
+        if (Pec) return -EIO;
+    }
+    else if (int e = EnsureWriteParent(S, vrel); e != 0) return e;
 
     // Directory copy-up: just create the dir in the writelayer. Classify with the SAME follow semantics
     // Resolve used to serve this hit: under flatten a data dir-layer symlink to a directory is served as a
