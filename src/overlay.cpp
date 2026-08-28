@@ -134,11 +134,21 @@ bool VfsState::Init(const Spec &S, std::string &Err)
                 src = ds;
                 opaque = true;   // a reconstructed archive is complete → mask anything below at this target
             }
-            baseByTarget[LS.target] = src;   // the composed view this target has reached (drops the prior flat)
+            // Chain membership: at a target with a delta chain, only the layers UP TO the final delta are the
+            // chain (base zip + intermediate deltas + the top delta). Zip layers stacked AFTER the chain are
+            // ordinary overlay layers (a game's patch/no-CD/mod zips above a delta-converted base) — they were
+            // never generation-time byte inputs, so they must neither fold into the chain nor advance the
+            // composed byte view. Folding them (the old `gi != last` check) silently DROPPED every overlay
+            // above a delta: Halo CE served the delta's retail SafeDisc exe instead of the no-CD layer's
+            // (instant silent death), and MW4 Mercenaries masked its MekTek hotfixes.
+            const auto ChainEnd = lastDeltaIdx.find(LS.target);
+            const bool InChain  = ChainEnd != lastDeltaIdx.end() && gi <= ChainEnd->second;
+            if (InChain || ChainEnd == lastDeltaIdx.end())
+                baseByTarget[LS.target] = src;   // the composed byte view (chain members, or plain-zip targets)
 
             // Fold: a base zip or intermediate delta of a chain is a byte input only, subsumed into the top
             // delta's flat map — do not surface it (or even index it) as an overlay layer.
-            if (auto ld = lastDeltaIdx.find(LS.target); ld != lastDeltaIdx.end() && gi != ld->second) continue;
+            if (InChain && gi != ChainEnd->second) continue;
 
             zip = BuildZipIndex(src, LS.source);
             if (!zip) { std::cerr << "[vidyagodfs] skipping unreadable zip layer: " << LS.source << "\n"; continue; }
