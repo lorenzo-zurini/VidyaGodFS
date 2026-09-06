@@ -4,16 +4,27 @@ project(vidyagodfs LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Hard floor: src/overlay.h uses std::atomic<std::shared_ptr<>>, whose libstdc++ specialization landed in gcc-12.
+# On gcc-11 it degrades to a cryptic "std::atomic requires a trivially copyable type" static_assert deep in
+# <atomic>; fail early with the real reason. Lives here (beside the code) so both a standalone FS build AND the
+# parent's add_subdirectory(VidyaGodFS) are covered. (This is a g++ project; clang would also need libstdc++ >= 13.)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 12)
+    message(FATAL_ERROR "VidyaGodFS needs g++ >= 12 (std::atomic<std::shared_ptr>); found ${CMAKE_CXX_COMPILER_VERSION}.")
+endif()
+
 # ---- Build hardening ----
 # Warnings mirror the parent's set; -Werror and sanitizers are opt-in and, when built as a subdirectory,
 # are driven by the parent (which forwards VIDYAGOD_WERROR/VIDYAGOD_SANITIZE into VGFS_WERROR/VGFS_SANITIZE).
 option(VGFS_WERROR      "Treat C++ warnings as errors" OFF)
 option(VGFS_SANITIZE    "Build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
 option(VGFS_BUILD_TESTS "Build the vgfs_tests unit suite" ON)
-# array-bounds/stringop-overflow are warnings, not errors — newer GCC false-positives via shared_ptr
-# inplace control blocks in system headers (mirrors the parent's VG_WARNINGS rationale).
+# array-bounds/stringop-overflow/maybe-uninitialized are warnings, not errors — newer GCC false-positives via
+# shared_ptr inplace control blocks + nlohmann + std::function/<regex> in system headers, several appearing only
+# under sanitizer codegen (mirrors the parent's VG_WARNINGS rationale). These are the speculative -Wmaybe-* family;
+# the reliable -Wuninitialized stays an error. Caveat (see parent): ASan/UBSan do NOT catch uninitialized reads
+# at runtime (that is MemorySanitizer, clang-only), so path-dependent uninit reads have no hard gate here.
 set(VGFS_WARNINGS -Wall -Wextra -Wshadow=local -Wnon-virtual-dtor
-    -Wno-error=array-bounds -Wno-error=stringop-overflow)
+    -Wno-error=array-bounds -Wno-error=stringop-overflow -Wno-error=maybe-uninitialized)
 
 # vidyagodfs links libzip + libzstd + a mount backend (FUSE on Linux, WinFsp on Windows); the merged-tree
 # spec is parsed with nlohmann_json. libzstd backs the .vgdelta binary-delta layers (random-access,
