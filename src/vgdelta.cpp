@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -13,7 +14,9 @@
 
 #ifndef _WIN32
 #include <fcntl.h>      // SpillFile: open/posix_fadvise
-#include <unistd.h>     //   … write/fdatasync/close
+#include <unistd.h>     //   … write/fdatasync/close, and getpid for the scratch-name salt
+#else
+#include <process.h>    // _getpid — unistd.h does not exist here
 #endif
 
 namespace vgdelta {
@@ -325,7 +328,8 @@ static uint64_t HashWin(const uint8_t *p) { uint64_t h = 0; for (uint32_t i = 0;
 
 std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
                                    const uint8_t *target, size_t targetLen,
-                                   uint32_t blockSize, const std::string &scratchDir) {
+                                   uint32_t blockSize, const std::string &scratchDir,
+                                   const ProgressFn &progress) {
     if (blockSize == 0) blockSize = DEFAULT_BLOCK;
 
     // Scratch files (see the header): the raw literal stream and the compressed ADD region are written out as
@@ -333,8 +337,18 @@ std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
     std::error_code sec;
     const std::filesystem::path scratch =
         scratchDir.empty() ? std::filesystem::temp_directory_path(sec) : std::filesystem::path(scratchDir);
-    const auto uniq = std::to_string(
-        (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count());
+    // Clock alone is not unique: two concurrent generations landing in the same tick shared these files and
+    // corrupted each other, and whichever finished first deleted the other's scratch. Mix in the pid and a
+    // process-wide counter so concurrent callers cannot collide.
+    static std::atomic<uint64_t> ScratchSeq{0};
+#ifdef _WIN32
+    const uint64_t pid = (uint64_t)::_getpid();
+#else
+    const uint64_t pid = (uint64_t)::getpid();
+#endif
+    const auto uniq = std::to_string((uint64_t)std::chrono::steady_clock::now().time_since_epoch().count())
+                    + "_" + std::to_string(pid)
+                    + "_" + std::to_string(ScratchSeq.fetch_add(1));
     const std::filesystem::path litPath = scratch / ("vgdelta_lit_" + uniq + ".tmp");
     const std::filesystem::path cmpPath = scratch / ("vgdelta_cmp_" + uniq + ".tmp");
     struct Cleanup {
@@ -365,9 +379,19 @@ std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
 
     const uint64_t Rhi = PowR(ANCHOR - 1);
     size_t p = 0, litStart = 0;
+    // Poll sparsely: `p` advances one byte per miss, so a callback per iteration would cost more than the
+    // matching itself. Track the NEXT threshold rather than testing p's alignment — on a near-identical
+    // archive p leaps over whole boundaries on every COPY, so an alignment test fires once and never again,
+    // freezing the bar and making Cancel unreachable for the entire scan.
+    constexpr size_t kPollEvery = 4u << 20;
+    size_t nextPoll = 0;
     if (targetLen >= ANCHOR) {
         uint64_t h = HashWin(target);
         while (p + ANCHOR <= targetLen) {
+            if (progress && p >= nextPoll) {
+                if (!progress(0, (uint64_t)p, (uint64_t)targetLen)) return {};
+                nextPoll = p + kPollEvery;
+            }
             bool matched = false;
             auto it = index.find(h);
             if (it != index.end()) {
@@ -406,6 +430,7 @@ std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
         if (!in || !out.Open(cmpPath)) return {};
         std::vector<uint8_t> buf(blockSize);
         for (uint64_t o = 0; o < addTotal; o += blockSize) {
+            if (progress && !progress(1, o, addTotal)) return {};
             const uint32_t ul = (uint32_t)std::min<uint64_t>(blockSize, addTotal - o);
             in.read(reinterpret_cast<char *>(buf.data()), (std::streamsize)ul);
             if ((uint64_t)in.gcount() != ul) return {};
@@ -461,7 +486,7 @@ std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
 } // namespace vgdelta
 
 bool vgdelta::VerifyDelta(const std::vector<uint8_t> &delta, const std::shared_ptr<ByteSource> &base,
-                          ByteSource &target, std::string &Err)
+                          ByteSource &target, std::string &Err, const ProgressFn &progress)
 {
     std::string derr;
     auto ds = DeltaByteSource::Create(std::make_shared<MemByteSource>(delta), base, derr, false);
@@ -476,11 +501,16 @@ bool vgdelta::VerifyDelta(const std::vector<uint8_t> &delta, const std::shared_p
     std::vector<uint8_t> a(CH), b(CH);
     for (uint64_t off = 0; off < N;)
     {
+        //Every 8MiB chunk is already a coarse enough tick for a progress bar, so no threshold bookkeeping here.
+        if (progress && !progress(2, off, N)) { Err = "cancelled"; return false; }
         const size_t want = (size_t)std::min<uint64_t>(CH, N - off);
         if (!ds->preadAll(a.data(), want, off))     { Err = "reconstruction read failed at " + std::to_string(off); return false; }
         if (!target.preadAll(b.data(), want, off))  { Err = "target read failed at " + std::to_string(off); return false; }
         if (std::memcmp(a.data(), b.data(), want) != 0) { Err = "byte mismatch in chunk at " + std::to_string(off); return false; }
         off += want;
     }
+    //Report the finish. Polling only at the TOP of the loop meant the bar stopped one chunk short of 100%
+    //and simply vanished — the operation looked stalled at the moment it succeeded.
+    if (progress) (void)progress(2, N, N);
     return true;
 }

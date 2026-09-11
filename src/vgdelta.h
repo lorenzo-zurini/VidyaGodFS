@@ -4,6 +4,7 @@
 #include "bytesource.h"
 
 #include <cstdint>
+#include <functional>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -109,17 +110,31 @@ private:
 // compressed copy plus the returned buffer used to blow past the machine's RAM. Only the returned delta (and the
 // base index) stay resident. `scratchDir` says where those files go; empty = the system temp dir — pass a real
 // on-disk directory when that is a tmpfs (spilling to RAM-backed /tmp would defeat the whole point).
+// Progress + cancellation. Called periodically while the delta is built; return FALSE to ABORT, and
+// GenerateDelta returns an empty vector (its scratch files are cleaned up on that path like any other).
+// `stage` is 0 while scanning the target for matches and 1 while compressing the literal stream — two passes
+// with independent totals, so a caller renders them as two halves of one bar rather than a number that jumps.
+// Multi-GB archives are the normal case here (a 3.7GB Minecraft chain), which is why this is not optional
+// decoration: without it a conversion cannot be interrupted and shows nothing for minutes.
+using ProgressFn = std::function<bool(int stage, uint64_t done, uint64_t total)>;
+
 std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
                                    const uint8_t *target, size_t targetLen,
                                    uint32_t blockSize = DEFAULT_BLOCK,
-                                   const std::string &scratchDir = std::string());
+                                   const std::string &scratchDir = std::string(),
+                                   const ProgressFn &progress = {});
 
 // Byte-verifies a delta: composes it over `base`, then streams the reconstruction and compares it against
 // `target` chunk-by-chunk. True only on an exact byte-for-byte match; on failure Err says what diverged
 // (create/size/read/mismatch). THE one verify used by both the app's --convert-delta-chain and the tests —
 // production converts and the test suite must never hand-roll (and drift) their own reconstruct-compare.
+//
+// `progress` is the SAME contract as GenerateDelta's, with stage 2 ("verifying"): this pass streams the whole
+// reconstruction a second time, so on a multi-GB archive it is minutes during which the caller would otherwise
+// show a finished bar and a Cancel button that does nothing. Return false to abort (VerifyDelta then returns
+// false with Err "cancelled").
 bool VerifyDelta(const std::vector<uint8_t> &delta, const std::shared_ptr<ByteSource> &base,
-                 ByteSource &target, std::string &Err);
+                 ByteSource &target, std::string &Err, const ProgressFn &progress = {});
 
 } // namespace vgdelta
 
