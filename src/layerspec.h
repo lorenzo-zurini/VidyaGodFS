@@ -16,13 +16,14 @@ struct LayerSpec {
     LayerType   type = LayerType::Dir;
     std::string source;      // absolute host path (dir / archive / single file)
     std::string target;      // normalized virtual subtree root: no leading/trailing '/', "" == mount root
-    std::string baseTarget;  // DELTA only: target of the byte-base zip when it lives at a DIFFERENT target than
-                             // `target` (cross-target delta, e.g. a root-mounted complete archive diffed over a
-                             // sub-target base). Empty == same as `target` (the ordinary overlay-relative delta).
-    std::vector<std::string> baseTargets;  // DELTA only, MULTI-BASE: the delta's base is the CONCATENATION (in this
-                             // exact order) of the composed views at these targets — one delta dedups against several
-                             // sources at once (e.g. a prefix over [wine, dxvk, prev-prefix]). Non-empty overrides
-                             // `baseTarget`. A single entry == a plain cross-target delta.
+    std::vector<std::string> baseTargets;  // DELTA only: the delta's byte-base is the CONCATENATION (in this exact
+                             // order) of the composed views at these targets — one entry is the ordinary
+                             // cross-target delta, several let one delta dedup against independent sources at once
+                             // (a prefix over [wine, dxvk, prev-prefix]). EMPTY means no base was declared: the base
+                             // is then the composed view at `target` itself (the overlay-relative delta, the common
+                             // case). There is deliberately no singular key — "" is a real target (the mount root),
+                             // so a lone string could not tell "based at the root" apart from "no base declared",
+                             // and the FS would silently reconstruct against the wrong bytes.
     // SUBMOUNTS (dir/zip/DELTA): Docker-style "src:dst" mounts of paths WITHIN source. Each (source,target)
     // pair is normalized and fanned out into its own single-subpath internal layer at Init. Empty → mount the
     // whole source at `target`. A pair's `first` is the in-source path ("" == whole source), `second` the dest.

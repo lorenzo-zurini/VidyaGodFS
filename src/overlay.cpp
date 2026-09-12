@@ -99,35 +99,27 @@ bool VfsState::Init(const Spec &S, std::string &Err)
 
             if (LS.type == LayerType::Delta)
             {
-                // Base = the composed view at this delta's base target. Normally that's its OWN target (the zip
-                // directly below), but a cross-target delta names a different `baseTarget` — e.g. a complete
-                // archive mounted at the package root, diffed over a base zip that mounts at a sub-target.
-                // MULTI-BASE (baseTargets): the byte-base is the CONCATENATION of those composed views, in order —
-                // one delta dedups against several sources at once (e.g. a prefix over [wine, dxvk, prev-prefix]).
-                // Else the single (cross-)target base. Concat parts are ByteSources (often flattened delta chains);
-                // nothing is materialized. The order MUST match what generation concatenated.
-                std::shared_ptr<ByteSource> base;
-                if (!LS.baseTargets.empty())
+                // Base = the composed view(s) this delta's COPY offsets index into. `baseTargets` names them
+                // explicitly and IN ORDER: one entry is the ordinary cross-target delta (a complete archive
+                // mounted at the package root, diffed over a base zip at a sub-target); several mean the base is
+                // their CONCATENATION, so one delta dedups against independent sources at once (a prefix over
+                // [wine, dxvk, prev-prefix]). Declaring nothing means the base is this layer's OWN target — the
+                // zip directly below, which is what a plain chain is. Concat parts are ByteSources (often
+                // flattened delta chains); nothing is materialized. The order MUST match what generation
+                // concatenated, and a lone "" is a REAL declaration (based at the mount root), which is exactly
+                // why there is no singular key to confuse it with "undeclared".
+                const std::vector<std::string> baseTgts =
+                    LS.baseTargets.empty() ? std::vector<std::string>{ LS.target } : LS.baseTargets;
+                std::vector<std::shared_ptr<ByteSource>> bs; bool ok = true;
+                for (const std::string &t : baseTgts)
                 {
-                    std::vector<std::shared_ptr<ByteSource>> bs; bool ok = true;
-                    for (const std::string &t : LS.baseTargets)
-                    {
-                        auto bit = baseByTarget.find(t);
-                        if (bit == baseByTarget.end() || !bit->second)
-                        { std::cerr << "[vidyagodfs] delta multi-base missing target '" << t << "': " << LS.source << "\n"; ok = false; break; }
-                        bs.push_back(bit->second);
-                    }
-                    if (!ok) continue;
-                    base = bs.size() == 1 ? bs[0] : std::make_shared<ConcatByteSource>(bs);
-                }
-                else
-                {
-                    const std::string &baseTgt = LS.baseTarget.empty() ? LS.target : LS.baseTarget;
-                    auto bit = baseByTarget.find(baseTgt);
+                    auto bit = baseByTarget.find(t);
                     if (bit == baseByTarget.end() || !bit->second)
-                    { std::cerr << "[vidyagodfs] delta layer has no base at target '" << baseTgt << "': " << LS.source << "\n"; continue; }
-                    base = bit->second;
+                    { std::cerr << "[vidyagodfs] delta layer has no base at target '" << t << "': " << LS.source << "\n"; ok = false; break; }
+                    bs.push_back(bit->second);
                 }
+                if (!ok) continue;
+                std::shared_ptr<ByteSource> base = bs.size() == 1 ? bs[0] : std::make_shared<ConcatByteSource>(bs);
                 std::string derr;
                 auto ds = vgdelta::DeltaByteSource::Create(src, base, derr, false);
                 if (!ds) { std::cerr << "[vidyagodfs] bad delta " << LS.source << ": " << derr << "\n"; continue; }

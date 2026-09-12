@@ -13,6 +13,7 @@
 
 #include <zip.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -22,6 +23,7 @@
 #include <functional>
 #include <iostream>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -328,6 +330,252 @@ TEST(delta_roundtrip_basic) {
         CHECK(ds->preadAll(out.data(), out.size(), 0));
         CHECK(std::memcmp(out.data(), tgt.data(), tgt.size()) == 0);
     }
+}
+
+// MULTI-BASE: one delta reconstructed against the CONCATENATION of several bases, in order. This is the primitive
+// behind deduping a wine prefix against [wine || dxvk] — a COPY offset indexes across the whole stitched address
+// space, so bytes that exist in EITHER base cost nothing.
+//
+// It had no test. `ConcatByteSource` shipped in July verified once by hand against a written-out mount spec, and
+// nothing exercised it again; the package-side path that would have used it was only wired up today.
+TEST(delta_over_concatenated_bases) {
+    // Two disjoint bases with distinctive content, as [wine || dxvk] would be.
+    std::string b1(3000, '\0'); for (size_t i = 0; i < b1.size(); ++i) b1[i] = char('a' + (i * 7) % 26);
+    std::string b2(2500, '\0'); for (size_t i = 0; i < b2.size(); ++i) b2[i] = char('A' + (i * 11) % 26);
+
+    // A target built from a run of the SECOND base, a run of the FIRST, and some novel bytes. If the concat is
+    // ordered or offset wrongly, the reconstruction differs and the memcmp below fails.
+    std::string tgt = b2.substr(500, 900) + std::string("NOVEL-BYTES-NOT-IN-EITHER-BASE") + b1.substr(1200, 1100);
+
+    std::string concat = b1 + b2;                               // the order generation used...
+    auto delta = vgdelta::GenerateDelta((const uint8_t *)concat.data(), concat.size(),
+                                        (const uint8_t *)tgt.data(), tgt.size());
+    CHECK(!delta.empty());
+    // It must actually be deduping, not just storing the target: the shared runs are 2000 of ~2030 bytes.
+    CHECK(delta.size() < tgt.size());
+
+    // ...and the order composition must use. Parts stay separate ByteSources — nothing is materialised.
+    std::vector<std::shared_ptr<ByteSource>> parts = {
+        std::make_shared<MemByteSource>(std::vector<uint8_t>(b1.begin(), b1.end())),
+        std::make_shared<MemByteSource>(std::vector<uint8_t>(b2.begin(), b2.end())),
+    };
+    auto cat = std::make_shared<ConcatByteSource>(parts);
+    CHECK_EQ(cat->size(), b1.size() + b2.size());
+
+    std::string derr;
+    auto ds = vgdelta::DeltaByteSource::Create(std::make_shared<MemByteSource>(delta), cat, derr, false);
+    CHECK(ds != nullptr);
+    if (ds) {
+        CHECK_EQ(ds->size(), tgt.size());
+        std::vector<uint8_t> out(tgt.size());
+        CHECK(ds->preadAll(out.data(), out.size(), 0));
+        CHECK(std::memcmp(out.data(), tgt.data(), tgt.size()) == 0);
+
+        // A read that STRADDLES the boundary between the two bases must be split and stitched correctly — the
+        // one thing a naive concat gets wrong.
+        std::vector<uint8_t> mid(64);
+        CHECK(cat->preadAll(mid.data(), mid.size(), b1.size() - 32));
+        CHECK(std::memcmp(mid.data(), b1.data() + b1.size() - 32, 32) == 0);
+        CHECK(std::memcmp(mid.data() + 32, b2.data(), 32) == 0);
+    }
+
+    // ORDER IS LOAD-BEARING: composing the same delta over [b2 || b1] must NOT reproduce the target. Asserted
+    // UNCONDITIONALLY — guarding this behind `if (wrong && ...)` runs zero CHECKs the day Create starts refusing
+    // the swapped base, and the test would still report pass while proving nothing.
+    std::vector<std::shared_ptr<ByteSource>> swapped = { parts[1], parts[0] };
+    auto wrong = vgdelta::DeltaByteSource::Create(std::make_shared<MemByteSource>(delta),
+                                                  std::make_shared<ConcatByteSource>(swapped), derr, false);
+    CHECK(wrong != nullptr);                       // same total size, so it must still parse
+    if (wrong) {
+        CHECK_EQ(wrong->size(), tgt.size());
+        std::vector<uint8_t> out(tgt.size());
+        CHECK(wrong->preadAll(out.data(), out.size(), 0));
+        CHECK(std::memcmp(out.data(), tgt.data(), tgt.size()) != 0);
+    }
+}
+
+// A base declared AT THE MOUNT ROOT ("") used to be inexpressible: the spec's singular `baseTarget` key could not
+// tell it apart from "no base declared", so the FS fell back to the delta's own target, reconstructed against the
+// wrong bytes and skipped the layer. One key — an ordered list — removes the ambiguity by construction.
+TEST(a_base_declared_at_the_root_is_not_confused_with_no_base) {
+    TmpDir t;
+    std::string body(6000, 'q'); for (size_t i = 0; i < body.size(); ++i) body[i] = char('a' + (i * 5) % 26);
+    writeStoreZip(t / "root.zip", { { "fr.bin", body, false } });          // mounts at "" (the root)
+    writeStoreZip(t / "decoy.zip", { { "fd.bin", std::string(6000, 'Z'), false } });  // mounts at "sub"
+
+    const std::string want = body.substr(1000, 3000) + "NOVEL";
+    writeStoreZip(t / "tgt.zip", { { "ft.bin", want, false } });
+
+    auto slurp = [](const fs::path &p) {
+        std::ifstream f(p, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    };
+    const std::string base = slurp(t / "root.zip"), tgt = slurp(t / "tgt.zip");
+    auto delta = vgdelta::GenerateDelta((const uint8_t *)base.data(), base.size(),
+                                        (const uint8_t *)tgt.data(), tgt.size());
+    CHECK(!delta.empty());
+    { std::ofstream o(t / "d.vgdelta", std::ios::binary); o.write((const char *)delta.data(), (std::streamsize)delta.size()); }
+
+    // The delta mounts at "sub" — where the DECOY is — but declares its base at the root. Read the wrong base and
+    // the reconstruction fails outright; read no base and the layer is skipped. Either way "sub/ft.bin" is absent.
+    std::ostringstream js;
+    js << "{\"mountpoint\":\"" << t.str("mnt") << "\",\"readonly\":true,\"layers\":["
+       << "{\"type\":\"zip\",\"source\":\"" << t.str("root.zip") << "\",\"target\":\"\"},"
+       << "{\"type\":\"zip\",\"source\":\"" << t.str("decoy.zip") << "\",\"target\":\"sub\"},"
+       << "{\"type\":\"delta\",\"source\":\"" << t.str("d.vgdelta") << "\",\"target\":\"sub\","
+       <<  "\"baseTargets\":[\"\"]}]}";
+    writeFile(t / "spec.json", js.str());
+
+    Spec sp; std::string err;
+    CHECK(ParseSpec(t.str("spec.json"), sp, err));
+    CHECK_EQ(sp.layers.size(), size_t(3));
+    CHECK_EQ(sp.layers[2].baseTargets.size(), size_t(1));
+
+    VfsState S;
+    CHECK(S.Init(sp, err));
+    OpenFile *of = nullptr;
+    CHECK_EQ(VfsOpen(S, "sub/ft.bin", 0, of), 0);
+    if (of) {
+        std::string got(want.size(), '\0');
+        CHECK_EQ(VfsRead(of, got.data(), got.size(), 0), (ssize_t)want.size());
+        VfsRelease(of);
+        CHECK(got == want);
+    }
+}
+
+// A malformed base list is REFUSED, not quietly shortened: a concatenation missing one part is a base of the
+// wrong SIZE, which fails the delta's size check and costs the layer its content with nothing said.
+TEST(a_malformed_base_list_is_refused) {
+    TmpDir t;
+    writeStoreZip(t / "a.zip", { { "x", "x", false } });
+    //The base list belongs to a DELTA layer — a zip has no byte-base, so hanging one on a zip would pin a
+    //shape that means nothing and quietly assert the parser accepts it there.
+    { std::ofstream o(t / "d.vgdelta", std::ios::binary); o << "x"; }
+    auto spec = [&](const std::string &bases) {
+        std::ostringstream js;
+        js << "{\"mountpoint\":\"" << t.str("mnt") << "\",\"readonly\":true,\"layers\":["
+           << "{\"type\":\"zip\",\"source\":\"" << t.str("a.zip") << "\",\"target\":\"a\"},"
+           << "{\"type\":\"delta\",\"source\":\"" << t.str("d.vgdelta") << "\",\"target\":\"b\","
+           <<  "\"baseTargets\":" << bases << "}]}";
+        writeFile(t / "spec.json", js.str());
+        Spec sp; std::string err;
+        const bool ok = ParseSpec(t.str("spec.json"), sp, err);
+        return std::make_pair(ok, err);
+    };
+    CHECK(!spec("[\"a\", 7]").first);                 // a non-string entry
+    CHECK(!spec("\"a\"").first);                      // a bare string where a list belongs
+    const auto Ok = spec("[\"a\"]");                  // ...and the well-formed shape still parses
+    CHECK(Ok.first);
+    if (!Ok.first) std::cerr << "    parse error was: " << Ok.second << "\n";
+}
+
+// END TO END, through the REAL handoff: the spec JSON VidyaGod writes → ParseSpec → VfsState::Init → a read.
+// The pieces above (ConcatByteSource, DeltaByteSource) were already unit-tested while the FLOW into them was
+// dead — `baseTargets` never appeared in a spec because the mount builder only read the singular key. A unit
+// test that pins a function while nothing reaches it reads as coverage and is worse than none.
+TEST(multi_base_delta_mounts_from_a_spec_file) {
+    TmpDir t;
+    // Two independent base archives at their own targets, as [wine || dxvk] would be.
+    std::string fa(4000, 'x'); for (size_t i = 0; i < fa.size(); ++i) fa[i] = char('a' + (i * 7) % 26);
+    std::string fb(3500, 'y'); for (size_t i = 0; i < fb.size(); ++i) fb[i] = char('A' + (i * 11) % 26);
+    writeStoreZip(t / "a.zip", { { "fa.bin", fa, false } });
+    writeStoreZip(t / "b.zip", { { "fb.bin", fb, false } });
+
+    // The target archive: STOREd, so its entry bytes appear verbatim and the delta can COPY them out of the
+    // bases' zip bytes. Its content is drawn from BOTH bases plus something novel.
+    const std::string want = fb.substr(400, 1200) + "NOVEL-NOVEL-NOVEL" + fa.substr(900, 1500);
+    writeStoreZip(t / "c.zip", { { "fc.bin", want, false } });
+
+    auto slurp = [](const fs::path &p) {
+        std::ifstream f(p, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    };
+    // The byte base is the CONCATENATION of the two base layers' composed views, in the spec's order.
+    const std::string cat = slurp(t / "a.zip") + slurp(t / "b.zip");
+    const std::string tgt = slurp(t / "c.zip");
+    auto delta = vgdelta::GenerateDelta((const uint8_t *)cat.data(), cat.size(),
+                                        (const uint8_t *)tgt.data(), tgt.size());
+    CHECK(!delta.empty());
+    CHECK(delta.size() < tgt.size());                       // it must be deduping, not just storing the target
+    { std::ofstream o(t / "c.vgdelta", std::ios::binary); o.write((const char *)delta.data(), (std::streamsize)delta.size()); }
+
+    // The spec exactly as VidyaGod's BuildLayerSpec writes it — `baseTargets` plural, in order.
+    std::ostringstream js;
+    js << "{\"mountpoint\":\"" << t.str("mnt") << "\",\"readonly\":true,\"layers\":["
+       << "{\"type\":\"zip\",\"source\":\"" << t.str("a.zip") << "\",\"target\":\"a\"},"
+       << "{\"type\":\"zip\",\"source\":\"" << t.str("b.zip") << "\",\"target\":\"b\"},"
+       << "{\"type\":\"delta\",\"source\":\"" << t.str("c.vgdelta") << "\",\"target\":\"c\","
+       <<  "\"baseTargets\":[\"a\",\"b\"]}]}";
+    writeFile(t / "spec.json", js.str());
+
+    Spec sp; std::string err;
+    CHECK(ParseSpec(t.str("spec.json"), sp, err));
+    CHECK_EQ(sp.layers.size(), size_t(3));
+    CHECK_EQ(sp.layers[2].baseTargets.size(), size_t(2));
+    if (sp.layers[2].baseTargets.size() == 2) {          // guarded: indexing past a failed size check aborts
+        CHECK_EQ(sp.layers[2].baseTargets[0], std::string("a"));
+        CHECK_EQ(sp.layers[2].baseTargets[1], std::string("b"));
+    }
+
+    VfsState S;
+    CHECK(S.Init(sp, err));
+    VfsAttr at;
+    CHECK_EQ(VfsGetattr(S, "c/fc.bin", at), 0);             // the delta reconstructed against the concatenation
+    CHECK_EQ(at.size, (uint64_t)want.size());
+    OpenFile *of = nullptr;
+    CHECK_EQ(VfsOpen(S, "c/fc.bin", 0, of), 0);
+    if (of) {
+        std::string got(want.size(), '\0');
+        ssize_t r = VfsRead(of, got.data(), got.size(), 0);
+        VfsRelease(of);
+        CHECK_EQ(r, (ssize_t)want.size());
+        CHECK(got == want);
+    }
+    // and the bases stay ordinary visible layers of their own
+    CHECK_EQ(VfsGetattr(S, "a/fa.bin", at), 0);
+    CHECK_EQ(VfsGetattr(S, "b/fb.bin", at), 0);
+}
+
+// A part's boundary is what its size() says, NOT what its pread happens to hand back. FdByteSource — the part
+// type the real mount uses — forwards straight to ::pread on the fd, so on a file longer than the declared
+// size it WILL return bytes past that size. The clamp in ConcatByteSource is the only thing standing between
+// that and a silently mis-stitched address space: a COPY near the seam would pull the wrong base's bytes and
+// the delta would reconstruct garbage, with no error anywhere.
+struct OverReadingSource : ByteSource {
+    std::vector<uint8_t> file;     // what the underlying storage actually holds
+    uint64_t             declared; // what this source claims to be
+    OverReadingSource(std::vector<uint8_t> f, uint64_t d) : file(std::move(f)), declared(d) {}
+    ssize_t pread(void *buf, size_t n, uint64_t off) override {
+        if (off >= file.size()) return 0;
+        const size_t avail = file.size() - static_cast<size_t>(off);   // clamps to the FILE, not to declared
+        const size_t want  = n < avail ? n : avail;
+        std::memcpy(buf, file.data() + off, want);
+        return static_cast<ssize_t>(want);
+    }
+    uint64_t size() const override { return declared; }
+};
+
+TEST(concat_part_boundary_is_defined_by_size) {
+    std::vector<uint8_t> backing(64, 'x');
+    for (size_t i = 32; i < 64; ++i) backing[i] = 'Z';       // past the declared end — must never be visible
+    std::vector<std::shared_ptr<ByteSource>> parts = {
+        std::make_shared<OverReadingSource>(backing, 32),
+        std::make_shared<MemByteSource>(std::vector<uint8_t>(32, 'Y')),
+    };
+    auto cat = std::make_shared<ConcatByteSource>(parts);
+    CHECK_EQ(cat->size(), uint64_t(64));
+
+    std::vector<uint8_t> out(64, 0);
+    CHECK(cat->preadAll(out.data(), out.size(), 0));
+    CHECK_EQ(std::count(out.begin(), out.end(), 'Z'), 0);     // the over-read must be cut off at the seam
+    CHECK(std::memcmp(out.data(), std::string(32, 'x').data(), 32) == 0);
+    CHECK(std::memcmp(out.data() + 32, std::string(32, 'Y').data(), 32) == 0);
+
+    // and the same read started INSIDE part 0, straddling the seam
+    std::vector<uint8_t> mid(20, 0);
+    CHECK(cat->preadAll(mid.data(), mid.size(), 22));
+    CHECK(std::memcmp(mid.data(), std::string(10, 'x').data(), 10) == 0);
+    CHECK(std::memcmp(mid.data() + 10, std::string(10, 'Y').data(), 10) == 0);
 }
 
 int main() {

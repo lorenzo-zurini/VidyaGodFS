@@ -42,9 +42,18 @@ bool ParseSpec(const std::string &Path, Spec &Out, std::string &Err)
             else { Err = "unknown layer type: " + Type; return false; }
             LS.source  = L.at("source").get<std::string>();
             LS.target  = NormalizeVPath(L.value("target", std::string()));
-            LS.baseTarget = NormalizeVPath(L.value("baseTarget", std::string()));   // delta cross-target base (empty = same-target)
-            if (L.contains("baseTargets") && L["baseTargets"].is_array())            // MULTI-BASE: ordered concat of bases
-                for (const auto &T : L["baseTargets"]) if (T.is_string()) LS.baseTargets.push_back(NormalizeVPath(T.get<std::string>()));
+            //A delta's declared byte-bases, in order (absent = based on this layer's own target). A non-string
+            //entry is REFUSED rather than skipped: dropping it would shorten the concatenation, and a base of the
+            //wrong length fails the delta's size check and silently costs the layer its content.
+            if (L.contains("baseTargets"))
+            {
+                if (!L["baseTargets"].is_array()) { Err = "layer baseTargets must be an array"; return false; }
+                for (const auto &T : L["baseTargets"])
+                {
+                    if (!T.is_string()) { Err = "layer baseTargets contains a non-string entry"; return false; }
+                    LS.baseTargets.push_back(NormalizeVPath(T.get<std::string>()));
+                }
+            }
             LS.rw      = L.value("rw", false);
             // SUBMOUNTS: array of Docker-style "src:dst" strings → (source,target) pairs (split on first ':').
             if (L.contains("submounts") && L["submounts"].is_array())
