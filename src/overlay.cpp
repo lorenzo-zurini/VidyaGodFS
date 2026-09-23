@@ -577,7 +577,11 @@ int CopyUp(VfsState &S, const std::string &vrel, const ResolveResult &rr)
                 if (int we = HostIO::FullWrite(out, buf, (size_t)got); we != 0) { rc = we; break; }
             if (got < 0 && rc == 0) rc = (int)got;
             HostIO::Close(in);
-            if (HostIO::Lstat(rr.hostPath, st) == 0) HostIO::Fchmod(out, st.mode & 0777);
+            // Keep the lower file's mode — but the copy is a COW copy that exists to be WRITTEN: force the owner
+            // write bit. A lower layer served from a read-only mount (a runner build mounted `readonly`, every
+            // file 0555) otherwise yields an unwritable copy, and the very open(O_WRONLY) that triggered the
+            // copy-up fails with EACCES — every in-place edit of a runner-provided file (a wine hive) was lost.
+            if (HostIO::Lstat(rr.hostPath, st) == 0) HostIO::Fchmod(out, (st.mode & 0777) | 0200);
         }
     }
     HostIO::Close(out);

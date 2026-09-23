@@ -170,6 +170,32 @@ TEST(writelayer_copyup_and_write) {
     CHECK(fs::exists(t / "wl/doc.txt"));  // copy-up landed in the writelayer
 }
 
+// A copy-up exists to be WRITTEN. A lower file that is read-only where it lives (a runner build mounted
+// read-only serves every file 0555) must still copy up into a WRITABLE file — the open(O_WRONLY|O_TRUNC) that
+// triggers the copy-up is what fails otherwise, and an in-place edit of a runner-provided wine hive was lost.
+TEST(writelayer_copyup_of_readonly_lower_is_writable) {
+    TmpDir t;
+    fs::create_directories(t / "lower");
+    writeFile(t / "lower/system.reg", "WINE REGISTRY\n");
+    fs::permissions(t / "lower/system.reg", fs::perms::owner_read | fs::perms::owner_exec |
+                    fs::perms::group_read | fs::perms::others_read, fs::perm_options::replace);   // 0544 (read-only)
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { dirLayer(t.str("lower")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+
+    OpenFile *of = nullptr;
+    CHECK_EQ(VfsOpen(S, "system.reg", 01001 /*O_WRONLY|O_TRUNC*/, of), 0);   // the hive rewrite's open
+    const char *nw = "edited";
+    CHECK(VfsWrite(S, of, nw, 6, 0) == 6);
+    VfsRelease(of);
+    CHECK(fs::exists(t / "wl/system.reg"));
+    CHECK((fs::status(t / "wl/system.reg").permissions() & fs::perms::owner_write) != fs::perms::none);
+    CHECK_EQ(VfsOpen(S, "system.reg", 0, of), 0);
+    char buf[16] = {0}; ssize_t r = VfsRead(of, buf, sizeof(buf), 0); VfsRelease(of);
+    CHECK_EQ(std::string(buf, r), std::string("edited"));
+    // The original lower file is untouched (COW).
+    CHECK((fs::status(t / "lower/system.reg").permissions() & fs::perms::owner_write) == fs::perms::none);
+}
+
 TEST(zipscan_matches_libzip) {
     TmpDir t;
     writeStoreZip(t / "z.zip", { { "a.txt", "aaa", false }, { "dir/", "", false }, { "dir/b.txt", "bbbb", false } });
