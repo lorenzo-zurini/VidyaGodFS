@@ -92,6 +92,7 @@ int Mkdir(const std::string &path, uint32_t mode) { return ::mkdir(path.c_str(),
 int Unlink(const std::string &path)               { return ::unlink(path.c_str()) == 0 ? 0 : -errno; }
 int Rmdir(const std::string &path)                { return ::rmdir(path.c_str()) == 0 ? 0 : -errno; }
 int Rename(const std::string &from, const std::string &to) { return ::rename(from.c_str(), to.c_str()) == 0 ? 0 : -errno; }
+int Link(const std::string &existing, const std::string &newpath) { return ::link(existing.c_str(), newpath.c_str()) == 0 ? 0 : -errno; }
 int Truncate(const std::string &path, uint64_t size)       { return ::truncate(path.c_str(), static_cast<off_t>(size)) == 0 ? 0 : -errno; }
 int Chmod(const std::string &path, uint32_t mode)          { return ::chmod(path.c_str(), static_cast<mode_t>(mode)) == 0 ? 0 : -errno; }
 

@@ -50,8 +50,11 @@ static int op_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t
 {
     filler(buf, ".",  nullptr, 0, (fuse_fill_dir_flags)0);
     filler(buf, "..", nullptr, 0, (fuse_fill_dir_flags)0);
-    return VfsReaddir(*St(), V(path),
-                      [&](const std::string &n) { filler(buf, n.c_str(), nullptr, 0, (fuse_fill_dir_flags)0); });
+    //With a stat, the entry carries its type (d_type); only st_mode's type bits are used without FUSE_FILL_DIR_PLUS.
+    return VfsReaddirTyped(*St(), V(path), [&](const std::string &n, const VfsAttr &a) {
+        struct stat st; ToStat(a, &st);
+        filler(buf, n.c_str(), &st, 0, (fuse_fill_dir_flags)0);
+    });
 }
 
 static int op_opendir(const char *, struct fuse_file_info *fi)
@@ -150,6 +153,7 @@ static int op_readlink(const char *path, char *buf, size_t size)
 }
 
 static int op_symlink(const char *target, const char *path) { return VfsSymlink(*St(), target, V(path)); }
+static int op_link(const char *from, const char *to) { return VfsLink(*St(), V(from), V(to)); }
 static int op_flush(const char *, struct fuse_file_info *)   { return 0; }
 static int op_fsync(const char *, int, struct fuse_file_info *fi) { return VfsFsync(OF(fi)); }
 
@@ -177,6 +181,7 @@ const struct fuse_operations *VidyagodfsOps()
     ops.unlink   = op_unlink;
     ops.rmdir    = op_rmdir;
     ops.symlink  = op_symlink;
+    ops.link     = op_link;
     ops.rename   = op_rename;
     ops.chmod    = op_chmod;
     ops.chown    = op_chown;

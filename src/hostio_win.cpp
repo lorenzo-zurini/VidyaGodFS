@@ -236,6 +236,11 @@ int Rename(const std::string &from, const std::string &to)
                          MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED) ? 0 : Err();
 }
 
+int Link(const std::string &existing, const std::string &newpath)
+{
+    return ::CreateHardLinkW(Wide(newpath).c_str(), Wide(existing).c_str(), nullptr) ? 0 : Err();
+}
+
 int Truncate(const std::string &path, uint64_t size)
 {
     Fd fd = Open(path, O_RDWR);

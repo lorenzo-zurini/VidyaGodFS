@@ -51,6 +51,10 @@ using DirFiller = std::function<void(const std::string &name)>;
 // All paths are normalized vrel ("" == mount root). Return 0 or -errno unless noted.
 int     VfsGetattr (VfsState &S, const std::string &vrel, VfsAttr &out);
 int     VfsReaddir (VfsState &S, const std::string &vrel, const DirFiller &fill);
+// Each child with its attributes (getattr's): a listing that says what each entry is (d_type). Programs walk a
+// tree by the listing's type — Xenia took every folder of an untyped listing for a file.
+using TypedDirFiller = std::function<void(const std::string &name, const VfsAttr &attr)>;
+int     VfsReaddirTyped(VfsState &S, const std::string &vrel, const TypedDirFiller &fill);
 int     VfsOpen    (VfsState &S, const std::string &vrel, int flags, OpenFile *&out);          // out=nullptr → dir (no handle), returns 0
 int     VfsCreate  (VfsState &S, const std::string &vrel, uint32_t mode, int flags, OpenFile *&out);
 ssize_t VfsRead    (OpenFile *of, void *buf, size_t size, uint64_t off);                        // bytes read (>=0) or -errno
@@ -65,6 +69,7 @@ int     VfsChmod   (VfsState &S, const std::string &vrel, uint32_t mode);
 int     VfsUtimens (VfsState &S, const std::string &vrel, int64_t atimeSec, int64_t mtimeSec);
 int     VfsReadlink(VfsState &S, const std::string &vrel, std::string &target);
 int     VfsSymlink (VfsState &S, const std::string &target, const std::string &vrel);
+int     VfsLink    (VfsState &S, const std::string &vexisting, const std::string &vnew);   // a hard link
 int     VfsFsync   (OpenFile *of);
 int     VfsStatfs  (VfsState &S, HostIO::StatvfsInfo &out);
 

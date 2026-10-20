@@ -23,6 +23,7 @@
 #include <functional>
 #include <iostream>
 #include <set>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -194,6 +195,78 @@ TEST(writelayer_copyup_of_readonly_lower_is_writable) {
     CHECK_EQ(std::string(buf, r), std::string("edited"));
     // The original lower file is untouched (COW).
     CHECK((fs::status(t / "lower/system.reg").permissions() & fs::perms::owner_write) == fs::perms::none);
+}
+
+// A zipped program edited in place (a BinaryPatch rewrites it) must still run: the copy keeps the 0555 a zip entry
+// is served with, plus the owner write bit — not a 0644 that drops the executable bit.
+TEST(writelayer_copyup_of_a_zip_entry_keeps_it_executable) {
+    TmpDir t;
+    writeStoreZip(t / "build.zip", { { "bin/game", "\x7f" "ELF", false } });
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { zipLayer(t.str("build.zip")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    OpenFile *of = nullptr;
+    CHECK_EQ(VfsOpen(S, "bin/game", 2 /*O_RDWR*/, of), 0);
+    CHECK(VfsWrite(S, of, "!", 1, 1) == 1);
+    VfsRelease(of);
+    const auto p = fs::status(t / "wl/bin/game").permissions();
+    CHECK((p & fs::perms::owner_exec) != fs::perms::none);
+    CHECK((p & fs::perms::others_exec) != fs::perms::none);
+    CHECK((p & fs::perms::owner_write) != fs::perms::none);
+    VfsAttr a; CHECK_EQ(VfsGetattr(S, "bin/game", a), 0);
+    CHECK((a.perms & 0111) == 0111);
+}
+
+// The listing says what each entry is: a zip's folders (implicit: no directory entries) list as folders, its files as
+// files. An untyped listing (DT_UNKNOWN) made Xenia, which walks a game folder by d_type, see no folders at all.
+TEST(a_typed_listing_says_which_entries_are_folders) {
+    TmpDir t;
+    writeStoreZip(t / "game.zip", { { "Languages/English/a.arl", "A", false }, { "default.xex", "X", false } });
+    Spec sp; sp.layers = { zipLayer(t.str("game.zip")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    std::map<std::string, bool> dir;
+    CHECK_EQ(VfsReaddirTyped(S, "", [&](const std::string &n, const VfsAttr &a) { dir[n] = a.isDir; }), 0);
+    CHECK_EQ(dir.size(), (size_t)2);
+    CHECK(dir["Languages"]);
+    CHECK(!dir["default.xex"]);
+    dir.clear();
+    CHECK_EQ(VfsReaddirTyped(S, "Languages", [&](const std::string &n, const VfsAttr &a) { dir[n] = a.isDir; }), 0);
+    CHECK(dir.count("English") && dir["English"]);
+}
+
+// Hard links: in the writelayer (a zipped file copied up first) and inside a kept passthrough folder, both names are
+// one file — a write through one is read through the other.
+TEST(hard_links_in_the_writelayer_and_a_kept_folder) {
+    TmpDir t;
+    writeStoreZip(t / "base.zip", { { "a.txt", "zip", false } });
+    fs::create_directories(t / "keep");
+    writeFile(t / "keep/k.txt", "kept");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl");
+    sp.layers = { zipLayer(t.str("base.zip")) };
+    sp.layers.push_back(dirLayer(t.str("keep"), "save", true));
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK_EQ(VfsLink(S, "a.txt", "b.txt"), 0);
+    CHECK(fs::equivalent(t / "wl/a.txt", t / "wl/b.txt"));
+    CHECK_EQ(VfsLink(S, "save/k.txt", "save/k2.txt"), 0);
+    CHECK(fs::equivalent(t / "keep/k.txt", t / "keep/k2.txt"));
+    OpenFile *of = nullptr;
+    CHECK_EQ(VfsOpen(S, "save/k2.txt", 2 /*O_RDWR*/, of), 0);
+    CHECK(VfsWrite(S, of, "KEPT", 4, 0) == 4); VfsRelease(of);
+    CHECK_EQ(VfsOpen(S, "save/k.txt", 0, of), 0);
+    char buf[8] = {0}; ssize_t r = VfsRead(of, buf, sizeof buf, 0); VfsRelease(of);
+    CHECK_EQ(std::string(buf, r), std::string("KEPT"));
+    CHECK_EQ(VfsLink(S, "a.txt", "save/k.txt"), -EEXIST);
+}
+
+// A link that fails leaves a deleted name deleted: the whiteout goes only once the link exists.
+TEST(a_failed_link_keeps_a_deleted_file_deleted) {
+    TmpDir t;
+    writeStoreZip(t / "base.zip", { { "cfg.ini", "lower", false } });
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { zipLayer(t.str("base.zip")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK_EQ(VfsUnlink(S, "cfg.ini"), 0);
+    CHECK_EQ(VfsMkdir(S, "d", 0755), 0);
+    CHECK(VfsLink(S, "d", "cfg.ini") != 0);      // the host refuses to hard-link a directory
+    VfsAttr a; CHECK_EQ(VfsGetattr(S, "cfg.ini", a), -ENOENT);
 }
 
 TEST(zipscan_matches_libzip) {

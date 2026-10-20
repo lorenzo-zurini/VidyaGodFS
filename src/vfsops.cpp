@@ -184,6 +184,18 @@ int VfsReaddir(VfsState &S, const std::string &v, const DirFiller &fill)
     return 0;
 }
 
+int VfsReaddirTyped(VfsState &S, const std::string &v, const TypedDirFiller &fill)
+{
+    std::set<std::string> names;
+    CollectChildren(S, v, names);
+    for (const std::string &n : names)
+    {
+        VfsAttr a;
+        if (VfsGetattr(S, v.empty() ? n : v + "/" + n, a) == 0) fill(n, a);   // a name getattr cannot serve is not listed
+    }
+    return 0;
+}
+
 int VfsOpen(VfsState &S, const std::string &v, int flags, OpenFile *&out)
 {
     out = nullptr;
@@ -435,6 +447,30 @@ int VfsSymlink(VfsState &S, const std::string &target, const std::string &v)
     RemoveWhiteout(S, v);
     if (int e = EnsureWriteParent(S, v); e != 0) return e;
     return HostIO::Symlink(target, WLPath(S, v));
+}
+
+// A hard link, as rename does it: the existing file is made writable first (a copy-up, unless it lives in a kept
+// passthrough folder), then linked host to host. Both names must land on one host file system; across two (the
+// writelayer and a kept folder elsewhere) the host refuses with EXDEV, as any file system would. An AppImage's
+// squashfs holds hard links, and unpacking one (bbport) failed on the missing op.
+int VfsLink(VfsState &S, const std::string &vf, const std::string &vt)
+{
+    if (S.readOnly) return -EROFS;
+    ResolveResult rr = Resolve(S, vf);
+    if (rr.kind == HitKind::None) return -ENOENT;
+    const bool isDir = (rr.kind == HitKind::ImplicitDir) ||
+                       (rr.kind == HitKind::ZipEntry && (rr.zipEntry == nullptr || rr.zipEntry->isDir));
+    if (isDir) return -EPERM;                                    // directories cannot be hard-linked
+    if (Resolve(S, vt).kind != HitKind::None) return -EEXIST;
+    if (!rr.rwPassthrough && rr.kind != HitKind::WriteLayer)
+        if (int e = CopyUp(S, vf, rr); e != 0) return e;
+    const std::string src = rr.rwPassthrough ? rr.hostPath : WLPath(S, vf);
+    std::string dst;
+    if (PassthroughHost(S, vt, dst)) { EnsureHostParent(dst); }
+    else { if (int e = EnsureWriteParent(S, vt); e != 0) return e; dst = WLPath(S, vt); }
+    if (int e = HostIO::Link(src, dst); e != 0) return e;
+    RemoveWhiteout(S, vt);   // only now: a failed link must not bring back a deleted lower-layer file at that name
+    return 0;
 }
 
 int VfsFsync(OpenFile *of)

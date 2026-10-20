@@ -94,6 +94,7 @@ int     Mkdir   (const std::string &path, uint32_t mode);
 int     Unlink  (const std::string &path);
 int     Rmdir   (const std::string &path);
 int     Rename  (const std::string &from, const std::string &to);
+int     Link    (const std::string &existing, const std::string &newpath);   // a hard link
 int     Truncate(const std::string &path, uint64_t size);
 int     Chmod   (const std::string &path, uint32_t mode);
 int     Utimens (const std::string &path, int64_t atimeSec, int64_t mtimeSec, bool followSymlink);

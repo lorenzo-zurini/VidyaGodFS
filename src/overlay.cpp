@@ -564,6 +564,9 @@ int CopyUp(VfsState &S, const std::string &vrel, const ResolveResult &rr)
                 off += got;
             }
         }
+        // The mode the entry was served with (getattr: 0555) plus the owner write bit, as for a host file below: a
+        // 0644 copy dropped the executable bit, and a patched program (a BinaryPatch on a zipped ELF) no longer ran.
+        if (rc == 0) HostIO::Fchmod(out, 0555 | 0200);
     }
     else // DirLayer or FileLayer host file
     {
