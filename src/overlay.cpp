@@ -60,6 +60,7 @@ static void AddAncestors(std::set<std::string> &dst, const std::string &leaf)
 }
 
 static void SeedMasksFromWritelayer(VfsState &S);   // defined with the mask machinery below
+static void SeedKeptMasks(Layer &L);                 // likewise, for each kept folder
 
 bool VfsState::Init(const Spec &S, std::string &Err)
 {
@@ -177,6 +178,8 @@ bool VfsState::Init(const Spec &S, std::string &Err)
     }
     implicitDirs.erase("\x01");
     implicitDirs.erase("");
+    for (Layer &L : layers)
+        if (L.type == LayerType::Dir && L.rw) SeedKeptMasks(L);
     return true;
     (void)Err;
 }
@@ -400,6 +403,7 @@ ResolveResult Resolve(VfsState &S, const std::string &vrel)
                 R.kind = HitKind::DirLayer; R.hostPath = host; R.layer = &L; R.rwPassthrough = L.rw;
                 return R;
             }
+            if (L.rw && KeptMasked(L, vrel)) return R;   // deleted in the kept folder: the lower layers don't show
         }
         else if (L.type == LayerType::File)
         {
@@ -461,6 +465,160 @@ bool PassthroughHost(VfsState &S, const std::string &vrel, std::string &HostOut)
         }
     }
     return false;
+}
+
+// ---- deletions under a kept (rw passthrough) folder (see overlay.h) --------
+const Layer *KeptLayerFor(const VfsState &S, const std::string &vrel)
+{
+    for (auto it = S.layers.rbegin(); it != S.layers.rend(); ++it)
+        if (it->type == LayerType::Dir && it->rw && LayerCovers(*it, vrel)) return &*it;
+    return nullptr;
+}
+
+static std::string KeptHost(const Layer &L, const std::string &rel)
+{
+    return rel.empty() ? L.source : (L.source + "/" + rel);
+}
+
+//vrel's marker in kept layer L; empty for the kept folder's own root (a mount point cannot hide itself).
+static std::string KeptMarker(const Layer &L, const std::string &rel)
+{
+    return rel.empty() ? std::string() : KeptHost(L, ParentVRel(rel)) + "/.wh." + BaseName(rel);
+}
+
+static int TouchMarker(const std::string &path)
+{
+    std::error_code ec;
+    fs::create_directories(fs::path(path).parent_path(), ec);
+    if (ec) return -(ec.value() ? ec.value() : EIO);
+    HostIO::Fd fd = HostIO::Open(path, O_CREAT | O_WRONLY, 0644);
+    if (fd < 0) return (int)fd;
+    HostIO::Close(fd);
+    return 0;
+}
+
+static bool InMask(const std::atomic<MaskPtr> &a, const std::string &rel)
+{
+    MaskPtr m = LoadMask(a);
+    return m && m->count(rel) != 0;
+}
+
+//Init-time: one walk of each kept folder for its markers (the folder holds only what the user's games wrote).
+static void SeedKeptMasks(Layer &L)
+{
+    auto del = std::make_shared<MaskSet>(), opq = std::make_shared<MaskSet>();
+    std::function<void(const std::string &)> walk = [&](const std::string &rel) {
+        const std::string host = KeptHost(L, rel);
+        HostIO::ReadDir(host, [&](const std::string &n) {
+            if (n == ".wh..wh..opq") { opq->insert(rel); return; }
+            if (n.rfind(".wh.", 0) == 0) { del->insert(rel.empty() ? n.substr(4) : rel + "/" + n.substr(4)); return; }
+            HostIO::Stat st;
+            if (HostIO::Lstat(host + "/" + n, st) == 0 && st.isDir) walk(rel.empty() ? n : rel + "/" + n);
+        });
+    };
+    walk(L.subpath);
+    L.kept = std::make_shared<KeptMasks>();
+    L.kept->deleted.store(std::move(del), std::memory_order_release);
+    L.kept->opaque.store(std::move(opq), std::memory_order_release);
+}
+
+int HideLower(VfsState &S, const std::string &vrel)
+{
+    if (const Layer *L = KeptLayerFor(S, vrel))
+    {
+        const std::string rel = SourceRel(*L, vrel);
+        if (!rel.empty())
+        {
+            if (int e = TouchMarker(KeptMarker(*L, rel)); e != 0) return e;
+            MutateMask(S, L->kept->deleted, [&](MaskSet &m) { m.insert(rel); });
+            return 0;
+        }
+    }
+    CreateWhiteout(S, vrel);
+    return 0;
+}
+
+int UnhideLower(VfsState &S, const std::string &vrel)
+{
+    if (const Layer *L = KeptLayerFor(S, vrel))
+        if (const std::string rel = SourceRel(*L, vrel); !rel.empty() && InMask(L->kept->deleted, rel))
+        {
+            if (int e = HostIO::Unlink(KeptMarker(*L, rel)); e != 0 && e != -ENOENT) return e;
+            MutateMask(S, L->kept->deleted, [&](MaskSet &m) { m.erase(rel); });
+        }
+    RemoveWhiteout(S, vrel);
+    return 0;
+}
+
+bool KeptHidden(const VfsState &S, const std::string &vrel)
+{
+    const Layer *L = KeptLayerFor(S, vrel);
+    return L && InMask(L->kept->deleted, SourceRel(*L, vrel));
+}
+
+bool KeptOpaqueDir(const Layer &L, const std::string &vrel)
+{
+    return L.kept && InMask(L.kept->opaque, SourceRel(L, vrel));
+}
+
+bool KeptMasked(const Layer &L, const std::string &vrel)
+{
+    if (!L.kept) return false;
+    MaskPtr del = LoadMask(L.kept->deleted), opq = LoadMask(L.kept->opaque);
+    const bool anyDel = del && !del->empty(), anyOpq = opq && !opq->empty();
+    if (!anyDel && !anyOpq) return false;
+    std::string rel = SourceRel(L, vrel);
+    if (rel.empty()) return false;
+    if (anyDel && del->count(rel)) return true;
+    for (std::string cur = ParentVRel(rel);; cur = ParentVRel(cur))
+    {
+        if (anyDel && !cur.empty() && del->count(cur)) return true;   // an ancestor deleted here
+        if (anyOpq && opq->count(cur)) return true;                   // an ancestor (or the root) made again
+        if (cur.empty()) return false;
+    }
+}
+
+int KeptMarkOpaque(VfsState &S, const std::string &vrel)
+{
+    const Layer *L = KeptLayerFor(S, vrel);
+    if (!L) return -EINVAL;
+    const std::string rel = SourceRel(*L, vrel);
+    if (int e = TouchMarker(KeptHost(*L, rel) + "/.wh..wh..opq"); e != 0) return e;
+    MutateMask(S, L->kept->opaque, [&](MaskSet &m) { m.insert(rel); });
+    return 0;
+}
+
+static void RewritePrefix(VfsState &S, std::atomic<MaskPtr> &a, const std::string &o, const std::string &n)
+{
+    MutateMask(S, a, [&](MaskSet &m) {
+        MaskSet next;
+        for (const std::string &x : m)
+            if (x == o) next.insert(n);
+            else if (x.rfind(o + "/", 0) == 0) next.insert(n + x.substr(o.size()));
+            else next.insert(x);
+        m.swap(next);
+    });
+}
+
+void KeptRenamePrefix(VfsState &S, const std::string &oldv, const std::string &newv)
+{
+    const Layer *L = KeptLayerFor(S, oldv);
+    if (!L || L != KeptLayerFor(S, newv)) return;
+    const std::string o = SourceRel(*L, oldv), n = SourceRel(*L, newv);
+    RewritePrefix(S, L->kept->deleted, o, n);
+    RewritePrefix(S, L->kept->opaque, o, n);
+}
+
+void KeptDropMarkersUnder(VfsState &S, const std::string &vrel)
+{
+    const Layer *L = KeptLayerFor(S, vrel);
+    if (!L) return;
+    const std::string rel = SourceRel(*L, vrel), host = KeptHost(*L, rel);
+    HostIO::ReadDir(host, [&](const std::string &n) { if (n.rfind(".wh.", 0) == 0) HostIO::Unlink(host + "/" + n); });
+    auto under = [&](const std::string &x) { return rel.empty() ? !x.empty() && x.find('/') == std::string::npos
+                                                                : x.rfind(rel + "/", 0) == 0 && x.find('/', rel.size() + 1) == std::string::npos; };
+    MutateMask(S, L->kept->deleted, [&](MaskSet &m) { for (auto it = m.begin(); it != m.end();) it = under(*it) ? m.erase(it) : std::next(it); });
+    MutateMask(S, L->kept->opaque, [&](MaskSet &m) { m.erase(rel); });
 }
 
 int EnsureWriteParent(VfsState &S, const std::string &vrel)

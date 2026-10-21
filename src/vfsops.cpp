@@ -50,6 +50,11 @@ static void CollectChildren(VfsState &S, const std::string &v, std::set<std::str
     int opaquePrio = -1;
     for (const Layer &L : S.layers)
         if (L.opaque && LayerCovers(L, v) && L.priority > opaquePrio) opaquePrio = L.priority;
+    // A kept folder's directory made again over a deleted one masks the lower layers the same way.
+    for (const Layer &L : S.layers)
+        if (L.type == LayerType::Dir && L.rw && LayerCovers(L, v) && L.priority > opaquePrio && KeptOpaqueDir(L, v))
+            opaquePrio = L.priority;
+    std::set<std::string> keptWhiteouts, keptOwn;   // a kept folder's markers hide LOWER names, never its own
 
     for (const Layer &L : S.layers)
     {
@@ -61,7 +66,15 @@ static void CollectChildren(VfsState &S, const std::string &v, std::set<std::str
             {
                 std::string rel = SourceRel(L, v);
                 std::string host = rel.empty() ? L.source : (L.source + "/" + rel);
-                HostIO::ReadDir(host, [&](const std::string &n) { out.insert(n); });
+                HostIO::ReadDir(host, [&](const std::string &n) {
+                    if (L.rw && n.rfind(".wh.", 0) == 0)   // a kept folder's deletion markers: never listed
+                    {
+                        if (n != ".wh..wh..opq") keptWhiteouts.insert(n.substr(4));
+                        return;
+                    }
+                    if (L.rw) keptOwn.insert(n);
+                    out.insert(n);
+                });
             }
             else if (L.type == LayerType::Zip)
             {
@@ -102,6 +115,15 @@ static void CollectChildren(VfsState &S, const std::string &v, std::set<std::str
             if (std::string seg = SegmentAfter(v, d); !seg.empty()) out.insert(seg);
 
     for (const std::string &w : whiteouts) out.erase(w);
+    for (const std::string &w : keptWhiteouts) if (!keptOwn.count(w)) out.erase(w);
+}
+
+// A kept folder holds the user's files and its own `.wh.*` deletion markers side by side; a guest name that looks
+// like a marker would read as one on the next mount, so it is refused there.
+static bool MarkerName(const std::string &v)
+{
+    const size_t s = v.find_last_of('/');
+    return v.compare(s == std::string::npos ? 0 : s + 1, 4, ".wh.") == 0;
 }
 
 // Ensure the host parent directory of `host` exists (for passthrough writes into the source).
@@ -254,11 +276,15 @@ int VfsCreate(VfsState &S, const std::string &v, uint32_t mode, int flags, OpenF
     if (S.readOnly) return -EROFS;
 
     std::string host;
-    if (PassthroughHost(S, v, host)) { EnsureHostParent(host); }   // straight to the durable source
+    const bool kept = PassthroughHost(S, v, host);
+    if (kept) { if (MarkerName(v)) return -EINVAL; EnsureHostParent(host); }   // straight to the durable source
     else { RemoveWhiteout(S, v); if (int e = EnsureWriteParent(S, v); e != 0) return e; host = WLPath(S, v); }
 
     HostIO::Fd fd = HostIO::Open(host, (flags | O_CREAT) & ~O_NOFOLLOW, mode);
     if (fd < 0) return (int)fd;
+    // Only now: the deleted name is made again. Were the marker to stay (an unlink failure), the new file still
+    // shows — the folder's own names are never masked by its markers — and the marker keeps hiding the package copy.
+    if (kept) UnhideLower(S, v);
     auto *of = new OpenFile; of->fd = fd; out = of;
     return 0;
 }
@@ -287,7 +313,20 @@ int VfsMkdir(VfsState &S, const std::string &v, uint32_t mode)
 {
     if (S.readOnly) return -EROFS;
     std::string host;
-    if (PassthroughHost(S, v, host)) { EnsureHostParent(host); return HostIO::Mkdir(host, mode); }
+    if (PassthroughHost(S, v, host))
+    {
+        if (MarkerName(v)) return -EINVAL;
+        // The kept folder's own root, removed this session (VfsRmdir): it still exists, emptied — just show it again.
+        if (const Layer *L = KeptLayerFor(S, v); L && SourceRel(*L, v).empty() && IsWhiteouted(S, v))
+        { RemoveWhiteout(S, v); return 0; }
+        const bool overDeleted = KeptHidden(S, v);   // made again over a deleted lower dir: it must start empty
+        EnsureHostParent(host);
+        if (int e = HostIO::Mkdir(host, mode); e != 0) return e;
+        if (overDeleted)
+            if (int e = KeptMarkOpaque(S, v); e != 0) { HostIO::Rmdir(host); return e; }
+        UnhideLower(S, v);   // as in VfsCreate: a marker left behind only keeps masking the package's copy
+        return 0;
+    }
     // A whiteout here means this dir existed below and was deleted; recreating it must yield an
     // EMPTY dir, so mark it opaque to mask the lower layer's old contents.
     bool recreateOverLower = IsWhiteouted(S, v);
@@ -302,7 +341,14 @@ int VfsUnlink(VfsState &S, const std::string &v)
 {
     if (S.readOnly) return -EROFS;
     std::string host;
-    if (PassthroughHost(S, v, host)) return HostIO::Unlink(host); // straight to source
+    if (PassthroughHost(S, v, host))
+    {
+        // The kept folder's own copy goes; a copy a lower layer provides is hidden by a marker in the folder.
+        const int e = HostIO::Unlink(host);
+        if (e != 0 && e != -ENOENT) return e;
+        if (Resolve(S, v).kind != HitKind::None) return HideLower(S, v);
+        return e;   // 0 if the kept folder had it, -ENOENT if nothing did
+    }
     // Removing the writelayer copy (if any): tolerate ENOENT (it may only exist below), fail loudly on
     // anything else rather than silently returning success.
     if (!S.writelayer.empty())
@@ -321,7 +367,23 @@ int VfsRmdir(VfsState &S, const std::string &v)
     CollectChildren(S, v, children);
     if (!children.empty()) return -ENOTEMPTY;
     std::string host;
-    if (PassthroughHost(S, v, host)) return HostIO::Rmdir(host);
+    if (PassthroughHost(S, v, host))
+    {
+        // Its markers (names deleted inside it) go with it.
+        KeptDropMarkersUnder(S, v);
+        // The kept folder's own root is a mount point: it stays, emptied for good — opaque over the package's copy
+        // (durable), and gone from this session's view until made again.
+        if (const Layer *L = KeptLayerFor(S, v); L && SourceRel(*L, v).empty())
+        {
+            if (int e = KeptMarkOpaque(S, v); e != 0) return e;
+            CreateWhiteout(S, v);
+            return 0;
+        }
+        const int e = HostIO::Rmdir(host);
+        if (e != 0 && e != -ENOENT) return e;
+        if (Resolve(S, v).kind != HitKind::None) return HideLower(S, v);
+        return e;
+    }
     if (!S.writelayer.empty())
     {
         // The writelayer dir may still hold child whiteouts / an opaque marker (all ".wh."-prefixed),
@@ -357,22 +419,31 @@ int VfsRename(VfsState &S, const std::string &vf, const std::string &vt)
     // A DIRECTORY is a MERGED entity: even when a writelayer copy already exists (it may hold only a
     // whiteout from an earlier delete), lower layers can still contribute children — always deep-copy
     // the merged subtree up. A file needs a copy-up only when it isn't already writable.
-    if (!rr.rwPassthrough)
-    {
-        if (isDir) { if (int e = DeepCopyUp(S, vf); e != 0) return e; }
-        else if (rr.kind != HitKind::WriteLayer) { if (int e = CopyUp(S, vf, rr); e != 0) return e; }
-    }
+    // A directory always: a kept one too, whose package contents would otherwise stay behind (and, hidden at the
+    // old name, be lost for good). CopyUp is a no-op for what the folder already holds.
+    if (isDir) { if (int e = DeepCopyUp(S, vf); e != 0) return e; }
+    else if (!rr.rwPassthrough && rr.kind != HitKind::WriteLayer) { if (int e = CopyUp(S, vf, rr); e != 0) return e; }
 
-    std::string src = rr.rwPassthrough ? rr.hostPath : WLPath(S, vf);
+    // CopyUp put a lower file under a kept folder INTO the folder (its durable store), not the writelayer.
+    std::string src;
+    if (rr.rwPassthrough) src = rr.hostPath;
+    else if (!PassthroughHost(S, vf, src)) src = WLPath(S, vf);
     std::string dst;
-    if (PassthroughHost(S, vt, dst)) { EnsureHostParent(dst); }
+    const bool dstKept = PassthroughHost(S, vt, dst);
+    if (dstKept && MarkerName(vt)) return -EINVAL;
+    const bool dstOverDeleted = dstKept && KeptHidden(S, vt);   // a dir moved onto a deleted one must not show its old contents
+    if (dstKept) { EnsureHostParent(dst); }
     else { if (int e = EnsureWriteParent(S, vt); e != 0) return e; RemoveWhiteout(S, vt); dst = WLPath(S, vt); }
     if (int e = HostIO::Rename(src, dst); e != 0) return e;
+    if (isDir) KeptRenamePrefix(S, vf, vt);   // the kept markers inside it moved along
+    if (dstKept && isDir && dstOverDeleted)
+        if (int e = KeptMarkOpaque(S, vt); e != 0) return e;
+    if (dstKept) UnhideLower(S, vt);
 
     // A moved DIRECTORY takes its writelayer `.wh.*` markers with it — rewrite the in-memory masks to the
     // new prefix so they keep matching the relocated disk markers.
     if (isDir) RenameMaskPrefix(S, vf, vt);
-    if (Resolve(S, vf).kind != HitKind::None) CreateWhiteout(S, vf); // old name still below → hide it
+    if (Resolve(S, vf).kind != HitKind::None) return HideLower(S, vf); // old name still below → hide it
     return 0;
 }
 
@@ -443,7 +514,14 @@ int VfsSymlink(VfsState &S, const std::string &target, const std::string &v)
 {
     if (S.readOnly) return -EROFS;
     std::string host;
-    if (PassthroughHost(S, v, host)) { EnsureHostParent(host); return HostIO::Symlink(target, host); }
+    if (PassthroughHost(S, v, host))
+    {
+        if (MarkerName(v)) return -EINVAL;
+        EnsureHostParent(host);
+        if (int e = HostIO::Symlink(target, host); e != 0) return e;
+        UnhideLower(S, v);   // as in VfsCreate
+        return 0;
+    }
     RemoveWhiteout(S, v);
     if (int e = EnsureWriteParent(S, v); e != 0) return e;
     return HostIO::Symlink(target, WLPath(S, v));
@@ -464,12 +542,14 @@ int VfsLink(VfsState &S, const std::string &vf, const std::string &vt)
     if (Resolve(S, vt).kind != HitKind::None) return -EEXIST;
     if (!rr.rwPassthrough && rr.kind != HitKind::WriteLayer)
         if (int e = CopyUp(S, vf, rr); e != 0) return e;
-    const std::string src = rr.rwPassthrough ? rr.hostPath : WLPath(S, vf);
+    std::string src;   // CopyUp put a lower file under a kept folder INTO the folder (as rename)
+    if (rr.rwPassthrough) src = rr.hostPath;
+    else if (!PassthroughHost(S, vf, src)) src = WLPath(S, vf);
     std::string dst;
-    if (PassthroughHost(S, vt, dst)) { EnsureHostParent(dst); }
+    if (PassthroughHost(S, vt, dst)) { if (MarkerName(vt)) return -EINVAL; EnsureHostParent(dst); }
     else { if (int e = EnsureWriteParent(S, vt); e != 0) return e; dst = WLPath(S, vt); }
     if (int e = HostIO::Link(src, dst); e != 0) return e;
-    RemoveWhiteout(S, vt);   // only now: a failed link must not bring back a deleted lower-layer file at that name
+    UnhideLower(S, vt);   // only now: a failed link must not bring back a deleted lower-layer file at that name
     return 0;
 }
 

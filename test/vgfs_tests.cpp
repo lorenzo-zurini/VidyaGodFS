@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <unistd.h>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -720,4 +721,207 @@ TEST(passthrough_copyup_lands_durable) {
     OpenFile *rf = nullptr; CHECK_EQ(VfsOpen(S, "cfg/settings.cfg", 0, rf), 0);
     char buf[32] = {0}; ssize_t r = VfsRead(rf, buf, sizeof buf, 0); VfsRelease(rf);
     CHECK_EQ(std::string(buf, r), std::string("xres 1920\n"));
+}
+
+// A kept folder (rw passthrough) is the user's durable upper layer for its subtree. Deleting a file that only a
+// LOWER layer provides used to fail with ENOENT (the passthrough unlinked a host file that did not exist): Proton's
+// prefix setup died on it under a whole-runtime keep. The deletion is a durable marker in the kept folder itself.
+static Spec keptOverLower(TmpDir &t, const std::string &target) {
+    writeStoreZip(t / "lower.zip", {{"b.txt", "package b", false}, {"cfg/default.sav", "package save", false},
+                                    {"cfg/sub/x.txt", "package x", false}});
+    fs::create_directories(t / "durable");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl");
+    sp.layers = { zipLayer(t.str("lower.zip")), dirLayer(t.str("durable"), target, /*rw=*/true) };
+    return sp;
+}
+
+TEST(a_kept_folder_over_the_whole_runtime_can_delete_package_files) {
+    TmpDir t; Spec sp = keptOverLower(t, "");
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    VfsAttr a;
+    CHECK_EQ(VfsUnlink(S, "b.txt"), 0);
+    CHECK_EQ(VfsUnlink(S, "cfg/default.sav"), 0);
+    CHECK_EQ(VfsGetattr(S, "b.txt", a), -ENOENT);
+    CHECK_EQ(VfsGetattr(S, "cfg/default.sav", a), -ENOENT);
+    CHECK_EQ(VfsUnlink(S, "b.txt"), -ENOENT);                  // gone is gone
+    CHECK_EQ(VfsUnlink(S, "never-there.txt"), -ENOENT);
+    auto root = readdirNames(S, ""), cfg = readdirNames(S, "cfg");
+    CHECK(!root.count("b.txt")); CHECK(!cfg.count("default.sav")); CHECK(cfg.count("sub"));
+    for (const auto &n : root) CHECK(n.rfind(".wh.", 0) != 0);  // markers never show
+    for (const auto &n : cfg) CHECK(n.rfind(".wh.", 0) != 0);
+}
+
+TEST(deleting_a_lower_file_in_a_kept_folder_stays_deleted_next_launch) {
+    TmpDir t; Spec sp = keptOverLower(t, "cfg");
+    { VfsState S; std::string err; CHECK(S.Init(sp, err)); CHECK_EQ(VfsUnlink(S, "cfg/default.sav"), 0); }
+    CHECK(fs::exists(t / "durable/.wh.default.sav"));          // the marker lives in the user's folder
+    CHECK(!fs::exists(t / "wl/cfg/.wh.default.sav"));          // not in the per-session layer
+    fs::remove_all(t / "wl");                                  // a new launch: fresh writelayer, same kept folder
+    VfsState S2; std::string err; CHECK(S2.Init(sp, err));
+    VfsAttr a; CHECK_EQ(VfsGetattr(S2, "cfg/default.sav", a), -ENOENT);
+    CHECK(!readdirNames(S2, "cfg").count("default.sav"));
+    CHECK_EQ(VfsGetattr(S2, "cfg/sub/x.txt", a), 0);           // the rest of the package is untouched
+}
+
+TEST(a_file_made_again_in_a_kept_folder_comes_back) {
+    TmpDir t; Spec sp = keptOverLower(t, "cfg");
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK_EQ(VfsUnlink(S, "cfg/default.sav"), 0);
+    OpenFile *of = nullptr; CHECK_EQ(VfsCreate(S, "cfg/default.sav", 0644, 0x41 /*O_WRONLY|O_CREAT*/, of), 0);
+    CHECK(VfsWrite(S, of, "mine", 4, 0) == 4); VfsRelease(of);
+    VfsAttr a; CHECK_EQ(VfsGetattr(S, "cfg/default.sav", a), 0); CHECK_EQ(a.size, (uint64_t)4);
+    CHECK(!fs::exists(t / "durable/.wh.default.sav"));
+    CHECK(readdirNames(S, "cfg").count("default.sav"));
+}
+
+TEST(a_lower_folder_removed_in_a_kept_folder_and_made_again_is_empty) {
+    TmpDir t; Spec sp = keptOverLower(t, "cfg");
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK_EQ(VfsUnlink(S, "cfg/sub/x.txt"), 0);
+    CHECK_EQ(VfsRmdir(S, "cfg/sub"), 0);
+    VfsAttr a; CHECK_EQ(VfsGetattr(S, "cfg/sub", a), -ENOENT);
+    CHECK(!readdirNames(S, "cfg").count("sub"));
+    CHECK_EQ(VfsMkdir(S, "cfg/sub", 0755), 0);
+    CHECK_EQ(VfsGetattr(S, "cfg/sub", a), 0); CHECK(a.isDir);
+    CHECK(readdirNames(S, "cfg/sub").empty());                 // the package's old contents stay deleted
+    CHECK_EQ(VfsGetattr(S, "cfg/sub/x.txt", a), -ENOENT);
+    fs::remove_all(t / "wl");
+    VfsState S2; CHECK(S2.Init(sp, err));
+    CHECK(readdirNames(S2, "cfg/sub").empty());
+    CHECK_EQ(VfsGetattr(S2, "cfg/sub/x.txt", a), -ENOENT);
+}
+
+TEST(renaming_a_lower_file_in_a_kept_folder_hides_the_old_name_for_good) {
+    TmpDir t; Spec sp = keptOverLower(t, "cfg");
+    { VfsState S; std::string err; CHECK(S.Init(sp, err)); CHECK_EQ(VfsRename(S, "cfg/default.sav", "cfg/slot1.sav"), 0); }
+    fs::remove_all(t / "wl");
+    VfsState S2; std::string err; CHECK(S2.Init(sp, err));
+    VfsAttr a;
+    CHECK_EQ(VfsGetattr(S2, "cfg/default.sav", a), -ENOENT);
+    CHECK_EQ(VfsGetattr(S2, "cfg/slot1.sav", a), 0); CHECK_EQ(a.size, (uint64_t)12);
+}
+
+TEST(hard_linking_a_lower_file_in_a_kept_folder_links_its_kept_copy) {
+    TmpDir t; Spec sp = keptOverLower(t, "cfg");
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK_EQ(VfsLink(S, "cfg/default.sav", "cfg/backup.sav"), 0);
+    VfsAttr a; CHECK_EQ(VfsGetattr(S, "cfg/backup.sav", a), 0); CHECK_EQ(a.size, (uint64_t)12);
+    CHECK(fs::exists(t / "durable/default.sav") && fs::exists(t / "durable/backup.sav"));
+    std::error_code ec; CHECK(fs::equivalent(t / "durable/default.sav", t / "durable/backup.sav", ec));
+}
+
+// Review findings (2026-10-21). A directory renamed after one of its package files was deleted used to move only the
+// marker: its other package files were hidden at the old name and never copied — lost for good.
+static Spec keptOverTwo(TmpDir &t, const std::string &target) {
+    writeStoreZip(t / "lower.zip", {{"cfg/sub/x.txt", "package x", false}, {"cfg/sub/y.txt", "package y", false}});
+    fs::create_directories(t / "durable");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl");
+    sp.layers = { zipLayer(t.str("lower.zip")), dirLayer(t.str("durable"), target, /*rw=*/true) };
+    return sp;
+}
+
+TEST(renaming_a_folder_after_deleting_one_of_its_package_files_keeps_the_rest) {
+    TmpDir t; Spec sp = keptOverTwo(t, "cfg");
+    {
+        VfsState S; std::string err; CHECK(S.Init(sp, err));
+        CHECK_EQ(VfsUnlink(S, "cfg/sub/y.txt"), 0);
+        CHECK_EQ(VfsRename(S, "cfg/sub", "cfg/sub2"), 0);
+        VfsAttr a;
+        CHECK_EQ(VfsGetattr(S, "cfg/sub2/x.txt", a), 0);
+        CHECK_EQ(VfsGetattr(S, "cfg/sub2/y.txt", a), -ENOENT);
+        CHECK_EQ(VfsGetattr(S, "cfg/sub", a), -ENOENT);
+    }
+    fs::remove_all(t / "wl");
+    VfsState S2; std::string err; CHECK(S2.Init(sp, err));
+    VfsAttr a;
+    CHECK_EQ(VfsGetattr(S2, "cfg/sub2/x.txt", a), 0); CHECK_EQ(a.size, (uint64_t)9);
+    CHECK_EQ(VfsGetattr(S2, "cfg/sub2/y.txt", a), -ENOENT);
+    CHECK_EQ(VfsGetattr(S2, "cfg/sub", a), -ENOENT);
+    CHECK(readdirNames(S2, "cfg") == std::set<std::string>{"sub2"});
+}
+
+TEST(a_folder_renamed_onto_a_deleted_package_folder_does_not_bring_its_files_back) {
+    TmpDir t; Spec sp = keptOverTwo(t, "cfg");
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK_EQ(VfsUnlink(S, "cfg/sub/x.txt"), 0); CHECK_EQ(VfsUnlink(S, "cfg/sub/y.txt"), 0);
+    CHECK_EQ(VfsRmdir(S, "cfg/sub"), 0);
+    CHECK_EQ(VfsMkdir(S, "cfg/new", 0755), 0);
+    CHECK_EQ(VfsRename(S, "cfg/new", "cfg/sub"), 0);
+    CHECK(readdirNames(S, "cfg/sub").empty());
+    fs::remove_all(t / "wl");
+    VfsState S2; CHECK(S2.Init(sp, err));
+    CHECK(readdirNames(S2, "cfg/sub").empty());
+    VfsAttr a; CHECK_EQ(VfsGetattr(S2, "cfg/sub/x.txt", a), -ENOENT);
+}
+
+// A deletion that cannot be recorded fails; it never reports success while the file stays.
+TEST(a_deletion_the_kept_folder_cannot_record_fails) {
+    if (::geteuid() == 0) return;   // root ignores the permission this test relies on
+    TmpDir t; Spec sp = keptOverLower(t, "cfg");
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    fs::permissions(t / "durable", fs::perms::owner_read | fs::perms::owner_exec);
+    CHECK(VfsUnlink(S, "cfg/default.sav") < 0);
+    VfsAttr a; CHECK_EQ(VfsGetattr(S, "cfg/default.sav", a), 0);
+    fs::permissions(t / "durable", fs::perms::owner_all);
+}
+
+TEST(a_create_that_fails_does_not_bring_a_deleted_file_back) {
+    if (::geteuid() == 0) return;
+    TmpDir t; Spec sp = keptOverLower(t, "cfg");
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK_EQ(VfsUnlink(S, "cfg/default.sav"), 0);
+    fs::permissions(t / "durable", fs::perms::owner_read | fs::perms::owner_exec);
+    OpenFile *of = nullptr;
+    CHECK(VfsCreate(S, "cfg/default.sav", 0644, 0x41, of) < 0);
+    fs::permissions(t / "durable", fs::perms::owner_all);
+    VfsAttr a; CHECK_EQ(VfsGetattr(S, "cfg/default.sav", a), -ENOENT);
+}
+
+// The kept folder's own root is a mount point: removing it empties it for good; it can be made again.
+TEST(removing_the_kept_folders_root_empties_it_for_good) {
+    TmpDir t; Spec sp = keptOverTwo(t, "cfg/sub");
+    {
+        VfsState S; std::string err; CHECK(S.Init(sp, err));
+        CHECK_EQ(VfsUnlink(S, "cfg/sub/x.txt"), 0); CHECK_EQ(VfsUnlink(S, "cfg/sub/y.txt"), 0);
+        CHECK_EQ(VfsRmdir(S, "cfg/sub"), 0);
+        VfsAttr a; CHECK_EQ(VfsGetattr(S, "cfg/sub", a), -ENOENT);
+        CHECK_EQ(VfsMkdir(S, "cfg/sub", 0755), 0);
+        CHECK_EQ(VfsGetattr(S, "cfg/sub", a), 0);
+        CHECK(readdirNames(S, "cfg/sub").empty());
+    }
+    fs::remove_all(t / "wl");
+    VfsState S2; std::string err; CHECK(S2.Init(sp, err));
+    CHECK(readdirNames(S2, "cfg/sub").empty());
+    VfsAttr a; CHECK_EQ(VfsGetattr(S2, "cfg/sub/x.txt", a), -ENOENT);
+}
+
+TEST(a_kept_folder_refuses_names_that_look_like_its_markers) {
+    TmpDir t; Spec sp = keptOverLower(t, "cfg");
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    OpenFile *of = nullptr;
+    CHECK_EQ(VfsCreate(S, "cfg/.wh.default.sav", 0644, 0x41, of), -EINVAL);
+    CHECK_EQ(VfsMkdir(S, "cfg/.wh..wh..opq", 0755), -EINVAL);
+    VfsAttr a; CHECK_EQ(VfsGetattr(S, "cfg/default.sav", a), 0);
+}
+
+// A marker left beside the user's own file of that name (a failed marker unlink) masks the package copy only.
+TEST(a_stale_marker_never_hides_the_kept_folders_own_file) {
+    TmpDir t; Spec sp = keptOverLower(t, "cfg");
+    writeFile(t / "durable/default.sav", "mine");
+    writeFile(t / "durable/.wh.default.sav", "");
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK(readdirNames(S, "cfg").count("default.sav"));
+    VfsAttr a; CHECK_EQ(VfsGetattr(S, "cfg/default.sav", a), 0); CHECK_EQ(a.size, (uint64_t)4);
+}
+
+// The same with a create the kernel refuses outright (O_CREAT|O_DIRECTORY → EINVAL) while the marker could be
+// removed: the deleted file must stay deleted (the marker goes only once the new file exists).
+TEST(a_refused_create_leaves_the_deleted_file_deleted) {
+    TmpDir t; Spec sp = keptOverLower(t, "cfg");
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK_EQ(VfsUnlink(S, "cfg/default.sav"), 0);
+    OpenFile *of = nullptr;
+    CHECK(VfsCreate(S, "cfg/default.sav", 0644, O_WRONLY | O_CREAT | O_DIRECTORY, of) < 0);
+    VfsAttr a; CHECK_EQ(VfsGetattr(S, "cfg/default.sav", a), -ENOENT);
+    CHECK(fs::exists(t / "durable/.wh.default.sav"));
 }

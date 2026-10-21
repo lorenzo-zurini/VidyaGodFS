@@ -14,6 +14,15 @@
 #include <cstdint>
 #include <functional>
 
+//A kept folder's deletion markers mirrored in memory, like the writelayer's (VfsState::whiteoutSet): the names
+//deleted there and the directories made again over deleted ones (opaque), as paths relative to the layer's source
+//(SourceRel). Seeded from the folder at Init, swapped copy-on-write under VfsState::maskWriteMtx on every change, so
+//lookups through a kept folder never touch the disk for them.
+struct KeptMasks {
+    std::atomic<std::shared_ptr<const std::set<std::string>>> deleted;
+    std::atomic<std::shared_ptr<const std::set<std::string>>> opaque;
+};
+
 //A resolved layer in the running filesystem.
 struct Layer {
     LayerType   type = LayerType::Dir;
@@ -29,6 +38,7 @@ struct Layer {
     std::shared_ptr<ZipIndex> zip;  // Zip layers only
     std::string fileVPath;   // File layers only: target [+ "/"] + basename(source)
     std::string fileBase;    // File layers only: basename(source)
+    std::shared_ptr<KeptMasks> kept;   // rw Dir layers (kept folders) only
 };
 
 //The whole running filesystem state, built once from a Spec and immutable afterward (lock-free reads),
@@ -113,5 +123,27 @@ int CopyUp(VfsState &S, const std::string &vrel, const ResolveResult &rr);
 //true. Such paths bypass the overlay entirely (read AND all mutations go straight to the durable
 //source) — matching the old bindfs-over-union persist-dir behavior. Highest-priority layer wins.
 bool PassthroughHost(VfsState &S, const std::string &vrel, std::string &HostOut);
+
+//Deletions under a kept (rw passthrough) folder. The folder is the user's durable upper layer for its subtree,
+//so deleting what a LOWER layer provides there must stay deleted on the next launch: the marker lives IN the kept
+//folder, overlayfs-style — `.wh.<name>` beside where the name would be, `.wh..wh..opq` inside a directory made
+//again over a deleted one (or inside the kept folder's own root when that is removed) — mirrored in Layer::kept.
+//Listings never show the markers; Resolve treats them as masks over the LOWER layers only. Elsewhere both fall
+//back to the writelayer's (per-session) whiteouts. All return 0 or -errno: a deletion that can't be recorded
+//must fail, never report success while the file stays visible.
+int  HideLower(VfsState &S, const std::string &vrel);     //vrel was deleted or renamed away: hide its lower copies
+int  UnhideLower(VfsState &S, const std::string &vrel);   //vrel was made again: drop its masks (both kinds)
+bool KeptHidden(const VfsState &S, const std::string &vrel);   //a kept folder's own marker for vrel (not ancestors)
+//True if kept layer L masks vrel for the layers below it: vrel or an ancestor deleted there, or an ancestor (or
+//the kept root) made again (opaque). In-memory lookups only.
+bool KeptMasked(const Layer &L, const std::string &vrel);
+bool KeptOpaqueDir(const Layer &L, const std::string &vrel);   //the kept folder's dir for vrel is opaque
+int  KeptMarkOpaque(VfsState &S, const std::string &vrel);     //make it so (its lower contents stay hidden)
+//A directory moved within one kept folder takes the markers inside it along: rewrite the in-memory sets.
+void KeptRenamePrefix(VfsState &S, const std::string &oldv, const std::string &newv);
+//The rmdir sweep: drop the markers inside a kept directory (disk and memory) before it goes.
+void KeptDropMarkersUnder(VfsState &S, const std::string &vrel);
+//The kept layer serving vrel's passthrough (the same choice as PassthroughHost), or null.
+const Layer *KeptLayerFor(const VfsState &S, const std::string &vrel);
 
 #endif // VIDYAGODFS_OVERLAY_H
