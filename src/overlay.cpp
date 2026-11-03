@@ -493,18 +493,18 @@ ResolveResult Resolve(VfsState &S, const std::string &vrel)
             if (fit != L.zip->byName.end() || isDir)
             {
                 const ZipEntry *e = (fit != L.zip->byName.end()) ? &fit->second : nullptr; // null → synthesized dir
-                // Symlink abolition: chase an archive link to its in-archive target file; a link that
-                // escapes the archive, dangles, or targets a directory simply does not exist in this
-                // layer (fall through — e.g. dosdevices/c: vanishes and wine recreates it at boot in
-                // the writelayer, where runtime symlinks legitimately live).
+                // An archive link that resolves to a FILE inside the archive is served as that file: links
+                // authored for the archive's own tree (proton's default_pfx template, drivers/mountmgr.sys ->
+                // ../../../../../../lib/wine/...) resolve only there, not where the layer is mounted. Every
+                // other link (absolute, out of the archive, to a folder, dangling) is served as the link it
+                // is, its target as stored: the kernel resolves it inside the game's own view of the tree,
+                // as an installed copy would be resolved (a self-mounting bundle's entrypoint into /nix/store).
                 if (S.flattenSymlinks && e && e->symlink)
                 {
-                    e = ResolveZipSymlink(*L.zip, *e);
-                    if (e == nullptr)
-                    {
-                        if (L.opaque) return R;
-                        continue;
-                    }
+                    if (const ZipEntry *T = ResolveZipSymlink(*L.zip, *e)) e = T;
+                    //A target longer than any path is no link (its size is the archive's claim, read on every
+                    //lookup): this layer does not have it.
+                    else if (e->size > 4096 || !e->stored) { if (L.opaque) return R; continue; }
                 }
                 R.kind = HitKind::ZipEntry; R.layer = &L; R.zipEntry = e;
                 return R;
@@ -744,22 +744,22 @@ int CopyUp(VfsState &S, const std::string &vrel, const ResolveResult &rr)
         return ec ? -EIO : 0;
     }
 
-    // Symlink copy-up: recreate the link itself; never dereference it into a regular file. Under symlink
-    // abolition these branches are dead by construction — Resolve already flattened archive links to their
-    // target entries and host-layer links are followed (the generic file copy-up below then copies the
-    // TARGET's content, which is exactly the abolition semantics).
+    // Symlink copy-up: recreate the link itself; never dereference it into a regular file. An archive link that
+    // reaches here is one served as a link (one resolving to a file inside the archive is served as that file).
+    // Host-layer links under flattening are followed (the generic file copy-up below copies the TARGET's content).
+    if (rr.kind == HitKind::ZipEntry && rr.zipEntry && rr.zipEntry->symlink)
+    {
+        if (rr.zipEntry->size > 4096) return -ENAMETOOLONG;
+        ZipReader zr;
+        if (int e = OpenZipEntry(*const_cast<ZipIndex *>(rr.layer->zip.get()), *rr.zipEntry, zr); e != 0) return e;
+        std::string tgt(rr.zipEntry->size, '\0');
+        int got = ReadZipEntry(zr, tgt.data(), tgt.size(), 0);
+        if (got < 0) return got;
+        tgt.resize(got);
+        return HostIO::Symlink(tgt, dst);
+    }
     if (!S.flattenSymlinks)
     {
-        if (rr.kind == HitKind::ZipEntry && rr.zipEntry && rr.zipEntry->symlink)
-        {
-            ZipReader zr;
-            if (int e = OpenZipEntry(*const_cast<ZipIndex *>(rr.layer->zip.get()), *rr.zipEntry, zr); e != 0) return e;
-            std::string tgt(rr.zipEntry->size, '\0');
-            int got = ReadZipEntry(zr, tgt.data(), tgt.size(), 0);
-            if (got < 0) return got;
-            tgt.resize(got);
-            return HostIO::Symlink(tgt, dst);
-        }
         if ((rr.kind == HitKind::DirLayer || rr.kind == HitKind::FileLayer) &&
             HostIO::Lstat(rr.hostPath, st) == 0 && st.isSymlink)
         {

@@ -59,8 +59,8 @@ int OpenZipEntry(ZipIndex &Z, const ZipEntry &E, ZipReader &Out);
 //(targets resolve against the entry's own directory, using the zip's INTERNAL names — i.e. the tree as
 //authored, before any submount re-rooting; that is the namespace the links were written for). Returns the
 //final entry, or nullptr when the chain leaves the archive (e.g. "-> /"), targets a directory, dangles, or
-//exceeds the hop limit — callers treat that as "entry does not exist". Serving symlinks is thereby
-//abolished for archive layers: a link either becomes its target file or disappears.
+//exceeds the hop limit — callers then serve the link itself, as stored. A link either becomes its target file
+//(it was authored for the archive's own tree) or stays the link it is.
 const ZipEntry *ResolveZipSymlink(ZipIndex &Z, const ZipEntry &E);
 
 //Serves a read from an opened ZipReader. Returns bytes read (>=0) or -errno.

@@ -11,6 +11,7 @@
 #include "vgdelta.h"
 #include "bytesource.h"
 
+#include <cerrno>
 #include <zip.h>
 
 #include <algorithm>
@@ -124,6 +125,64 @@ TEST(zip_store_read_roundtrip) {
     CHECK(names.count("hello.txt")); CHECK(names.count("sub"));
     checkReaddirSubsetGetattr(S, "");
     checkReaddirSubsetGetattr(S, "sub");
+}
+
+// An archive link that resolves to a FILE inside the archive is served as that file (proton's default_pfx template
+// links resolve only inside its own tree); every other link is served as the link it is, its target as stored:
+// absolute (a Nix bundle's entrypoint into /nix/store), climbing out of the archive, to a folder, dangling. Listed,
+// stat'ed as a link, readlink'ed, and recreated as a link by a copy-up (a rename). Teeth: hide the unresolvable links
+// (the old rule: abs/out/dir/dangle vanish); flatten nothing (in.txt reads as a link); copy-up the link as a file.
+TEST(zip_links_outside_the_archive_are_served_as_links) {
+    TmpDir t;
+    writeStoreZip(t / "a.zip", {
+        { "app/real.txt", "content", false }, { "app/sub/", "", false }, { "app/sub/x.txt", "x", false },
+        { "app/in.txt", "real.txt", true },                                  // resolves inside: a file
+        { "app/entrypoint", "/nix/store/abc-bbport-0.1/bin/bbport", true },  // absolute
+        { "app/out", "../../elsewhere/lib.so", true },                       // climbs out of the archive
+        { "app/dirlink", "sub", true },                                      // to a folder
+        { "app/dangle", "missing.txt", true } });                            // dangling
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { zipLayer(t.str("a.zip")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+
+    VfsAttr a;
+    CHECK_EQ(VfsGetattr(S, "app/in.txt", a), 0); CHECK(!a.isSymlink); CHECK_EQ(a.size, (uint64_t)7);
+    std::string tgt;
+    CHECK_EQ(VfsReadlink(S, "app/in.txt", tgt), -EINVAL);
+    const std::vector<std::pair<std::string, std::string>> Links = {
+        { "app/entrypoint", "/nix/store/abc-bbport-0.1/bin/bbport" }, { "app/out", "../../elsewhere/lib.so" },
+        { "app/dirlink", "sub" }, { "app/dangle", "missing.txt" } };
+    const auto names = readdirNames(S, "app");
+    for (const auto &[Path, Target] : Links)
+    {
+        CHECK_EQ(VfsGetattr(S, Path, a), 0);
+        CHECK(a.isSymlink);
+        tgt.clear();
+        CHECK_EQ(VfsReadlink(S, Path, tgt), 0);
+        CHECK_EQ(tgt, Target);
+        CHECK(names.count(Path.substr(4)));
+    }
+    checkReaddirSubsetGetattr(S, "app");
+    //A rename copies the link up as a link, not as the bytes of its target.
+    CHECK_EQ(VfsRename(S, "app/entrypoint", "app/entry2"), 0);
+    std::error_code ec;
+    CHECK(fs::is_symlink(fs::symlink_status(t / "wl/app/entry2", ec)));
+    CHECK_EQ(fs::read_symlink(t / "wl/app/entry2", ec).string(), std::string("/nix/store/abc-bbport-0.1/bin/bbport"));
+}
+
+// A link entry whose stored target is longer than any path is no link: it does not exist in the layer, and nothing
+// allocates the size the archive claims for it. Teeth: serve it (readlink allocates and returns 5000 bytes).
+TEST(zip_link_with_an_outsized_target_does_not_exist) {
+    TmpDir t;
+    writeStoreZip(t / "a.zip", { { "app/ok.txt", "x", false }, { "app/huge", std::string(5000, 'a'), true } });
+    Spec sp; sp.layers = { zipLayer(t.str("a.zip")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    VfsAttr a;
+    CHECK_EQ(VfsGetattr(S, "app/huge", a), -ENOENT);
+    std::string tgt;
+    CHECK(VfsReadlink(S, "app/huge", tgt) != 0);
+    CHECK(tgt.empty());
+    CHECK(!readdirNames(S, "app").count("huge"));
+    checkReaddirSubsetGetattr(S, "app");
 }
 
 // Case-insensitive names (a Windows mount): a program asks for "AGE2_X1\\DATA\\GRAPHICS.DRS" in a package that spells it

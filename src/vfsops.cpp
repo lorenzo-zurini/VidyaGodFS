@@ -83,16 +83,12 @@ static void CollectChildren(VfsState &S, const std::string &v, std::set<std::str
                 if (it != L.zip->dirChildren.end())
                     for (const std::string &c : it->second)
                     {
-                        // Symlink abolition: don't list archive links that flatten to nothing (escaping /
-                        // dangling / directory-target) — they don't exist through this filesystem.
-                        if (S.flattenSymlinks)
-                        {
-                            auto eit = L.zip->byName.find(rel.empty() ? c : rel + "/" + c);
-                            if (eit != L.zip->byName.end() && eit->second.symlink
-                                && ResolveZipSymlink(*L.zip, eit->second) == nullptr)
-                                continue;
-                        }
-                        out.insert(c);
+                        //A link entry claiming a target longer than any path does not exist (Resolve): not listed.
+                        const auto eit = L.zip->byName.find(rel.empty() ? c : rel + "/" + c);
+                        if (S.flattenSymlinks && eit != L.zip->byName.end() && eit->second.symlink
+                            && (eit->second.size > 4096 || !eit->second.stored) && ResolveZipSymlink(*L.zip, eit->second) == nullptr)
+                            continue;
+                        out.insert(c);   // a link listed as a file or as a link
                     }
             }
         }
@@ -488,16 +484,16 @@ int VfsUtimens(VfsState &S, const std::string &v, int64_t atimeSec, int64_t mtim
 int VfsReadlink(VfsState &S, const std::string &v, std::string &target)
 {
     ResolveResult rr = Resolve(S, v);
-    // Under symlink abolition only the writelayer / rw passthrough layers (guest-written runtime state)
-    // can hold a link; data layers present targets/nothing, so readlink on them is -EINVAL by construction.
-    if (S.flattenSymlinks)
-        return (rr.kind == HitKind::WriteLayer || rr.rwPassthrough) ? HostIO::Readlink(rr.hostPath, target)
-                                                                    : -EINVAL;
-    if (rr.kind == HitKind::WriteLayer || rr.kind == HitKind::DirLayer || rr.kind == HitKind::FileLayer)
+    // Under flattening a host data layer presents targets, not links; the writelayer and rw passthrough layers
+    // (guest-written runtime state) hold real ones; an archive serves the links that do not resolve to a file
+    // inside it (Resolve) as links.
+    if (rr.kind == HitKind::WriteLayer || rr.rwPassthrough
+        || (!S.flattenSymlinks && (rr.kind == HitKind::DirLayer || rr.kind == HitKind::FileLayer)))
         return HostIO::Readlink(rr.hostPath, target);
     // Zip symlink entry: the link target IS the entry content. Read it (STORED → zero-copy pread).
     if (rr.kind == HitKind::ZipEntry && rr.zipEntry && rr.zipEntry->symlink)
     {
+        if (rr.zipEntry->size > 4096) return -ENAMETOOLONG;   // the archive's claim: never an allocation of it
         ZipReader zr;
         if (int e = OpenZipEntry(*const_cast<ZipIndex *>(rr.layer->zip.get()), *rr.zipEntry, zr); e != 0) return e;
         std::string t(rr.zipEntry->size, '\0');
