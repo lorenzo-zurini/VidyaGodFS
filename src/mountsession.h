@@ -5,8 +5,8 @@
 // MountSession — the backend-neutral mount lifecycle. main.cpp (neutral) parses the spec,
 // builds the VfsState, and hands off here; the platform backend owns HOW the filesystem is
 // actually mounted, kept alive, watched, and torn down:
-//   - Linux/FUSE  (mountsession_fuse.cpp): fuse_main() daemonizes + serves multithreaded; a
-//                 forked watchdog lazily `fusermount3 -uz`'s the moment the spawner dies.
+//   - Linux/FUSE  (mountsession_fuse.cpp): fuse_main() daemonizes + serves multithreaded; the
+//                 server watches the spawner (a pidfd) and `fusermount3 -uz`'s the moment it exits.
 //   - Windows/WinFsp (mountsession_win.cpp, later): FspFileSystemCreate + SetMountPoint (drive
 //                 letter or directory) + a Job Object that reaps the FS with the spawner.
 // One impl is selected at compile time (VGFS_BACKEND in CMakeLists).

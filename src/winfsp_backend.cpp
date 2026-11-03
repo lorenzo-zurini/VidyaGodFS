@@ -29,14 +29,22 @@ static constexpr uint32_t VG_IFLNK = 0120000u;
 
 // The VfsState for this mount is WinFsp-FUSE's private_data (set at fuse_main time).
 static VfsState *St() { return static_cast<VfsState *>(fuse3_get_context()->private_data); }
-static std::string V(const char *path) { return NormalizeVPath(path ? path : ""); }
+//Every path the mount is handed, in the case the package spells it (CanonicalCase: Windows programs ask for names in any
+//case, and a zip's names are only found as spelled).
+static std::string V(const char *path) { return CanonicalCase(*St(), NormalizeVPath(path ? path : "")); }
 
 // Neutral VfsAttr → WinFsp's POSIX-shaped struct fuse_stat.
 static void ToStat(const VfsAttr &a, struct fuse_stat *st)
 {
     std::memset(st, 0, sizeof *st);
     uint32_t type = a.isDir ? VG_IFDIR : (a.isSymlink ? VG_IFLNK : VG_IFREG);
-    st->st_mode  = type | (a.perms & 07777);
+    // WinFsp turns the mode into the file's ACL, and Windows checks it BEFORE the request reaches us: a package
+    // entry served 0555 (a zip's) refused every write, so a file could neither be edited (copy-up never ran) nor
+    // created in a package folder. On a writable mount every name is writable through the writelayer: the owner
+    // gets w. (FUSE on Linux does not check the mode against the caller; it keeps 0555.)
+    uint32_t perms = a.perms & 07777;
+    if (!St()->readOnly) perms |= 0200;
+    st->st_mode  = type | perms;
     st->st_nlink = a.nlink ? a.nlink : 1;
     st->st_size  = (fuse_off_t)a.size;
     st->st_uid   = a.uid;
@@ -150,6 +158,8 @@ static int op_statfs(const char *, struct fuse_statvfs *stbuf)
     if (int e = VfsStatfs(*St(), si); e != 0) return e;
     std::memset(stbuf, 0, sizeof *stbuf);
     stbuf->f_bsize   = si.bsize;
+    stbuf->f_frsize  = si.bsize;   // WinFsp counts sizes in f_frsize units: left 0, every mount had "0 bytes free",
+                                   // and a game that checks its disk space (AoE2) quit at once
     stbuf->f_blocks  = si.blocks;
     stbuf->f_bfree   = si.bfree;
     stbuf->f_bavail  = si.bavail;

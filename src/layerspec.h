@@ -41,6 +41,9 @@ struct Spec {
     bool                    readOnly = false;
     std::string             writelayer;   // empty when readOnly (or absent) — the COW top branch host dir
     std::vector<LayerSpec>  layers;       // LOWEST priority first → HIGHEST last
+    // Names match whatever their case (Windows: a program asks for "DATA\\X.DRS" in a package that has
+    // "Data/x.drs"). Spec key "caseInsensitive"; default on for a Windows build only. See CanonicalCase.
+    bool                    caseInsensitive = false;
 };
 
 //Parses the spec file at Path into Out. Returns false (with Err set) on read/parse error.

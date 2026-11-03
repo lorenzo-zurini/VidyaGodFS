@@ -28,6 +28,11 @@ bool ParseSpec(const std::string &Path, Spec &Out, std::string &Err)
         Out.uid        = J.value("uid", 1000u);
         Out.gid        = J.value("gid", 1000u);
         Out.readOnly   = J.value("readonly", false);
+#ifdef _WIN32
+        Out.caseInsensitive = J.value("caseInsensitive", true);    // Windows programs name files in any case
+#else
+        Out.caseInsensitive = J.value("caseInsensitive", false);
+#endif
         if (!Out.readOnly && J.contains("writelayer") && !J["writelayer"].is_null())
             Out.writelayer = J["writelayer"].get<std::string>();
 

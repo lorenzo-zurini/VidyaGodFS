@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cerrno>
 #include <unordered_map>
+#include <unordered_set>
 #include <fcntl.h>      // O_RDONLY / O_CREAT / O_WRONLY / O_TRUNC flag constants (passed to HostIO::Open)
 #include <iostream>
 
@@ -81,9 +82,30 @@ bool VfsState::Init(const Spec &S, std::string &Err)
     // DeltaByteSource::Create). Only that top delta surfaces as an overlay layer, so reads never walk the chain
     // and memory stays O(1) in chain depth (hundreds of daisy-chained versions cost the same as one).
     std::unordered_map<std::string, std::shared_ptr<ByteSource>> baseByTarget;   // composed view so far, per target
-    std::unordered_map<std::string, size_t> lastDeltaIdx;                        // target → index of its final delta layer
-    for (size_t gi = 0; gi < S.layers.size(); ++gi)
-        if (S.layers[gi].type == LayerType::Delta) lastDeltaIdx[S.layers[gi].target] = gi;
+    //A CHAIN is a run, among one target's zip/delta layers in order: a base zip followed by its deltas (or deltas
+    //alone, based elsewhere). One target can hold SEVERAL chains - the same delta-built node contained twice (whole,
+    //and again with a TAKE re-rooting a folder of it) - each surfacing its own top. chainTop[gi] = the top delta of
+    //the chain layer gi belongs to, or npos for a layer in none (a zip stacked over a chain: an ordinary overlay).
+    constexpr size_t NoChain = static_cast<size_t>(-1);
+    std::vector<size_t> chainTop(S.layers.size(), NoChain);
+    std::unordered_set<std::string> chainTargets;                                 // targets holding any delta
+    {
+        std::unordered_map<std::string, std::vector<size_t>> byTarget;
+        for (size_t gi = 0; gi < S.layers.size(); ++gi)
+            if (S.layers[gi].type == LayerType::Zip || S.layers[gi].type == LayerType::Delta)
+                byTarget[S.layers[gi].target].push_back(gi);
+        for (const auto &[T, Idx] : byTarget)
+            for (size_t i = 0; i < Idx.size();)
+            {
+                const bool Zip = S.layers[Idx[i]].type == LayerType::Zip;
+                size_t j = Zip ? i + 1 : i;
+                while (j < Idx.size() && S.layers[Idx[j]].type == LayerType::Delta) ++j;
+                if (j == (Zip ? i + 1 : i)) { ++i; continue; }               // a zip no delta follows
+                chainTargets.insert(T);
+                for (size_t k = i; k < j; ++k) chainTop[Idx[k]] = Idx[j - 1];
+                i = j;
+            }
+    }
 
     for (size_t gi = 0; gi < S.layers.size(); ++gi)
     {
@@ -134,14 +156,13 @@ bool VfsState::Init(const Spec &S, std::string &Err)
             // composed byte view. Folding them (the old `gi != last` check) silently DROPPED every overlay
             // above a delta: Halo CE served the delta's retail SafeDisc exe instead of the no-CD layer's
             // (instant silent death), and MW4 Mercenaries masked its MekTek hotfixes.
-            const auto ChainEnd = lastDeltaIdx.find(LS.target);
-            const bool InChain  = ChainEnd != lastDeltaIdx.end() && gi <= ChainEnd->second;
-            if (InChain || ChainEnd == lastDeltaIdx.end())
+            const bool InChain = chainTop[gi] != NoChain;
+            if (InChain || !chainTargets.count(LS.target))
                 baseByTarget[LS.target] = src;   // the composed byte view (chain members, or plain-zip targets)
 
             // Fold: a base zip or intermediate delta of a chain is a byte input only, subsumed into the top
             // delta's flat map — do not surface it (or even index it) as an overlay layer.
-            if (InChain && gi != ChainEnd->second) continue;
+            if (InChain && gi != chainTop[gi]) continue;
 
             zip = BuildZipIndex(src, LS.source);
             if (!zip) { std::cerr << "[vidyagodfs] skipping unreadable zip layer: " << LS.source << "\n"; continue; }
@@ -180,6 +201,31 @@ bool VfsState::Init(const Spec &S, std::string &Err)
     implicitDirs.erase("");
     for (Layer &L : layers)
         if (L.type == LayerType::Dir && L.rw) SeedKeptMasks(L);
+    caseInsensitive = S.caseInsensitive;
+    if (caseInsensitive)
+    {
+        //Lowest layer first, first spelling kept: the base layer's case wins, as the packaging-time case resolver
+        //(FixCaseConflicts) already makes every layer spell a shared name.
+        auto Add = [&](const std::string &V) { if (!V.empty()) canonCase.try_emplace(FoldCase(V), V); };
+        for (const Layer &L : layers)
+        {
+            if (L.type == LayerType::File) { Add(L.fileVPath); continue; }
+            Add(L.target);
+            if (L.type != LayerType::Zip || !L.zip) continue;
+            auto AddZip = [&](const std::string &Rel) {
+                std::string Under = Rel;
+                if (!L.subpath.empty())
+                {
+                    if (Rel != L.subpath && Rel.rfind(L.subpath + "/", 0) != 0) return;
+                    Under = Rel.size() > L.subpath.size() ? Rel.substr(L.subpath.size() + 1) : std::string();
+                }
+                Add(L.target.empty() ? Under : (Under.empty() ? L.target : L.target + "/" + Under));
+            };
+            for (const auto &[Name, E] : L.zip->byName) AddZip(Name);
+            for (const auto &[Dir, Kids] : L.zip->dirChildren) AddZip(Dir);
+        }
+        for (const std::string &D : implicitDirs) Add(D);
+    }
     return true;
     (void)Err;
 }
@@ -360,6 +406,29 @@ static void SeedMasksFromWritelayer(VfsState &S)
     walk("");
     S.whiteoutSet.store(std::move(wh), std::memory_order_release);
     S.opaqueSet.store(std::move(opq), std::memory_order_release);
+}
+
+// ---- case ----------------------------------------------------------------
+
+std::string FoldCase(std::string S)
+{
+    for (char &C : S) if (C >= 'A' && C <= 'Z') C = static_cast<char>(C - 'A' + 'a');
+    return S;
+}
+
+std::string CanonicalCase(const VfsState &S, const std::string &vrel)
+{
+    if (!S.caseInsensitive || S.canonCase.empty() || vrel.empty()) return vrel;
+    const std::string F = FoldCase(vrel);
+    size_t Cut = F.size();
+    while (true)
+    {
+        const auto It = S.canonCase.find(F.substr(0, Cut));
+        if (It != S.canonCase.end()) return It->second + vrel.substr(Cut);   // ASCII folding keeps every length
+        const size_t Slash = F.rfind('/', Cut - 1);
+        if (Slash == std::string::npos || Slash == 0) return vrel;
+        Cut = Slash;
+    }
 }
 
 // ---- resolution ----------------------------------------------------------

@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <unordered_map>
 
 //A kept folder's deletion markers mirrored in memory, like the writelayer's (VfsState::whiteoutSet): the names
 //deleted there and the directories made again over deleted ones (opaque), as paths relative to the layer's source
@@ -52,10 +53,16 @@ struct VfsState {
     // WRITELAYER still presents symlinks: that's live runtime state written by the guest itself (e.g. wine
     // creating dosdevices/ at boot), on a real filesystem where they belong.
     bool                  flattenSymlinks = true;
-    uint32_t              uid = 1000;    // forced ownership presented by getattr (POSIX uid/gid; inert on Windows)
+    uint32_t              uid = 1000;    // forced ownership presented by getattr (POSIX; the WinFsp mount overrides it with the mounting user)
     uint32_t              gid = 1000;
     std::vector<Layer>    layers;        // ascending priority (index 0 lowest)
     std::set<std::string> implicitDirs;  // synthesized structural dirs (target parents)
+    // Case-insensitive names (Spec::caseInsensitive): every name the layers know (zip entries and folders, layer
+    // targets, structural dirs) by its folded (ASCII-lowercased) path, mapped to the case it has — the lowest layer's
+    // when they differ. CanonicalCase maps an incoming path through it. Host-backed names (writelayer, dir layers)
+    // need none: the host filesystem (NTFS) already ignores case.
+    bool                                         caseInsensitive = false;
+    std::unordered_map<std::string, std::string> canonCase;
 
     // Deletion masks, mirrored in memory: the set of whiteouted names and the set of opaque dirs. Resolve
     // consults ONLY these (pure lock-free set lookups — no host Lstat per path or per ancestor on the hot
@@ -107,6 +114,12 @@ bool        IsOpaqueDir(const VfsState &S, const std::string &vrel);
 void        MarkOpaque(VfsState &S, const std::string &vrel);
 void        UnmarkOpaque(VfsState &S, const std::string &vrel);   // mask erase only (caller owns the disk marker)
 bool        IsUnderOpaque(const VfsState &S, const std::string &vrel);
+
+//The case the layers spell vrel in: its longest prefix that a layer knows (VfsState::canonCase), in that case, and the
+//rest as given (a name being made). vrel itself when the state is case-sensitive. A backend applies it to every path
+//it is handed, so everything below sees one spelling per name: a lookup, a copy-up, a deletion marker.
+std::string CanonicalCase(const VfsState &S, const std::string &vrel);
+std::string FoldCase(std::string S);   // ASCII lowercase: the key CanonicalCase looks a path up by
 
 //Resolve a vrel: whiteout → None; writelayer entry → WriteLayer; covering layer (highest priority
 //first) → DirLayer/FileLayer/ZipEntry; structural dir → ImplicitDir; else None.

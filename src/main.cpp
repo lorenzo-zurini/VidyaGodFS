@@ -13,7 +13,7 @@
 // mount/serve/watchdog/unmount mechanics live in the backend; this file knows nothing about them.
 //
 // --watch-pid <pid>: auto-unmount the moment that pid dies, so a crash/kill of the VidyaGod app
-// can't leave the mount dangling (the backend implements the watchdog).
+// can't leave the mount dangling (the backend implements the watch).
 int main(int argc, char **argv)
 {
     if (argc < 3)

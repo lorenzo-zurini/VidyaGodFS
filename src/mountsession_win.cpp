@@ -42,7 +42,10 @@ int MountSession::Run(VfsState &state, const std::string &mountpoint, long long 
 
     // WinFsp-FUSE argv: prog, any pass-through opts, then the mountpoint (a drive letter like "Z:"
     // or a non-existent directory path). fuse_main blocks serving until unmount.
-    std::vector<std::string> fa = { "vidyagodfs" };
+    //The files are the mounting user's: WinFsp turns the POSIX owner into the file's Windows owner SID, and a uid
+    //no account holds (the spec's 1000 reads as "Other Organization") left the user only Everyone's read access,
+    //so every file create in the mount was refused. -1 = the mounting user. Caller options come after and win.
+    std::vector<std::string> fa = { "vidyagodfs", "-o", "uid=-1,gid=-1" };
     for (const std::string &s : backendArgs) fa.push_back(s);
     fa.push_back(mountpoint);
 

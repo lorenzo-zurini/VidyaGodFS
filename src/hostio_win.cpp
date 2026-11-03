@@ -90,8 +90,12 @@ static void FillStat(DWORD attrs, uint64_t size, const FILETIME &mtime, Stat &ou
     out.size      = size;
     out.mtime     = FtToUnix(mtime);
     out.nlink     = 1;
-    // Windows has no POSIX permission bits; present the conventional ones the FS reports anyway.
-    out.mode      = (out.isDir ? 0040000u : (out.isSymlink ? 0120000u : 0100000u)) | (out.isDir ? 0755u : 0644u);
+    // Windows has no POSIX permission bits, and WinFsp turns the ones we report into the file's ACL: a file
+    // without x is one Windows refuses to run ("Access is denied"), which broke every program in a folder
+    // layer and every patched (copied-up) one. Whether a file runs is the extension's business here, so
+    // every file is 0755; the read-only attribute takes the write bits away.
+    const uint32_t perms = (attrs & FILE_ATTRIBUTE_READONLY) ? 0555u : 0755u;
+    out.mode      = (out.isDir ? 0040000u : (out.isSymlink ? 0120000u : 0100000u)) | perms;
 }
 
 // ---- fd-based --------------------------------------------------------------

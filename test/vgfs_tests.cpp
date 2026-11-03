@@ -126,6 +126,34 @@ TEST(zip_store_read_roundtrip) {
     checkReaddirSubsetGetattr(S, "sub");
 }
 
+// Case-insensitive names (a Windows mount): a program asks for "AGE2_X1\\DATA\\GRAPHICS.DRS" in a package that spells it
+// "age2_x1/Data/graphics.drs"; the mount answers in the package's case, and a name being made keeps its own after
+// the known part. For a name two layers spell, the lowest layer's spelling wins. Teeth: CanonicalCase returning its
+// input finds nothing.
+TEST(case_insensitive_names_take_the_package_case) {
+    TmpDir t;
+    writeStoreZip(t / "base.zip", { { "Data/graphics.drs", "drs", false }, { "Data/Sub/", "", false } });
+    writeStoreZip(t / "patch.zip", { { "DATA/new.dat", "new", false } });
+    Spec sp; sp.caseInsensitive = true;
+    sp.layers = { zipLayer(t.str("base.zip"), "drive_c/749/age2_x1"), zipLayer(t.str("patch.zip"), "drive_c/749/age2_x1") };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK_EQ(CanonicalCase(S, "DRIVE_C/749/AGE2_X1/DATA/GRAPHICS.DRS"), std::string("drive_c/749/age2_x1/Data/graphics.drs"));
+    CHECK_EQ(CanonicalCase(S, "drive_c/749/AGE2_X1/data/SUB"), std::string("drive_c/749/age2_x1/Data/Sub"));
+    // A name only one layer has keeps that layer's spelling, so its zip finds it (packages make a name shared across
+    // layers agree: the case resolver, FixCaseConflicts).
+    CHECK_EQ(CanonicalCase(S, "drive_c/749/age2_x1/data/NEW.DAT"), std::string("drive_c/749/age2_x1/DATA/new.dat"));
+    CHECK_EQ(CanonicalCase(S, "drive_c/749/age2_x1/data/Saves/Slot1.SAV"), std::string("drive_c/749/age2_x1/Data/Saves/Slot1.SAV"));
+    CHECK_EQ(CanonicalCase(S, "Elsewhere/X"), std::string("Elsewhere/X"));
+    VfsAttr a;
+    CHECK_EQ(VfsGetattr(S, CanonicalCase(S, "drive_c/749/age2_x1/data/GRAPHICS.drs"), a), 0);
+    CHECK_EQ(a.size, (uint64_t)3);
+    CHECK_EQ(VfsGetattr(S, CanonicalCase(S, "drive_c/749/age2_x1/data/NEW.DAT"), a), 0);
+
+    Spec cs = sp; cs.caseInsensitive = false;   // Linux: names as spelled
+    VfsState C; CHECK(C.Init(cs, err));
+    CHECK_EQ(CanonicalCase(C, "DRIVE_C/749/AGE2_X1/DATA/GRAPHICS.DRS"), std::string("DRIVE_C/749/AGE2_X1/DATA/GRAPHICS.DRS"));
+}
+
 TEST(two_zip_layers_upper_masks) {
     TmpDir t;
     writeStoreZip(t / "base.zip",  { { "shared.txt", "BASE", false }, { "only_base.txt", "b", false } });
@@ -634,6 +662,42 @@ TEST(multi_base_delta_mounts_from_a_spec_file) {
     // and the bases stay ordinary visible layers of their own
     CHECK_EQ(VfsGetattr(S, "a/fa.bin", at), 0);
     CHECK_EQ(VfsGetattr(S, "b/fb.bin", at), 0);
+}
+
+// One delta-built node contained TWICE at one target: whole, and again with a TAKE renaming a folder of it (a
+// runner taking wine-mono-11.3.0 as "wine-mono" too, the link its build shipped). Each occurrence is its own chain
+// (base zip + deltas): the first surfaces whole, the second only its renamed folder. Teeth: one chain per target
+// (only the last chain's top surfaces, so the whole tree vanishes).
+TEST(a_delta_chain_contained_twice_at_one_target_mounts_both) {
+    TmpDir t;
+    std::string f1(3000, 'q'); for (size_t i = 0; i < f1.size(); ++i) f1[i] = char('a' + (i * 5) % 26);
+    std::string f2 = f1; f2.insert(1000, "VERSION-TWO-VERSION-TWO");
+    writeStoreZip(t / "base.zip", { { "mono-1.0/lib.bin", f1, false } });
+    writeStoreZip(t / "next.zip", { { "mono-2.0/lib.bin", f2, false } });
+    auto slurp = [](const fs::path &p) {
+        std::ifstream f(p, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    };
+    const std::string b = slurp(t / "base.zip"), n = slurp(t / "next.zip");
+    auto delta = vgdelta::GenerateDelta((const uint8_t *)b.data(), b.size(), (const uint8_t *)n.data(), n.size());
+    { std::ofstream o(t / "next.vgdelta", std::ios::binary); o.write((const char *)delta.data(), (std::streamsize)delta.size()); }
+    std::ostringstream js;
+    js << "{\"mountpoint\":\"" << t.str("mnt") << "\",\"readonly\":true,\"layers\":["
+       << "{\"type\":\"zip\",\"source\":\"" << t.str("base.zip") << "\",\"target\":\"share/mono\"},"
+       << "{\"type\":\"delta\",\"source\":\"" << t.str("next.vgdelta") << "\",\"target\":\"share/mono\"},"
+       << "{\"type\":\"zip\",\"source\":\"" << t.str("base.zip") << "\",\"target\":\"share/mono\",\"submounts\":[\"mono-2.0:share/mono/mono\"]},"
+       << "{\"type\":\"delta\",\"source\":\"" << t.str("next.vgdelta") << "\",\"target\":\"share/mono\",\"submounts\":[\"mono-2.0:share/mono/mono\"]}]}";
+    writeFile(t / "spec.json", js.str());
+    Spec sp; std::string err;
+    CHECK(ParseSpec(t.str("spec.json"), sp, err));
+    VfsState S;
+    CHECK(S.Init(sp, err));
+    VfsAttr at;
+    CHECK_EQ(VfsGetattr(S, "share/mono/mono-2.0/lib.bin", at), 0);   // the first occurrence, whole
+    CHECK_EQ(at.size, (uint64_t)f2.size());
+    CHECK_EQ(VfsGetattr(S, "share/mono/mono/lib.bin", at), 0);       // the second: its folder, renamed
+    CHECK_EQ(at.size, (uint64_t)f2.size());
+    CHECK(VfsGetattr(S, "share/mono/mono-1.0/lib.bin", at) != 0);    // the chain's base is a byte input only
 }
 
 // A part's boundary is what its size() says, NOT what its pread happens to hand back. FdByteSource — the part

@@ -110,4 +110,12 @@ if(VGFS_BUILD_TESTS AND NOT WIN32)
         target_link_options(vgfs_tests PRIVATE -fsanitize=address,undefined)
     endif()
     add_test(NAME vgfs_tests COMMAND vgfs_tests)
+
+    # ---- mounted: the real vidyagodfs binary on a real FUSE mount (the --watch-pid lifecycle) ----
+    add_executable(vgfs_mount_tests test/vgfs_mount_tests.cpp)
+    set_target_properties(vgfs_mount_tests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    target_compile_options(vgfs_mount_tests PRIVATE ${VGFS_WARNINGS} $<$<BOOL:${VGFS_WERROR}>:-Werror>)
+    add_dependencies(vgfs_mount_tests vidyagodfs)
+    add_test(NAME vgfs_mount_tests COMMAND vgfs_mount_tests $<TARGET_FILE:vidyagodfs>)
+    set_tests_properties(vgfs_mount_tests PROPERTIES SKIP_RETURN_CODE 77)
 endif()
