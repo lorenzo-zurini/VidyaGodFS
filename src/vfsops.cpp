@@ -46,11 +46,8 @@ static void CollectChildren(VfsState &S, const std::string &v, std::set<std::str
     // (No lazy mask enabling here anymore: Init seeds the in-memory masks from the persisted writelayer,
     // and every runtime marker mutation updates them — the listing above is just this dir's disk view.)
 
-    // A delta-backed (opaque) layer covering v masks every LOWER same-subtree layer's children.
+    // A kept folder's directory made again over a deleted one masks every LOWER same-subtree layer's children.
     int opaquePrio = -1;
-    for (const Layer &L : S.layers)
-        if (L.opaque && LayerCovers(L, v) && L.priority > opaquePrio) opaquePrio = L.priority;
-    // A kept folder's directory made again over a deleted one masks the lower layers the same way.
     for (const Layer &L : S.layers)
         if (L.type == LayerType::Dir && L.rw && LayerCovers(L, v) && L.priority > opaquePrio && KeptOpaqueDir(L, v))
             opaquePrio = L.priority;
@@ -59,6 +56,7 @@ static void CollectChildren(VfsState &S, const std::string &v, std::set<std::str
     for (const Layer &L : S.layers)
     {
         if (L.priority < opaquePrio) continue;   // masked by a higher opaque layer over this subtree
+        if (LayerMasked(L, v)) continue;          // a base hidden here by the delta built over it
 
         if (!opaque && LayerCovers(L, v))
         {

@@ -31,10 +31,12 @@ struct Layer {
     std::string target;      // normalized virtual subtree root ("" == mount root); for File, the containing dir
     std::string subpath;     // path within source exposed at target ("" == whole source). dir/zip only.
     bool        rw = false;  // Dir + rw:true = RW passthrough (writes go straight to source)
-    // A delta-backed zip reconstructs a COMPLETE archive, so it fully masks lower same-target layers (a file
-    // deleted in the newer version must not leak up from the base it was diffed against). opaque=true → for
-    // this layer's target subtree, only it (and higher-priority layers) contribute; lower layers are hidden.
-    bool        opaque = false;
+    // A delta reconstructs a complete archive OF WHAT IT REPLACES: the base it was diffed against. So it masks that
+    // base (a file deleted in the newer version must not leak up from the older one), and nothing else: another
+    // depot's archive at the same target shows through it like through any zip. maskedUnder = the virtual subtrees
+    // (the mount targets of the deltas built over this layer) where this layer is hidden. A same-target base is
+    // folded into its delta and never surfaces; this covers the rest (a base at another address, BASE_TARGETS).
+    std::vector<std::string> maskedUnder;
     int         priority = 0;
     std::shared_ptr<ZipIndex> zip;  // Zip layers only
     std::string fileVPath;   // File layers only: target [+ "/"] + basename(source)
@@ -96,6 +98,7 @@ struct ResolveResult {
 
 //Path helpers (vrel = normalized, no leading slash, "" == root).
 bool        LayerCovers(const Layer &L, const std::string &vrel);
+bool        LayerMasked(const Layer &L, const std::string &vrel);   // vrel lies where a delta built over L hides it
 std::string RelUnder(const Layer &L, const std::string &vrel);   // path under target (coverage side)
 std::string SourceRel(const Layer &L, const std::string &vrel);  // subpath-prefixed: the source/zip side
 std::string WLPath(const VfsState &S, const std::string &vrel);   // writelayer host path for vrel

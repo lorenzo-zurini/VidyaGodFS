@@ -759,6 +759,180 @@ TEST(a_delta_chain_contained_twice_at_one_target_mounts_both) {
     CHECK(VfsGetattr(S, "share/mono/mono-1.0/lib.bin", at) != 0);    // the chain's base is a byte input only
 }
 
+// A delta replaces its BASE, not everything at its target. A Steam game ships one zip per depot, and a language
+// depot's files land in the game root beside the main depot's: its version chain (v1 zip + delta) at the root must
+// hide v1's dropped file and leave the main depot alone. Teeth: the old rule (a delta masks every lower layer
+// under its target) hid the whole game.
+static std::string slurpFile(const fs::path &p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+static void writeDelta(const fs::path &out, const std::string &base, const fs::path &tgtZip) {
+    const std::string tgt = slurpFile(tgtZip);
+    auto d = vgdelta::GenerateDelta((const uint8_t *)base.data(), base.size(), (const uint8_t *)tgt.data(), tgt.size());
+    std::ofstream o(out, std::ios::binary); o.write((const char *)d.data(), (std::streamsize)d.size());
+}
+static LayerSpec deltaLayer(const std::string &src, const std::string &target, std::vector<std::string> bases = {}) {
+    LayerSpec L; L.type = LayerType::Delta; L.source = src; L.target = NormalizeVPath(target); L.baseTargets = std::move(bases);
+    return L;
+}
+
+TEST(a_delta_hides_its_base_and_not_another_depot_beneath_it) {
+    TmpDir t;
+    std::string pak(5000, 'p'); for (size_t i = 0; i < pak.size(); ++i) pak[i] = char('a' + (i * 3) % 26);
+    writeStoreZip(t / "main.zip", { { "Data/main.pak", "MAIN", false }, { "Localization/readme.txt", "MAIN-README", false } });
+    writeStoreZip(t / "en1.zip", { { "Localization/english.pak", pak, false }, { "Localization/old.pak", "DROPPED", false } });
+    writeStoreZip(t / "en2.zip", { { "Localization/english.pak", pak + "PATCHED", false } });
+    writeDelta(t / "en2.vgdelta", slurpFile(t / "en1.zip"), t / "en2.zip");
+
+    Spec sp; sp.readOnly = true;
+    sp.layers = { zipLayer(t.str("main.zip")), zipLayer(t.str("en1.zip")), deltaLayer(t.str("en2.vgdelta"), "") };
+    VfsState S; std::string err;
+    CHECK(S.Init(sp, err));
+    VfsAttr at;
+    CHECK_EQ(VfsGetattr(S, "Data/main.pak", at), 0);                     // the main depot shows through
+    CHECK_EQ(VfsGetattr(S, "Localization/readme.txt", at), 0);           // even in a folder the delta also has
+    CHECK_EQ(VfsGetattr(S, "Localization/english.pak", at), 0);          // the language depot at its newer version
+    CHECK_EQ(at.size, (uint64_t)pak.size() + 7);
+    CHECK(VfsGetattr(S, "Localization/old.pak", at) != 0);               // what the newer version dropped stays gone
+    CHECK(readdirNames(S, "") == (std::set<std::string>{ "Data", "Localization" }));
+    CHECK(readdirNames(S, "Localization") == (std::set<std::string>{ "english.pak", "readme.txt" }));
+    checkReaddirSubsetGetattr(S, "Localization");
+}
+
+// A base at ANOTHER address (BASE_TARGETS) is hidden where the delta surfaces, wherever it was mounted: a game's CD
+// music folder that a later release ships inside its own tree does not leak the tracks that release dropped, nor
+// the folders only the old layout had. A base outside the delta's subtree keeps the rest of itself.
+TEST(a_delta_hides_the_bases_it_names_under_itself_only) {
+    TmpDir t;
+    std::string game(4000, 'g'); for (size_t i = 0; i < game.size(); ++i) game[i] = char('a' + (i * 7) % 26);
+    std::string track(3000, 't'); for (size_t i = 0; i < track.size(); ++i) track[i] = char('A' + (i * 5) % 26);
+    writeStoreZip(t / "root.zip", { { "boot.ini", "ROOT", false }, { "g/old.cfg", "OLD-CFG", false } });
+    writeStoreZip(t / "game.zip", { { "game.exe", game, false } });
+    writeStoreZip(t / "music.zip", { { "track01.wav", track, false }, { "track02.wav", "DROPPED", false } });
+    writeStoreZip(t / "cd/deep.zip", { { "x.bin", "DEEP", false } });    // mounted below a folder only the old layout had
+    writeStoreZip(t / "new.zip", { { "game.exe", game + "1.1", false }, { "music/track01.wav", track, false } });
+    writeDelta(t / "new.vgdelta", slurpFile(t / "root.zip") + slurpFile(t / "game.zip") + slurpFile(t / "music.zip")
+                                      + slurpFile(t / "cd/deep.zip"), t / "new.zip");
+
+    Spec sp; sp.readOnly = true;
+    sp.layers = { zipLayer(t.str("root.zip")), zipLayer(t.str("game.zip"), "g"), zipLayer(t.str("music.zip"), "g/music"),
+                  zipLayer(t.str("cd/deep.zip"), "g/cd/deep"),
+                  deltaLayer(t.str("new.vgdelta"), "g", { "", "g", "g/music", "g/cd/deep" }) };
+    VfsState S; std::string err;
+    CHECK(S.Init(sp, err));
+    VfsAttr at;
+    CHECK_EQ(VfsGetattr(S, "g/game.exe", at), 0);
+    CHECK_EQ(at.size, (uint64_t)game.size() + 3);
+    CHECK_EQ(VfsGetattr(S, "g/music/track01.wav", at), 0);
+    CHECK(VfsGetattr(S, "g/music/track02.wav", at) != 0);                // the dropped track
+    CHECK(VfsGetattr(S, "g/cd", at) != 0);                                // a folder only a hidden base implied
+    CHECK(VfsGetattr(S, "g/old.cfg", at) != 0);                           // the root base, under the delta
+    CHECK_EQ(VfsGetattr(S, "boot.ini", at), 0);                           // ...keeps what lies outside it
+    CHECK(readdirNames(S, "g") == (std::set<std::string>{ "game.exe", "music" }));
+    CHECK(readdirNames(S, "g/music") == (std::set<std::string>{ "track01.wav" }));
+    CHECK(readdirNames(S, "") == (std::set<std::string>{ "boot.ini", "g" }));
+    checkReaddirSubsetGetattr(S, "g");
+}
+
+// A base named by a delta deep in a chain stays hidden under the chain's TOP: that delta is folded (a byte input
+// only, it never surfaces), so it cannot hide anything itself; its bases must carry up to whatever surfaces.
+TEST(a_base_named_inside_a_chain_stays_hidden_under_its_top) {
+    TmpDir t;
+    std::string game(4000, 'g'); for (size_t i = 0; i < game.size(); ++i) game[i] = char('a' + (i * 7) % 26);
+    writeStoreZip(t / "game.zip", { { "game.exe", game, false } });
+    writeStoreZip(t / "music.zip", { { "track01.wav", "TRACK-ONE", false }, { "track02.wav", "DROPPED", false } });
+    writeStoreZip(t / "v2.zip", { { "game.exe", game + "2", false }, { "music/track01.wav", "TRACK-ONE", false } });
+    writeStoreZip(t / "v3.zip", { { "game.exe", game + "23", false }, { "music/track01.wav", "TRACK-ONE", false } });
+    writeDelta(t / "v2.vgdelta", slurpFile(t / "game.zip") + slurpFile(t / "music.zip"), t / "v2.zip");
+    writeDelta(t / "v3.vgdelta", slurpFile(t / "v2.zip"), t / "v3.zip");
+
+    Spec sp; sp.readOnly = true;
+    sp.layers = { zipLayer(t.str("game.zip"), "g"), zipLayer(t.str("music.zip"), "g/music"),
+                  deltaLayer(t.str("v2.vgdelta"), "g", { "g", "g/music" }), deltaLayer(t.str("v3.vgdelta"), "g") };
+    VfsState S; std::string err;
+    CHECK(S.Init(sp, err));
+    VfsAttr at;
+    CHECK_EQ(VfsGetattr(S, "g/game.exe", at), 0);
+    CHECK_EQ(at.size, (uint64_t)game.size() + 2);
+    CHECK(VfsGetattr(S, "g/music/track02.wav", at) != 0);
+    CHECK(readdirNames(S, "g/music") == (std::set<std::string>{ "track01.wav" }));
+}
+
+// A delta whose declared bases leave out its own target was not built over what lies beneath it there: it starts a
+// chain of its own and folds nothing away. A language depot's delta deduped over another address must not swallow
+// the main depot beneath it (whole, or the top of its own chain), and a zip below every chain at a target is still
+// that target's byte view for a delta elsewhere. Teeth: any delta at a target used to extend the run below it.
+TEST(a_delta_based_elsewhere_does_not_swallow_the_depot_beneath_it) {
+    TmpDir t;
+    std::string big(5000, 'b'); for (size_t i = 0; i < big.size(); ++i) big[i] = char('a' + (i * 11) % 26);
+    writeStoreZip(t / "lang.zip", { { "Localization/english.pak", "ENGLISH", false } });
+    writeStoreZip(t / "x.zip", { { "x.bin", big, false } });
+    writeStoreZip(t / "main.zip", { { "game.exe", big + "MAIN", false } });
+    writeDelta(t / "main.vgdelta", slurpFile(t / "x.zip"), t / "main.zip");
+    {   // the language depot beneath a delta based at "x"
+        Spec sp; sp.readOnly = true;
+        sp.layers = { zipLayer(t.str("lang.zip")), zipLayer(t.str("x.zip"), "x"), deltaLayer(t.str("main.vgdelta"), "", { "x" }) };
+        VfsState S; std::string err;
+        CHECK(S.Init(sp, err));
+        VfsAttr at;
+        CHECK_EQ(VfsGetattr(S, "Localization/english.pak", at), 0);
+        CHECK_EQ(VfsGetattr(S, "game.exe", at), 0);
+        CHECK(VfsGetattr(S, "x/x.bin", at) != 0);                          // its base, inside its target
+    }
+    {   // the main depot's own chain beneath a language delta based at "x"
+        writeStoreZip(t / "m1.zip", { { "game.exe", big, false } });
+        writeStoreZip(t / "m2.zip", { { "game.exe", big + "V2", false } });
+        writeDelta(t / "m2.vgdelta", slurpFile(t / "m1.zip"), t / "m2.zip");
+        writeStoreZip(t / "l2.zip", { { "Localization/english.pak", big + "EN", false } });
+        writeDelta(t / "l2.vgdelta", slurpFile(t / "x.zip"), t / "l2.zip");
+        Spec sp; sp.readOnly = true;
+        sp.layers = { zipLayer(t.str("m1.zip")), deltaLayer(t.str("m2.vgdelta"), ""), zipLayer(t.str("x.zip"), "x"),
+                      deltaLayer(t.str("l2.vgdelta"), "", { "x" }) };
+        VfsState S; std::string err;
+        CHECK(S.Init(sp, err));
+        VfsAttr at;
+        CHECK_EQ(VfsGetattr(S, "game.exe", at), 0);
+        CHECK_EQ(at.size, (uint64_t)big.size() + 2);
+        CHECK_EQ(VfsGetattr(S, "Localization/english.pak", at), 0);
+        CHECK(readdirNames(S, "") == (std::set<std::string>{ "Localization", "game.exe" }));
+    }
+    {   // a zip below every chain at "" is the byte view a delta elsewhere names
+        writeStoreZip(t / "out.zip", { { "o.bin", big.substr(100, 4000) + "OUT", false } });
+        writeDelta(t / "out.vgdelta", slurpFile(t / "main.zip"), t / "out.zip");
+        Spec sp; sp.readOnly = true;
+        sp.layers = { zipLayer(t.str("main.zip")), deltaLayer(t.str("out.vgdelta"), "out", { "" }),
+                      zipLayer(t.str("x.zip"), "x"), deltaLayer(t.str("l2.vgdelta"), "", { "x" }) };
+        VfsState S; std::string err;
+        CHECK(S.Init(sp, err));
+        VfsAttr at;
+        CHECK_EQ(VfsGetattr(S, "out/o.bin", at), 0);
+        CHECK_EQ(VfsGetattr(S, "game.exe", at), 0);
+    }
+}
+
+// Names match whatever their case on a case-insensitive mount, and the spelling that resolves is the one a VISIBLE
+// layer has: a base hidden under its delta must not lend its spelling (readdir lists the delta's name, getattr on
+// it must find it). Teeth: the case map took every layer, hidden or not, lowest first.
+TEST(a_hidden_base_lends_no_spelling_to_a_case_insensitive_mount) {
+    TmpDir t;
+    std::string track(3000, 't'); for (size_t i = 0; i < track.size(); ++i) track[i] = char('A' + (i * 5) % 26);
+    writeStoreZip(t / "game.zip", { { "game.exe", track + "G", false } });
+    writeStoreZip(t / "music.zip", { { "Track01.wav", track, false } });
+    writeStoreZip(t / "new.zip", { { "game.exe", track + "G2", false }, { "music/track01.wav", track, false } });
+    writeDelta(t / "new.vgdelta", slurpFile(t / "game.zip") + slurpFile(t / "music.zip"), t / "new.zip");
+    Spec sp; sp.readOnly = true; sp.caseInsensitive = true;
+    sp.layers = { zipLayer(t.str("game.zip"), "h"), zipLayer(t.str("music.zip"), "h/music"),
+                  deltaLayer(t.str("new.vgdelta"), "h", { "h", "h/music" }) };
+    VfsState S; std::string err;
+    CHECK(S.Init(sp, err));
+    VfsAttr at;
+    CHECK(readdirNames(S, "h/music") == (std::set<std::string>{ "track01.wav" }));
+    CHECK_EQ(CanonicalCase(S, "H/MUSIC/TRACK01.WAV"), std::string("h/music/track01.wav"));   // as the backend asks
+    CHECK_EQ(VfsGetattr(S, CanonicalCase(S, "h/music/Track01.wav"), at), 0);
+    checkReaddirSubsetGetattr(S, "h/music");
+}
+
 // A part's boundary is what its size() says, NOT what its pread happens to hand back. FdByteSource — the part
 // type the real mount uses — forwards straight to ::pread on the fd, so on a file longer than the declared
 // size it WILL return bytes past that size. The clamp in ConcatByteSource is the only thing standing between

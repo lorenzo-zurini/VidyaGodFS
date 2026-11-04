@@ -19,7 +19,8 @@ struct LayerSpec {
     std::vector<std::string> baseTargets;  // DELTA only: the delta's byte-base is the CONCATENATION (in this exact
                              // order) of the composed views at these targets — one entry is the ordinary
                              // cross-target delta, several let one delta dedup against independent sources at once
-                             // (a prefix over [wine, dxvk, prev-prefix]). EMPTY means no base was declared: the base
+                             // (a prefix over [wine, dxvk, prev-prefix]). A base inside `target` is hidden there (the
+                             // delta replaces it), so a dedup-only source must lie outside. EMPTY means no base was declared: the base
                              // is then the composed view at `target` itself (the overlay-relative delta, the common
                              // case). There is deliberately no singular key — "" is a real target (the mount root),
                              // so a lone string could not tell "based at the root" apart from "no base declared",
