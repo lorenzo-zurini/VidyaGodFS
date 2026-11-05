@@ -360,13 +360,6 @@ static std::string OpaqueMarker(const VfsState &S, const std::string &vrel)
     return WLPath(S, vrel) + "/.wh..wh..opq";
 }
 
-bool IsOpaqueDir(const VfsState &S, const std::string &vrel)
-{
-    if (S.writelayer.empty()) return false;
-    MaskPtr m = LoadMask(S.opaqueSet);
-    return m && m->count(vrel) != 0;
-}
-
 void MarkOpaque(VfsState &S, const std::string &vrel)
 {
     if (S.writelayer.empty()) return;

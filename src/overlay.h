@@ -111,9 +111,6 @@ void        RemoveWhiteout(VfsState &S, const std::string &vrel);          // di
 // in-memory sets by rewriting every entry under oldv to the newv prefix (both whiteouts and opaque dirs).
 void        RenameMaskPrefix(VfsState &S, const std::string &oldv, const std::string &newv);
 
-//Opaque directories: a writelayer dir holding a `.wh..wh..opq` marker fully masks the lower layers for
-//its whole subtree (used when a lower-backed dir is deleted then recreated — the new one is empty).
-bool        IsOpaqueDir(const VfsState &S, const std::string &vrel);
 void        MarkOpaque(VfsState &S, const std::string &vrel);
 void        UnmarkOpaque(VfsState &S, const std::string &vrel);   // mask erase only (caller owns the disk marker)
 bool        IsUnderOpaque(const VfsState &S, const std::string &vrel);
