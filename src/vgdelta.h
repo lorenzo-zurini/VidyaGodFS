@@ -101,23 +101,28 @@ private:
     static constexpr size_t                                          CacheCap = 64;   // 64 blocks (~16 MB at 256K)
 };
 
-// Generates a .vgdelta reconstructing `target` from `base` (both addressable as flat memory — mmap them, they
-// are read once and sequentially). Uses a rolling-hash + greedy-extend matcher; literal runs are stored as
-// per-block zstd.
+// Generates a .vgdelta reconstructing `target` from `base` (both addressable as flat memory — mmap them; the target is
+// read once, sequentially). Uses a rolling-hash + greedy-extend matcher; literal runs are stored as per-block zstd.
 //
-// Memory: the matched-literal stream and the compressed ADD region are SPILLED to two scratch files instead of
-// being accumulated in RAM — on a big archive the literals alone can be several GB, and holding them plus the
-// compressed copy plus the returned buffer used to blow past the machine's RAM. Only the returned delta (and the
-// base index) stay resident. `scratchDir` says where those files go; empty = the system temp dir — pass a real
-// on-disk directory when that is a tmpfs (spilling to RAM-backed /tmp would defeat the whole point).
-// Progress + cancellation. Called periodically while the delta is built; return FALSE to ABORT, and
-// GenerateDelta returns an empty vector (its scratch files are cleaned up on that path like any other).
+// Memory is bounded whatever the target or delta size: the base index (~12 bytes per 256 bytes of base: a 57 GB base
+// is ~2.7 GB) plus O(block). The literal stream, the segment records and the compressed ADD region are SPILLED to
+// scratch files as they are produced, and the delta is streamed into `outPath` — never resident. `scratchDir` says
+// where the scratch goes; empty = the system temp dir — pass a real on-disk directory when that is a tmpfs (spilling
+// to RAM-backed /tmp would defeat the whole point). It needs about the delta's size plus the new literals, free.
+// Progress + cancellation. Called periodically while the delta is built; return FALSE to ABORT: the generation then
+// fails with Err "cancelled" (its scratch files and `outPath` are removed on that path like any other).
 // `stage` is 0 while scanning the target for matches and 1 while compressing the literal stream — two passes
 // with independent totals, so a caller renders them as two halves of one bar rather than a number that jumps.
 // Multi-GB archives are the normal case here (a 3.7GB Minecraft chain), which is why this is not optional
 // decoration: without it a conversion cannot be interrupted and shows nothing for minutes.
 using ProgressFn = std::function<bool(int stage, uint64_t done, uint64_t total)>;
 
+// False (outPath removed) on any failure or a cancel; Err says why.
+bool GenerateDeltaToFile(const uint8_t *base, size_t baseLen, const uint8_t *target, size_t targetLen,
+                         const std::string &outPath, std::string &Err, uint32_t blockSize = DEFAULT_BLOCK,
+                         const std::string &scratchDir = std::string(), const ProgressFn &progress = {});
+// The same delta, returned in memory — for small ones (the tests, a fixture, the editor's single archive). Empty on
+// failure or a cancel. A delta of gigabytes goes to a file.
 std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
                                    const uint8_t *target, size_t targetLen,
                                    uint32_t blockSize = DEFAULT_BLOCK,
@@ -133,6 +138,9 @@ std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
 // reconstruction a second time, so on a multi-GB archive it is minutes during which the caller would otherwise
 // show a finished bar and a Cancel button that does nothing. Return false to abort (VerifyDelta then returns
 // false with Err "cancelled").
+// `delta` is read through a ByteSource (mmap the file): only the tables and one ADD block at a time are resident.
+bool VerifyDelta(const std::shared_ptr<ByteSource> &delta, const std::shared_ptr<ByteSource> &base,
+                 ByteSource &target, std::string &Err, const ProgressFn &progress = {});
 bool VerifyDelta(const std::vector<uint8_t> &delta, const std::shared_ptr<ByteSource> &base,
                  ByteSource &target, std::string &Err, const ProgressFn &progress = {});
 

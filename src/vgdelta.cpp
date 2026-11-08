@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <memory>
 #include <unordered_map>
 
 #ifndef _WIN32
@@ -326,14 +327,106 @@ static constexpr uint64_t RK_R    = 131;
 static uint64_t PowR(uint64_t exp) { uint64_t r = 1, b = RK_R; while (exp) { if (exp & 1) r *= b; b *= b; exp >>= 1; } return r; }
 static uint64_t HashWin(const uint8_t *p) { uint64_t h = 0; for (uint32_t i = 0; i < ANCHOR; ++i) h = h * RK_R + p[i]; return h; }
 
-std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
-                                   const uint8_t *target, size_t targetLen,
-                                   uint32_t blockSize, const std::string &scratchDir,
-                                   const ProgressFn &progress) {
-    if (blockSize == 0) blockSize = DEFAULT_BLOCK;
+// The base index: one entry per ANCHOR-aligned window, the first offset winning per hash — open addressing at ~2/3
+// load, 8 bytes a slot: the hash's high half as a check, and the window's number + 1 (0 = empty). An unordered_map
+// node per window was ~40 bytes plus its bucket: a 57 GB base's 222 M windows took ~9 GB and OOM-killed the desktop
+// on a big jump; this is ~2.7 GB. A check collision drops a window from the index (a match not found: a bigger
+// delta, never a wrong one — every candidate is byte-compared before it is used).
+class BaseIndex {
+public:
+    bool Build(const uint8_t *base, size_t len) {
+        const uint64_t n = len >= ANCHOR ? (uint64_t)(len - ANCHOR) / ANCHOR + 1 : 0;
+        if (n >= UINT32_MAX) return false;                      // > 1 TiB of base: windows no longer fit 32 bits
+        Cap = std::max<uint64_t>(16, n + n / 2);
+        Slots.assign(Cap, 0);
+        for (uint64_t w = 0; w < n; ++w) Insert(HashWin(base + w * ANCHOR), (uint32_t)w);
+        return true;
+    }
+    // The base offset of the first window hashing to h, or -1. A candidate: the caller compares the bytes.
+    int64_t Find(uint64_t h) const {
+        if (!Cap) return -1;
+        const uint32_t Check = (uint32_t)(h >> 32);
+        for (uint64_t i = Home(h);; i = i + 1 == Cap ? 0 : i + 1) {
+            const uint64_t S = Slots[i];
+            if (!S) return -1;
+            if ((uint32_t)(S >> 32) == Check) return (int64_t)((S & 0xffffffffu) - 1) * ANCHOR;
+        }
+    }
+private:
+    uint64_t Home(uint64_t h) const {
+        h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33;  // spread the rolling hash over the table
+        return (uint64_t)(((unsigned __int128)h * Cap) >> 64);
+    }
+    void Insert(uint64_t h, uint32_t w) {
+        const uint32_t Check = (uint32_t)(h >> 32);
+        for (uint64_t i = Home(h);; i = i + 1 == Cap ? 0 : i + 1) {
+            uint64_t &S = Slots[i];
+            if (!S) { S = ((uint64_t)Check << 32) | ((uint64_t)w + 1); return; }
+            if ((uint32_t)(S >> 32) == Check) return;           // first wins
+        }
+    }
+    std::vector<uint64_t> Slots;
+    uint64_t Cap = 0;
+};
 
-    // Scratch files (see the header): the raw literal stream and the compressed ADD region are written out as
-    // they are produced, so neither is ever fully resident. Removed on every exit path by this guard.
+// One scratch file, removed on every exit path.
+struct Scratch {
+    std::filesystem::path path;
+    ~Scratch() { std::error_code e; if (!path.empty()) std::filesystem::remove(path, e); }
+};
+
+// Copies `n` bytes of the file at `from` onto `out`, a buffer at a time.
+static bool Append(SpillFile &out, const std::filesystem::path &from, uint64_t n) {
+    std::ifstream in(from, std::ios::binary);
+    if (!in) return false;
+    std::vector<char> buf(size_t(4) << 20);
+    while (n) {
+        const size_t k = (size_t)std::min<uint64_t>(n, buf.size());
+        in.read(buf.data(), (std::streamsize)k);
+        if ((size_t)in.gcount() != k || !out.Write(buf.data(), k)) return false;
+        n -= k;
+    }
+    return true;
+}
+
+// Compresses the file at `from` (`n` bytes) into `to` as ONE zstd frame (the reader decompresses a table in one
+// call), streaming: a block of input and its output resident at a time. Returns the compressed size, or -1.
+static int64_t CompressFile(const std::filesystem::path &from, uint64_t n, const std::filesystem::path &to, int level) {
+    std::unique_ptr<ZSTD_CCtx, size_t (*)(ZSTD_CCtx *)> c(ZSTD_createCCtx(), ZSTD_freeCCtx);
+    if (!c || ZSTD_isError(ZSTD_CCtx_setParameter(c.get(), ZSTD_c_compressionLevel, level))
+           || ZSTD_isError(ZSTD_CCtx_setPledgedSrcSize(c.get(), n))) return -1;
+    std::ifstream in(from, std::ios::binary);
+    SpillFile out;
+    if (!in || !out.Open(to)) return -1;
+    std::vector<char> ib(ZSTD_CStreamInSize()), ob(ZSTD_CStreamOutSize());
+    uint64_t left = n;
+    for (;;) {
+        const size_t k = (size_t)std::min<uint64_t>(left, ib.size());
+        in.read(ib.data(), (std::streamsize)k);
+        if ((size_t)in.gcount() != k) return -1;
+        left -= k;
+        const ZSTD_EndDirective mode = left ? ZSTD_e_continue : ZSTD_e_end;
+        ZSTD_inBuffer I{ ib.data(), k, 0 };
+        for (bool more = true; more;) {
+            ZSTD_outBuffer O{ ob.data(), ob.size(), 0 };
+            const size_t r = ZSTD_compressStream2(c.get(), &O, &I, mode);
+            if (ZSTD_isError(r) || !out.Write(ob.data(), O.pos)) return -1;
+            more = mode == ZSTD_e_end ? r != 0 : I.pos < I.size;
+        }
+        if (!left) break;
+    }
+    const uint64_t size = out.Size();
+    return out.Close() ? (int64_t)size : -1;
+}
+
+bool GenerateDeltaToFile(const uint8_t *base, size_t baseLen, const uint8_t *target, size_t targetLen,
+                         const std::string &outPath, std::string &Err, uint32_t blockSize,
+                         const std::string &scratchDir, const ProgressFn &progress) {
+    if (blockSize == 0) blockSize = DEFAULT_BLOCK;
+    const auto Fail = [&](const std::string &why) { Err = why; std::error_code e; std::filesystem::remove(outPath, e); return false; };
+
+    // Scratch files (see the header): the literal stream, the segment records, then their compressed forms — each
+    // written as it is produced, so none is ever resident.
     std::error_code sec;
     const std::filesystem::path scratch =
         scratchDir.empty() ? std::filesystem::temp_directory_path(sec) : std::filesystem::path(scratchDir);
@@ -349,33 +442,28 @@ std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
     const auto uniq = std::to_string((uint64_t)std::chrono::steady_clock::now().time_since_epoch().count())
                     + "_" + std::to_string(pid)
                     + "_" + std::to_string(ScratchSeq.fetch_add(1));
-    const std::filesystem::path litPath = scratch / ("vgdelta_lit_" + uniq + ".tmp");
-    const std::filesystem::path cmpPath = scratch / ("vgdelta_cmp_" + uniq + ".tmp");
-    struct Cleanup {
-        std::filesystem::path a, b;
-        ~Cleanup() { std::error_code e; std::filesystem::remove(a, e); std::filesystem::remove(b, e); }
-    } cleanup{ litPath, cmpPath };
+    Scratch litPath{ scratch / ("vgdelta_lit_" + uniq + ".tmp") }, cmpPath{ scratch / ("vgdelta_cmp_" + uniq + ".tmp") },
+            segPath{ scratch / ("vgdelta_seg_" + uniq + ".tmp") }, segcPath{ scratch / ("vgdelta_segc_" + uniq + ".tmp") };
 
-    struct Seg { uint8_t kind; uint64_t len; uint64_t srcOff; };
-    std::vector<Seg> segs;
-
-    SpillFile lit;
-    if (!lit.Open(litPath)) return {};
+    SpillFile lit, seg;
+    if (!lit.Open(litPath.path) || !seg.Open(segPath.path)) return Fail("cannot write scratch files in " + scratch.string());
     bool spillOk = true;
-
+    uint64_t numSegs = 0;
+    // Segment records: kind(1) len(8) srcOff(8) = 17 bytes each.
+    auto emitSeg = [&](uint8_t kind, uint64_t len, uint64_t srcOff) {
+        uint8_t r[17] = { kind };
+        for (int i = 0; i < 8; ++i) { r[1 + i] = (uint8_t)(len >> (8 * i)); r[9 + i] = (uint8_t)(srcOff >> (8 * i)); }
+        spillOk = seg.Write(r, sizeof r) && spillOk;
+        ++numSegs;
+    };
     auto emitAdd = [&](size_t from, size_t to) {
         if (to <= from) return;
-        segs.push_back({ KIND_ADD, (uint64_t)(to - from), lit.Size() });
+        emitSeg(KIND_ADD, (uint64_t)(to - from), lit.Size());
         spillOk = lit.Write(target + from, to - from) && spillOk;
     };
 
-    // Index the base at ANCHOR-aligned windows (first offset wins per hash). u64 offset: bases can be >4 GB.
-    std::unordered_map<uint64_t, uint64_t> index;
-    if (baseLen >= ANCHOR) {
-        index.reserve(baseLen / ANCHOR + 1);
-        for (size_t o = 0; o + ANCHOR <= baseLen; o += ANCHOR)
-            index.emplace(HashWin(base + o), (uint64_t)o);
-    }
+    BaseIndex index;
+    if (!index.Build(base, baseLen)) return Fail("the base is over 1 TiB");
 
     const uint64_t Rhi = PowR(ANCHOR - 1);
     size_t p = 0, litStart = 0;
@@ -389,20 +477,19 @@ std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
         uint64_t h = HashWin(target);
         while (p + ANCHOR <= targetLen) {
             if (progress && p >= nextPoll) {
-                if (!progress(0, (uint64_t)p, (uint64_t)targetLen)) return {};
+                if (!progress(0, (uint64_t)p, (uint64_t)targetLen)) return Fail("cancelled");
                 nextPoll = p + kPollEvery;
             }
             bool matched = false;
-            auto it = index.find(h);
-            if (it != index.end()) {
-                size_t o = it->second;
+            if (const int64_t at = index.Find(h); at >= 0) {
+                size_t o = (size_t)at;
                 if (o + ANCHOR <= baseLen && std::memcmp(base + o, target + p, ANCHOR) == 0) {
                     size_t len = ANCHOR;
                     while (o + len < baseLen && p + len < targetLen && base[o + len] == target[p + len]) ++len;
                     size_t back = 0;
                     while (back < p - litStart && o > back && base[o - 1 - back] == target[p - 1 - back]) ++back;
                     emitAdd(litStart, p - back);
-                    segs.push_back({ KIND_COPY, (uint64_t)(len + back), (uint64_t)(o - back) });
+                    emitSeg(KIND_COPY, (uint64_t)(len + back), (uint64_t)(o - back));
                     p += len; litStart = p;
                     matched = true;
                     if (p + ANCHOR <= targetLen) h = HashWin(target + p);
@@ -415,71 +502,87 @@ std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
         }
     }
     emitAdd(litStart, targetLen);   // tail literals
+    { BaseIndex done; std::swap(index, done); }   // the index is the encoder's one big allocation: free it now
 
     // ---- serialize ----
     // ADD region: stream the literal file back in blockSize chunks, zstd each, and write the compressed bytes
     // straight to the second scratch file. Only ONE uncompressed block (blockSize) and its compressed form are
     // resident at a time, so this scales to any archive size.
-    const uint64_t addTotal = lit.Size();
-    if (!lit.Close() || !spillOk) return {};
+    const uint64_t addTotal = lit.Size(), segBytes = seg.Size();
+    if (!lit.Close() || !seg.Close() || !spillOk) return Fail("writing the scratch files failed (disk full?)");
+    if (numSegs > UINT32_MAX) return Fail("too many segments");
     std::vector<BlockRec> blocks;
     uint64_t addRegionSize = 0;
     {
-        std::ifstream in(litPath, std::ios::binary);
+        std::ifstream in(litPath.path, std::ios::binary);
         SpillFile out;
-        if (!in || !out.Open(cmpPath)) return {};
+        if (!in || !out.Open(cmpPath.path)) return Fail("cannot write scratch files in " + scratch.string());
         std::vector<uint8_t> buf(blockSize);
         for (uint64_t o = 0; o < addTotal; o += blockSize) {
-            if (progress && !progress(1, o, addTotal)) return {};
+            if (progress && !progress(1, o, addTotal)) return Fail("cancelled");
             const uint32_t ul = (uint32_t)std::min<uint64_t>(blockSize, addTotal - o);
             in.read(reinterpret_cast<char *>(buf.data()), (std::streamsize)ul);
-            if ((uint64_t)in.gcount() != ul) return {};
+            if ((uint64_t)in.gcount() != ul) return Fail("reading the literals back failed");
             std::vector<uint8_t> c = ZCompress(buf.data(), ul, 19);   // ADD blocks + tables both at 19 (decode
                                                                      // cost is level-independent, so max the ratio)
+            if (c.empty()) return Fail("zstd failed");
             blocks.push_back({ addRegionSize, (uint32_t)c.size(), ul });
-            if (!out.Write(c.data(), c.size())) return {};
+            if (!out.Write(c.data(), c.size())) return Fail("writing the scratch files failed (disk full?)");
             addRegionSize += c.size();
         }
-        if (!out.Close()) return {};
+        if (!out.Close()) return Fail("writing the scratch files failed (disk full?)");
     }
-    std::filesystem::remove(litPath, sec);   // literals no longer needed — free the space before building `out`
+    std::filesystem::remove(litPath.path, sec);   // literals no longer needed — free the space before the output
 
-    // Segment records: kind(1) len(8) srcOff(8) = 17 bytes each.
-    std::vector<uint8_t> segRaw;
-    segRaw.reserve(segs.size() * 17);
-    for (const Seg &s : segs) { segRaw.push_back(s.kind); put64(segRaw, s.len); put64(segRaw, s.srcOff); }
-    std::vector<uint8_t> segComp = ZCompress(segRaw.data(), segRaw.size());
+    const int64_t segComp = CompressFile(segPath.path, segBytes, segcPath.path, 19);
+    if (segComp < 0) return Fail("compressing the segment table failed");
+    std::filesystem::remove(segPath.path, sec);
 
-    // Block records: compOff(8) compLen(4) uncompLen(4) = 16 bytes each.
+    // Block records: compOff(8) compLen(4) uncompLen(4) = 16 bytes each — 16 bytes per 256K of new content.
     std::vector<uint8_t> blkRaw;
     blkRaw.reserve(blocks.size() * 16);
     for (const BlockRec &b : blocks) { put64(blkRaw, b.compOff); put32(blkRaw, b.compLen); put32(blkRaw, b.uncompLen); }
     std::vector<uint8_t> blkComp = ZCompress(blkRaw.data(), blkRaw.size());
 
-    std::vector<uint8_t> out;
-    // Exact reserve: the returned buffer is the ONLY multi-GB allocation left, and letting it grow by doubling
-    // would transiently need twice its size — the spike that used to OOM on large archives.
-    out.reserve(4 + 4 + 4 + 8 + 8 + 8 + 4 + 4 + 16 + segComp.size() + 16 + blkComp.size() + addRegionSize);
-    out.insert(out.end(), MAGIC, MAGIC + 4);
-    put32(out, VERSION);
-    put32(out, blockSize);
-    put64(out, targetLen);
-    put64(out, baseLen);
-    put64(out, Fnv1a64(base, baseLen));
-    put32(out, (uint32_t)segs.size());
-    put32(out, (uint32_t)blocks.size());
-    put64(out, segComp.size()); put64(out, segRaw.size());
-    out.insert(out.end(), segComp.begin(), segComp.end());
-    put64(out, blkComp.size()); put64(out, blkRaw.size());
-    out.insert(out.end(), blkComp.begin(), blkComp.end());
-    {   // append the compressed ADD region straight from its scratch file
-        std::ifstream in(cmpPath, std::ios::binary);
-        if (!in) return {};
-        const size_t addStart = out.size();
-        out.resize(addStart + addRegionSize);
-        in.read(reinterpret_cast<char *>(out.data() + addStart), (std::streamsize)addRegionSize);
-        if ((uint64_t)in.gcount() != addRegionSize) return {};
-    }
+    SpillFile out;
+    if (!out.Open(outPath)) return Fail("cannot write " + outPath);
+    std::vector<uint8_t> head;
+    head.insert(head.end(), MAGIC, MAGIC + 4);
+    put32(head, VERSION);
+    put32(head, blockSize);
+    put64(head, targetLen);
+    put64(head, baseLen);
+    put64(head, Fnv1a64(base, baseLen));
+    put32(head, (uint32_t)numSegs);
+    put32(head, (uint32_t)blocks.size());
+    put64(head, (uint64_t)segComp); put64(head, segBytes);
+    bool ok = out.Write(head.data(), head.size()) && Append(out, segcPath.path, (uint64_t)segComp);
+    head.clear();
+    put64(head, blkComp.size()); put64(head, blkRaw.size());
+    ok = ok && out.Write(head.data(), head.size()) && out.Write(blkComp.data(), blkComp.size())
+            && Append(out, cmpPath.path, addRegionSize);   // the compressed ADD region, straight from its scratch file
+    if (!out.Close() || !ok) return Fail("writing " + outPath + " failed (disk full?)");
+    return true;
+}
+
+std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
+                                   const uint8_t *target, size_t targetLen,
+                                   uint32_t blockSize, const std::string &scratchDir,
+                                   const ProgressFn &progress) {
+    std::error_code sec;
+    const std::filesystem::path scratch =
+        scratchDir.empty() ? std::filesystem::temp_directory_path(sec) : std::filesystem::path(scratchDir);
+    static std::atomic<uint64_t> OutSeq{0};
+    Scratch outPath{ scratch / ("vgdelta_out_" + std::to_string((uint64_t)std::chrono::steady_clock::now().time_since_epoch().count())
+                                + "_" + std::to_string(OutSeq.fetch_add(1)) + ".tmp") };
+    std::string err;
+    if (!GenerateDeltaToFile(base, baseLen, target, targetLen, outPath.path.string(), err, blockSize, scratchDir, progress)) return {};
+    std::ifstream in(outPath.path, std::ios::binary | std::ios::ate);
+    if (!in) return {};
+    std::vector<uint8_t> out((size_t)in.tellg());
+    in.seekg(0);
+    in.read(reinterpret_cast<char *>(out.data()), (std::streamsize)out.size());
+    if ((size_t)in.gcount() != out.size()) return {};
     return out;
 }
 
@@ -488,8 +591,14 @@ std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,
 bool vgdelta::VerifyDelta(const std::vector<uint8_t> &delta, const std::shared_ptr<ByteSource> &base,
                           ByteSource &target, std::string &Err, const ProgressFn &progress)
 {
+    return VerifyDelta(std::make_shared<MemByteSource>(delta), base, target, Err, progress);
+}
+
+bool vgdelta::VerifyDelta(const std::shared_ptr<ByteSource> &delta, const std::shared_ptr<ByteSource> &base,
+                          ByteSource &target, std::string &Err, const ProgressFn &progress)
+{
     std::string derr;
-    auto ds = DeltaByteSource::Create(std::make_shared<MemByteSource>(delta), base, derr, false);
+    auto ds = DeltaByteSource::Create(delta, base, derr, false);
     if (!ds) { Err = "compose failed: " + derr; return false; }
     const uint64_t N = target.size();
     if (ds->size() != N)
