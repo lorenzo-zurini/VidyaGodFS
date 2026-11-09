@@ -423,7 +423,10 @@ bool GenerateDeltaToFile(const uint8_t *base, size_t baseLen, const uint8_t *tar
                          const std::string &outPath, std::string &Err, uint32_t blockSize,
                          const std::string &scratchDir, const ProgressFn &progress) {
     if (blockSize == 0) blockSize = DEFAULT_BLOCK;
-    const auto Fail = [&](const std::string &why) { Err = why; std::error_code e; std::filesystem::remove(outPath, e); return false; };
+    //outPath is removed on a failure only once this call opened it: a file already there (the delta it would replace,
+    //or a base or target named by mistake) is never taken by a generation that failed before writing.
+    bool Opened = false;
+    const auto Fail = [&](const std::string &why) { Err = why; std::error_code e; if (Opened) std::filesystem::remove(outPath, e); return false; };
 
     // Scratch files (see the header): the literal stream, the segment records, then their compressed forms — each
     // written as it is produced, so none is ever resident.
@@ -546,6 +549,7 @@ bool GenerateDeltaToFile(const uint8_t *base, size_t baseLen, const uint8_t *tar
 
     SpillFile out;
     if (!out.Open(outPath)) return Fail("cannot write " + outPath);
+    Opened = true;
     std::vector<uint8_t> head;
     head.insert(head.end(), MAGIC, MAGIC + 4);
     put32(head, VERSION);
