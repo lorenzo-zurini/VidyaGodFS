@@ -4,7 +4,9 @@
 #include "layerspec.h"
 #include "bytesource.h"
 
+#include <array>
 #include <functional>
+#include <unordered_map>
 #include <map>
 #include <memory>
 #include <string>
@@ -84,8 +86,12 @@ struct CaseConflict
     std::string firstName, secondName;
     bool dir = false;
 };
+//The names a listing puts in the tree through one mount, prepared once (its tree path, lower-cased): the same in every
+//tree that mounts it that way. A caller asking many trees (the validator: a version chain of 900 launchables) keeps one
+//across them; a listing must stay put while it is kept.
+struct PreparedNames { std::unordered_map<std::string, std::vector<std::array<std::string, 3>>> Of; };
 //Every conflicting component once, lowest layer first. A file mounted twice does not conflict with itself.
-std::vector<CaseConflict> CaseConflicts(const Spec &S, const TreePlan &P, const EntriesFn &Entries);
+std::vector<CaseConflict> CaseConflicts(const Spec &S, const TreePlan &P, const EntriesFn &Entries, PreparedNames *Cache = nullptr);
 //Per layer: {entry as its source holds it -> that entry spelt as the tree first spells each of its folders and its
 //name, lowest layer first} — the entries a rename to the tree's own case would rewrite. Hidden entries spell nothing
 //and are not renamed; an entry whose place would itself change case is left alone.

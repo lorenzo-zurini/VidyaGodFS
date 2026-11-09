@@ -3,6 +3,7 @@
 #include "hostio.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <fcntl.h>
 #include <set>
@@ -64,27 +65,35 @@ TreePlan PlanTree(const Spec &S, const std::vector<bool> &Failed)
         return !P.broken[D];
     };
     for (size_t I = 0; I < N; ++I) if (S.layers[I].type == LayerType::Delta) Rebuilds(I);
-    //What each delta replaces: the CIDs it names, and what each of them was rebuilt from.
-    std::vector<std::set<std::string>> Replaces(N);
-    std::vector<bool> Got(N, false);
-    std::function<const std::set<std::string> &(size_t)> ReplacesOf = [&](size_t D) -> const std::set<std::string> & {
-        if (Got[D]) return Replaces[D];
-        Got[D] = true;                                      // set first: a ring was refused above, this only terminates
-        for (size_t K = 0; K < P.bases[D].size(); ++K)
-        {
-            const size_t B = P.bases[D][K];
-            Replaces[D].insert(S.layers[B].cid);
-            if (S.layers[B].type == LayerType::Delta) { const auto &R = ReplacesOf(B); Replaces[D].insert(R.begin(), R.end()); }
-        }
-        return Replaces[D];
-    };
+    //Where each file is hidden, and up to which layer: a delta that rebuilds hides the files it names, beneath it, inside
+    //its places — and what they were rebuilt from too, so whatever hides a file it names (from beneath that one) also
+    //hides that file's own bases. Passed down the names, once per file: a chain of a thousand versions is a thousand
+    //steps, not a million. Per CID: place -> the highest layer whose placements beneath it are hidden there.
+    std::unordered_map<std::string, std::vector<size_t>> NamedBy;   // CID -> the rebuilding deltas naming it
     for (size_t D = 0; D < N; ++D)
+        if (S.layers[D].type == LayerType::Delta && !P.broken[D])
+            for (const std::string &C : S.layers[D].bases) NamedBy[C].push_back(D);
+    std::unordered_map<std::string, std::map<std::string, size_t>> Down;
+    std::unordered_set<std::string> Passed;
+    std::function<const std::map<std::string, size_t> &(const std::string &)> DownOf = [&](const std::string &C) -> const std::map<std::string, size_t> & {
+        auto &Out = Down[C];
+        if (!Passed.insert(C).second) return Out;          // a ring was refused above, this only terminates
+        const auto Add = [&](const std::string &Place, size_t Upto) { auto &U = Out[Place]; U = std::max(U, Upto); };
+        const auto It = NamedBy.find(C);
+        if (It == NamedBy.end()) return Out;
+        for (size_t D : It->second)
+        {
+            for (const auto &M : P.mounts[D]) Add(M.second, D);
+            if (!S.layers[D].cid.empty())
+                for (const auto &[Place, Upto] : std::map<std::string, size_t>(DownOf(S.layers[D].cid))) Add(Place, Upto);   // whatever hides D hides D's bases
+        }
+        return Out;
+    };
+    for (size_t L = 0; L < N; ++L)
     {
-        if (S.layers[D].type != LayerType::Delta || P.broken[D] || P.mounts[D].empty()) continue;
-        const auto &R = ReplacesOf(D);
-        for (size_t L = 0; L < D; ++L)
-            if (Archive(S.layers[L]) && !S.layers[L].cid.empty() && R.count(S.layers[L].cid))
-                for (const auto &M : P.mounts[D]) P.maskedUnder[L].push_back(M.second);
+        if (!Archive(S.layers[L]) || S.layers[L].cid.empty()) continue;
+        for (const auto &[Place, Upto] : DownOf(S.layers[L].cid))
+            if (L < Upto) P.maskedUnder[L].push_back(Place);
     }
     for (size_t L = 0; L < N; ++L)
         P.whole[L] = S.layers[L].bytesOnly
@@ -161,9 +170,10 @@ std::vector<std::string> Split(const std::string &S)
     return V;
 }
 
-//Each visible name layer I puts in the tree: (entry as its source holds it, its path in the tree), in mount order.
-void Visible(const Spec &S, const TreePlan &P, size_t I, const EntriesFn &Entries,
-             const std::function<void(const std::string &, const std::string &, const std::pair<std::string, std::string> &)> &Out)
+//Each visible name layer I puts in the tree: (entry as its source holds it, its path in the tree, that path lower-cased,
+//the mount that put it there). Prepared once per listing and mount when a cache is given.
+using NameFn = std::function<void(const std::string &, const std::string &, const std::string &, const std::pair<std::string, std::string> &)>;
+void Visible(const Spec &S, const TreePlan &P, size_t I, const EntriesFn &Entries, PreparedNames *Cache, const NameFn &Out)
 {
     if (P.whole[I]) return;
     const LayerSpec &L = S.layers[I];
@@ -175,40 +185,53 @@ void Visible(const Spec &S, const TreePlan &P, size_t I, const EntriesFn &Entrie
         const size_t Sl = L.source.find_last_of("/\\");
         const std::string Base = Sl == std::string::npos ? L.source : L.source.substr(Sl + 1);
         const std::string V = L.target.empty() ? Base : L.target + "/" + Base;
-        if (!Masked(V)) Out(Base, V, P.mounts[I].front());
+        if (!Masked(V)) Out(Base, V, Lower(V), P.mounts[I].front());
         return;
     }
     const std::vector<std::string> *E = Entries(I);
     if (!E) return;
-    for (const std::string &Raw : *E)
+    for (const auto &M : P.mounts[I])
     {
-        std::string Entry = Raw;
-        while (!Entry.empty() && Entry.back() == '/') Entry.pop_back();
-        if (Entry.empty()) continue;
-        for (const auto &M : P.mounts[I])
+        const auto &[Sub, Place] = M;
+        std::vector<std::array<std::string, 3>> Local;
+        std::vector<std::array<std::string, 3>> *Names = &Local;
+        bool Fresh = true;
+        if (Cache)
         {
-            const auto &[Sub, Place] = M;
-            std::string Rel;
-            if (Sub.empty()) Rel = Entry;
-            else if (Entry == Sub) Rel.clear();                                    // the mount is this one entry (a file a TAKE takes)
-            else if (Entry.size() > Sub.size() && Entry.compare(0, Sub.size(), Sub) == 0 && Entry[Sub.size()] == '/') Rel = Entry.substr(Sub.size() + 1);
-            else continue;
-            const std::string V = Rel.empty() ? Place : Place.empty() ? Rel : Place + "/" + Rel;
-            if (V.empty()) continue;
-            if (!Masked(V)) Out(Raw, V, M);
+            auto [It, New] = Cache->Of.try_emplace(std::to_string(reinterpret_cast<uintptr_t>(E)) + '\x1f' + Sub + '\x1f' + Place);
+            Names = &It->second;
+            Fresh = New;
         }
+        if (Fresh)
+            for (const std::string &Raw : *E)
+            {
+                std::string Entry = Raw;
+                while (!Entry.empty() && Entry.back() == '/') Entry.pop_back();
+                if (Entry.empty()) continue;
+                std::string Rel;
+                if (Sub.empty()) Rel = Entry;
+                else if (Entry == Sub) Rel.clear();                                // the mount is this one entry (a file a TAKE takes)
+                else if (Entry.size() > Sub.size() && Entry.compare(0, Sub.size(), Sub) == 0 && Entry[Sub.size()] == '/') Rel = Entry.substr(Sub.size() + 1);
+                else continue;
+                std::string V = Rel.empty() ? Place : Place.empty() ? Rel : Place + "/" + Rel;
+                if (V.empty()) continue;
+                std::string Lv = Lower(V);
+                Names->push_back({ Raw, std::move(V), std::move(Lv) });
+            }
+        for (const auto &[Raw, V, Lv] : *Names)
+            if (!Masked(V)) Out(Raw, V, Lv, M);
     }
 }
 } // namespace
 
-std::vector<CaseConflict> CaseConflicts(const Spec &S, const TreePlan &P, const EntriesFn &Entries)
+std::vector<CaseConflict> CaseConflicts(const Spec &S, const TreePlan &P, const EntriesFn &Entries, PreparedNames *Cache)
 {
     std::vector<CaseConflict> Out;
     std::unordered_map<std::string, std::pair<std::string, size_t>> Seen;   // lower-cased path -> (spelling, layer)
     std::unordered_set<std::string> Reported;
     for (size_t I = 0; I < S.layers.size(); ++I)
-        Visible(S, P, I, Entries, [&](const std::string &, const std::string &V, const auto &) {
-            const auto [It, New] = Seen.try_emplace(Lower(V), V, I);
+        Visible(S, P, I, Entries, Cache, [&](const std::string &, const std::string &V, const std::string &Lv, const auto &) {
+            const auto [It, New] = Seen.try_emplace(Lv, V, I);
             if (New) return;
             const auto &[Prev, J] = It->second;
             if (Prev == V || S.layers[J].source == S.layers[I].source) return;   // one file mounted twice is no conflict
@@ -229,7 +252,7 @@ std::map<size_t, std::map<std::string, std::string>> CaseRenames(const Spec &S, 
     std::map<size_t, std::map<std::string, std::string>> Out;
     std::unordered_map<std::string, std::string> Canon;   // lower-cased path prefix -> the tree's spelling of its last part
     for (size_t I = 0; I < S.layers.size(); ++I)
-        Visible(S, P, I, Entries, [&](const std::string &Raw, const std::string &V, const std::pair<std::string, std::string> &M) {
+        Visible(S, P, I, Entries, nullptr, [&](const std::string &Raw, const std::string &V, const std::string &, const std::pair<std::string, std::string> &M) {
             const std::vector<std::string> C = Split(V);
             std::string Prefix, Fixed;
             bool Changed = false;

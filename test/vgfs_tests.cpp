@@ -1017,6 +1017,29 @@ TEST(failures_found_while_surfacing_are_followed_down_the_chain) {
     CHECK_EQ(at.size, (uint64_t)game.size() + 2);
 }
 
+// What hides a file a delta names reaches that delta's own bases beneath IT, not only beneath the delta: v2 (bytes only)
+// sits below v1's placement, v3 above both replaces v2 — and so v1, though v1 lies above v2. Teeth: bound the inherited
+// hiding by the delta that names the base instead of the one that hides.
+TEST(inherited_hiding_reaches_up_to_the_delta_that_hides) {
+    TmpDir t;
+    std::string game(4000, 'g'); for (size_t i = 0; i < game.size(); ++i) game[i] = char('a' + (i * 7) % 26);
+    writeStoreZip(t / "v1.zip", { { "game.exe", game, false }, { "old.dll", "DROPPED", false } });
+    writeStoreZip(t / "v2.zip", { { "game.exe", game + "V2", false } });
+    writeStoreZip(t / "v3.zip", { { "game.exe", game + "V23", false } });
+    writeDelta(t / "v2.vgdelta", slurpFile(t / "v1.zip"), t / "v2.zip");
+    writeDelta(t / "v3.vgdelta", slurpFile(t / "v2.zip"), t / "v3.zip");
+    LayerSpec D2 = deltaLayer(t.str("v2.vgdelta"), "g", { t.str("v1.zip") });
+    D2.bytesOnly = true;
+    Spec sp; sp.readOnly = true;
+    sp.layers = { D2, zipLayer(t.str("v1.zip"), "g"), deltaLayer(t.str("v3.vgdelta"), "g", { t.str("v2.vgdelta") }) };
+    VfsState S; std::string err;
+    CHECK(S.Init(sp, err));
+    VfsAttr at;
+    CHECK(VfsGetattr(S, "g/old.dll", at) != 0);
+    CHECK_EQ(VfsGetattr(S, "g/game.exe", at), 0);
+    CHECK_EQ(at.size, (uint64_t)game.size() + 3);
+}
+
 // A version chain holds one rebuilt map at a time: each base's bytes are released once the last delta over it is
 // built, unless it surfaces. Teeth: keep every view built (a 900-version chain held 900 maps at mount).
 TEST(a_chain_releases_each_version_once_the_next_is_built) {
@@ -1064,6 +1087,20 @@ TEST(case_conflicts_and_renames_follow_the_tree) {
         const std::map<size_t, std::vector<std::string>> E3 = { { 0, { "Data/w.dat" } }, { 1, { "inner/Data/w.dat" } } };
         const EntriesFn Fn3 = [&](size_t I) { return &E3.at(I); };
         CHECK_EQ(CaseConflicts(Two, PlanTree(Two), Fn3).size(), size_t(1));
+    }
+    {   // one cache across trees: a listing mounted at another place is prepared again, not reused from the first
+        PreparedNames Cache;
+        Spec At; At.readOnly = true;
+        At.layers = { zipLayer("/a.zip", "data"), zipLayer("/b.zip") };
+        const std::map<size_t, std::vector<std::string>> Ea = { { 0, { "x.dat" } }, { 1, { "DATA/x.dat" } } };
+        Spec Root; Root.readOnly = true;
+        Root.layers = { zipLayer("/a.zip", "elsewhere"), zipLayer("/b.zip") };
+        const std::vector<std::string> Shared = { "x.dat" }, Other = { "DATA/x.dat" };
+        const EntriesFn Fa = [&](size_t I) { return I == 0 ? &Shared : &Other; };
+        CHECK_EQ(CaseConflicts(At, PlanTree(At), Fa, &Cache).size(), size_t(1));       // data/x.dat vs DATA/x.dat
+        CHECK(CaseConflicts(Root, PlanTree(Root), Fa, &Cache).empty());                  // elsewhere/x.dat: nothing
+        CHECK_EQ(CaseConflicts(At, PlanTree(At), Fa, &Cache).size(), size_t(1));       // and again, from the cache
+        (void)Ea;
     }
     const auto R = CaseRenames(sp, P, Fn);
     CHECK(R.count(1) && R.at(1).at("DATA/x.dat") == "Data/x.dat");
