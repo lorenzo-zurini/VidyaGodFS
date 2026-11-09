@@ -37,6 +37,7 @@ find_package(nlohmann_json REQUIRED)
 # (arg parse + backend handoff) is deliberately NOT part of the core so tests can link it. ---
 set(VGFS_CORE_SRC
     src/layerspec.cpp
+    src/treeplan.cpp
     src/ziplayer.cpp
     src/overlay.cpp
     src/vfsops.cpp

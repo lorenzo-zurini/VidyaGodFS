@@ -1,4 +1,5 @@
 #include "overlay.h"
+#include "treeplan.h"
 #include "vgdelta.h"
 #include "hostio.h"     // all host filesystem I/O goes through the backend-neutral shim
 
@@ -61,6 +62,7 @@ static void AddAncestors(std::set<std::string> &dst, const std::string &leaf)
     while (!cur.empty()) { dst.insert(cur); cur = ParentVRel(cur); }
 }
 
+
 static void SeedMasksFromWritelayer(VfsState &S);   // defined with the mask machinery below
 static void SeedKeptMasks(Layer &L);                 // likewise, for each kept folder
 
@@ -78,143 +80,68 @@ bool VfsState::Init(const Spec &S, std::string &Err)
     SeedMasksFromWritelayer(*this);
 
     int prio = 0;
-    // Delta chaining + folding: within a run of same-target layers ending in delta(s), the base zip and any
-    // intermediate deltas are BYTE inputs only — they compose into the topmost delta's single FLAT map (done in
-    // DeltaByteSource::Create). Only that top delta surfaces as an overlay layer, so reads never walk the chain
-    // and memory stays O(1) in chain depth (hundreds of daisy-chained versions cost the same as one).
-    std::unordered_map<std::string, std::shared_ptr<ByteSource>> baseByTarget;   // composed view so far, per target
-    //The spec layers behind each target's composed view (a delta's: itself and every layer of its bases), and the
-    //mounted layers each spec layer surfaced as: a delta hides exactly its bases, wherever they surfaced.
-    std::unordered_map<std::string, std::vector<size_t>> baseLayersByTarget;
-    std::vector<std::vector<size_t>> mountedAs(S.layers.size());
-    std::unordered_set<std::string> chainSeen;   // targets where a chain has begun: a zip stacked there later is an overlay
-    //A CHAIN is a run, among one target's zip/delta layers in order: a base zip followed by the deltas built over
-    //that target (or a delta based elsewhere, and those built over it). A delta whose declared bases leave out its own
-    //target was not built over what lies beneath it there, so it starts a chain of its own instead of folding that
-    //away (a language depot's delta deduped over another address, above the main depot). One target can hold SEVERAL
-    //chains - Steam depots, or the same delta-built node contained twice (whole, and again with a TAKE re-rooting a
-    //folder of it) - each surfacing its own top. chainTop[gi] = the top delta of the chain layer gi belongs to, or
-    //npos for a layer in none (a zip stacked over a chain: an ordinary overlay).
-    constexpr size_t NoChain = static_cast<size_t>(-1);
-    std::vector<size_t> chainTop(S.layers.size(), NoChain);
+    //What the layers make of the tree (treeplan.h): where each appears, which file each base CID is, what each delta
+    //hides. Then the bytes of each layer that surfaces, built on demand — a delta over its bases' bytes, released as
+    //soon as no surfacing layer or unbuilt delta needs them. A delta that turns out not to rebuild hides nothing: the
+    //plan is made again with it broken, so what it would have hidden surfaces — and again, while that finds more.
+    TreePlan P = PlanTree(S);
+    for (const std::string &Why : P.problems) std::cerr << "[vidyagodfs] " << Why << " — it is left out\n";
+    std::vector<std::shared_ptr<ZipIndex>> Index(S.layers.size());
+    std::vector<bool> Failed(S.layers.size(), false);
+    //Each round surfaces what the failures so far stopped hiding, and may find a failure beneath them (a delta whose own
+    //file is gone is found to fail before anything beneath it is tried): re-planned until a round finds none. At most
+    //one round per delta, plus the last.
+    for (;;)
     {
-        std::unordered_map<std::string, std::vector<size_t>> byTarget;
-        for (size_t gi = 0; gi < S.layers.size(); ++gi)
-            if (S.layers[gi].type == LayerType::Zip || S.layers[gi].type == LayerType::Delta)
-                byTarget[S.layers[gi].target].push_back(gi);
-        const auto BuiltOverOwnTarget = [&](size_t gi) {
-            const LayerSpec &D = S.layers[gi];
-            return D.baseTargets.empty() || std::find(D.baseTargets.begin(), D.baseTargets.end(), D.target) != D.baseTargets.end();
-        };
-        for (const auto &[T, Idx] : byTarget)
-            for (size_t i = 0; i < Idx.size();)
+        std::vector<bool> Keep(S.layers.size());
+        for (size_t I = 0; I < S.layers.size(); ++I) Keep[I] = !P.whole[I];
+        LayerBytes Bytes(S, P, Keep);
+        bool NewFailure = false;
+        for (size_t I = 0; I < S.layers.size(); ++I)
+        {
+            const LayerSpec &LS = S.layers[I];
+            if ((LS.type != LayerType::Zip && LS.type != LayerType::Delta) || P.whole[I] || Index[I] || Failed[I]) continue;
+            if (LS.type == LayerType::Delta && P.broken[I]) continue;
+            std::string Why;
+            std::shared_ptr<ByteSource> Src = Bytes.Get(I, &Why);
+            if (!Src)
             {
-                const bool Zip = S.layers[Idx[i]].type == LayerType::Zip;
-                size_t j = i + 1;
-                while (j < Idx.size() && S.layers[Idx[j]].type == LayerType::Delta && BuiltOverOwnTarget(Idx[j])) ++j;
-                if (Zip && j == i + 1) { ++i; continue; }                    // a zip no delta is built over
-                for (size_t k = i; k < j; ++k) chainTop[Idx[k]] = Idx[j - 1];
-                i = j;
+                std::cerr << "[vidyagodfs] skipping layer " << LS.source << ": " << Why << "\n";
+                if (Bytes.Failed(I)) { Failed[I] = true; NewFailure = true; }
+                continue;
             }
+            Index[I] = BuildZipIndex(Src, LS.source);
+            if (!Index[I]) std::cerr << "[vidyagodfs] skipping unreadable zip layer: " << LS.source << "\n";
+        }
+        for (size_t I = 0; I < S.layers.size(); ++I)          // a delta read only as a base can fail too
+            if (Bytes.Failed(I) && !Failed[I]) { Failed[I] = true; NewFailure = true; }
+        if (!NewFailure) break;
+        P = PlanTree(S, Failed);                              // what the failed deltas hid surfaces
     }
 
     for (size_t gi = 0; gi < S.layers.size(); ++gi)
     {
         const LayerSpec &LS = S.layers[gi];
-        std::shared_ptr<ZipIndex> zip;
-        std::vector<size_t> behind{ gi };   // the spec layers this one's byte view stands for
-        if (LS.type == LayerType::Zip || LS.type == LayerType::Delta)
-        {
-            HostIO::Fd fd = HostIO::Open(LS.source, O_RDONLY);
-            if (fd < 0) { std::cerr << "[vidyagodfs] skipping unreadable layer: " << LS.source << "\n"; continue; }
-            HostIO::Stat stt;
-            if (HostIO::Fstat(fd, stt) != 0) { HostIO::Close(fd); continue; }
-            std::shared_ptr<ByteSource> src = std::make_shared<FdByteSource>(fd, stt.size, true);
-
-            if (LS.type == LayerType::Delta)
-            {
-                // Base = the composed view(s) this delta's COPY offsets index into. `baseTargets` names them
-                // explicitly and IN ORDER: one entry is the ordinary cross-target delta (a complete archive
-                // mounted at the package root, diffed over a base zip at a sub-target); several mean the base is
-                // their CONCATENATION, so one delta dedups against independent sources at once (a prefix over
-                // [wine, dxvk, prev-prefix]). Declaring nothing means the base is this layer's OWN target — the
-                // zip directly below, which is what a plain chain is. Concat parts are ByteSources (often
-                // flattened delta chains); nothing is materialized. The order MUST match what generation
-                // concatenated, and a lone "" is a REAL declaration (based at the mount root), which is exactly
-                // why there is no singular key to confuse it with "undeclared".
-                const std::vector<std::string> baseTgts =
-                    LS.baseTargets.empty() ? std::vector<std::string>{ LS.target } : LS.baseTargets;
-                std::vector<std::shared_ptr<ByteSource>> bs; bool ok = true;
-                for (const std::string &t : baseTgts)
-                {
-                    auto bit = baseByTarget.find(t);
-                    if (bit == baseByTarget.end() || !bit->second)
-                    { std::cerr << "[vidyagodfs] delta layer has no base at target '" << t << "': " << LS.source << "\n"; ok = false; break; }
-                    bs.push_back(bit->second);
-                    const auto &B = baseLayersByTarget[t];
-                    behind.insert(behind.end(), B.begin(), B.end());
-                }
-                if (!ok) continue;
-                std::shared_ptr<ByteSource> base = bs.size() == 1 ? bs[0] : std::make_shared<ConcatByteSource>(bs);
-                std::string derr;
-                auto ds = vgdelta::DeltaByteSource::Create(src, base, derr, false);
-                if (!ds) { std::cerr << "[vidyagodfs] bad delta " << LS.source << ": " << derr << "\n"; continue; }
-                src = ds;
-            }
-            // Chain membership: at a target with a delta chain, only the layers UP TO the final delta are the
-            // chain (base zip + intermediate deltas + the top delta). Zip layers stacked AFTER the chain are
-            // ordinary overlay layers (a game's patch/no-CD/mod zips above a delta-converted base) — they were
-            // never generation-time byte inputs, so they must neither fold into the chain nor advance the
-            // composed byte view. A zip below every chain at its target is still that target's view (a depot a
-            // delta elsewhere names as its base). Folding them (the old `gi != last` check) silently DROPPED every overlay
-            // above a delta: Halo CE served the delta's retail SafeDisc exe instead of the no-CD layer's
-            // (instant silent death), and MW4 Mercenaries masked its MekTek hotfixes.
-            const bool InChain = chainTop[gi] != NoChain;
-            if (InChain) chainSeen.insert(LS.target);
-            if (InChain || !chainSeen.count(LS.target))
-            {
-                baseByTarget[LS.target] = src;   // the composed byte view (chain members, or plain-zip targets)
-                baseLayersByTarget[LS.target] = behind;
-            }
-
-            // Fold: a base zip or intermediate delta of a chain is a byte input only, subsumed into the top
-            // delta's flat map — do not surface it (or even index it) as an overlay layer.
-            if (InChain && gi != chainTop[gi]) continue;
-
-            zip = BuildZipIndex(src, LS.source);
-            if (!zip) { std::cerr << "[vidyagodfs] skipping unreadable zip layer: " << LS.source << "\n"; continue; }
-        }
-
-        // SUBMOUNTS fan-out: one internal Layer per (subpath,target) mount, or a single whole-mount ("" subpath
-        // at LS.target) when none are declared. File layers ignore submounts (already a single file).
-        std::vector<std::pair<std::string, std::string>> mounts = LS.submounts;
-        if (mounts.empty() || LS.type == LayerType::File) mounts = { { std::string(), LS.target } };
-
-        for (const auto &[sub, tgt] : mounts)
+        const bool Archive = LS.type == LayerType::Zip || LS.type == LayerType::Delta;
+        if (Archive && (P.whole[gi] || !Index[gi])) continue;   // a byte input only, or nothing to serve
+        for (const auto &[sub, tgt] : P.mounts[gi])
         {
             Layer L;
-            L.type = (LS.type == LayerType::Delta) ? LayerType::Zip : LS.type;  // delta-backed → a zip layer
+            L.type = Archive ? LayerType::Zip : LS.type;      // delta-backed → a zip layer
             L.source = LS.source;
             L.target = tgt;
             L.subpath = sub;
             L.rw = LS.rw;
-            L.zip = zip;
+            L.zip = Archive ? Index[gi] : nullptr;
             L.priority = prio++;
-
+            L.maskedUnder = P.maskedUnder[gi];
             if (LS.type == LayerType::File)
             {
                 L.fileBase  = BaseName(LS.source);
                 L.fileVPath = L.target.empty() ? L.fileBase : (L.target + "/" + L.fileBase);
             }
-
-            mountedAs[gi].push_back(layers.size());
             layers.push_back(std::move(L));
         }
-        //A delta hides its bases (behind[0] is itself) under each place it surfaced. A folded base never surfaced.
-        if (LS.type == LayerType::Delta)
-            for (size_t b = 1; b < behind.size(); ++b)
-                for (size_t Li : mountedAs[behind[b]])
-                    for (size_t Di : mountedAs[gi]) layers[Li].maskedUnder.push_back(layers[Di].target);
     }
     //Structural dirs come from what is visible: a base hidden whole by its delta implies none of its own.
     for (const Layer &L : layers)
@@ -273,10 +200,6 @@ bool LayerCovers(const Layer &L, const std::string &vrel)
     return vrel == L.target || vrel.rfind(L.target + "/", 0) == 0;
 }
 
-static bool Within(const std::string &vrel, const std::string &root)
-{
-    return root.empty() || vrel == root || vrel.rfind(root + "/", 0) == 0;
-}
 
 bool LayerMasked(const Layer &L, const std::string &vrel)
 {

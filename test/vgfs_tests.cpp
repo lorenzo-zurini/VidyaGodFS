@@ -4,6 +4,7 @@
 // HostIO mocking — the POSIX shim is exercised for real. Fixtures are torn down per test.
 
 #include "overlay.h"
+#include "treeplan.h"
 #include "vfsops.h"
 #include "layerspec.h"
 #include "ziplayer.h"
@@ -77,8 +78,9 @@ static void writeStoreZip(const fs::path &zipPath, const std::vector<std::tuple<
     zip_close(z);
 }
 
+// A zip layer; its CID is its path here (one path, one file: what the app's CIDs are to the FS).
 static LayerSpec zipLayer(const std::string &src, const std::string &target = "") {
-    LayerSpec L; L.type = LayerType::Zip; L.source = src; L.target = NormalizeVPath(target); return L;
+    LayerSpec L; L.type = LayerType::Zip; L.source = src; L.cid = src; L.target = NormalizeVPath(target); return L;
 }
 static LayerSpec dirLayer(const std::string &src, const std::string &target = "", bool rw = false) {
     LayerSpec L; L.type = LayerType::Dir; L.source = src; L.target = NormalizeVPath(target); L.rw = rw; return L;
@@ -581,10 +583,9 @@ TEST(delta_over_concatenated_bases) {
     }
 }
 
-// A base declared AT THE MOUNT ROOT ("") used to be inexpressible: the spec's singular `baseTarget` key could not
-// tell it apart from "no base declared", so the FS fell back to the delta's own target, reconstructed against the
-// wrong bytes and skipped the layer. One key — an ordered list — removes the ambiguity by construction.
-TEST(a_base_declared_at_the_root_is_not_confused_with_no_base) {
+// A delta reads the layer it NAMES, not the one beneath it at its target: here a decoy zip sits at the delta's
+// target and the base is at the mount root. Teeth: base a delta on whatever lies beneath its target.
+TEST(a_delta_reads_the_base_it_names_not_the_layer_beneath_it) {
     TmpDir t;
     std::string body(6000, 'q'); for (size_t i = 0; i < body.size(); ++i) body[i] = char('a' + (i * 5) % 26);
     writeStoreZip(t / "root.zip", { { "fr.bin", body, false } });          // mounts at "" (the root)
@@ -603,20 +604,20 @@ TEST(a_base_declared_at_the_root_is_not_confused_with_no_base) {
     CHECK(!delta.empty());
     { std::ofstream o(t / "d.vgdelta", std::ios::binary); o.write((const char *)delta.data(), (std::streamsize)delta.size()); }
 
-    // The delta mounts at "sub" — where the DECOY is — but declares its base at the root. Read the wrong base and
-    // the reconstruction fails outright; read no base and the layer is skipped. Either way "sub/ft.bin" is absent.
+    // The delta mounts at "sub" — where the DECOY is — but names the root zip. Read the wrong base and the
+    // reconstruction fails outright, and "sub/ft.bin" is absent.
     std::ostringstream js;
     js << "{\"mountpoint\":\"" << t.str("mnt") << "\",\"readonly\":true,\"layers\":["
-       << "{\"type\":\"zip\",\"source\":\"" << t.str("root.zip") << "\",\"target\":\"\"},"
-       << "{\"type\":\"zip\",\"source\":\"" << t.str("decoy.zip") << "\",\"target\":\"sub\"},"
+       << "{\"type\":\"zip\",\"source\":\"" << t.str("root.zip") << "\",\"target\":\"\",\"cid\":\"QmRoot\"},"
+       << "{\"type\":\"zip\",\"source\":\"" << t.str("decoy.zip") << "\",\"target\":\"sub\",\"cid\":\"QmDecoy\"},"
        << "{\"type\":\"delta\",\"source\":\"" << t.str("d.vgdelta") << "\",\"target\":\"sub\","
-       <<  "\"baseTargets\":[\"\"]}]}";
+       <<  "\"bases\":[\"QmRoot\"]}]}";
     writeFile(t / "spec.json", js.str());
 
     Spec sp; std::string err;
     CHECK(ParseSpec(t.str("spec.json"), sp, err));
     CHECK_EQ(sp.layers.size(), size_t(3));
-    CHECK_EQ(sp.layers[2].baseTargets.size(), size_t(1));
+    CHECK(sp.layers[2].bases == std::vector<std::string>{ "QmRoot" });
 
     VfsState S;
     CHECK(S.Init(sp, err));
@@ -630,8 +631,9 @@ TEST(a_base_declared_at_the_root_is_not_confused_with_no_base) {
     }
 }
 
-// A malformed base list is REFUSED, not quietly shortened: a concatenation missing one part is a base of the
-// wrong SIZE, which fails the delta's size check and costs the layer its content with nothing said.
+// A malformed base list is REFUSED, not quietly repaired: a concatenation missing one part, or reading a layer that is
+// not there, is a base of the wrong bytes, which fails the delta's check and costs the layer its content with nothing
+// said. And a delta that names nothing is refused: there is no implicit base.
 TEST(a_malformed_base_list_is_refused) {
     TmpDir t;
     writeStoreZip(t / "a.zip", { { "x", "x", false } });
@@ -641,24 +643,43 @@ TEST(a_malformed_base_list_is_refused) {
     auto spec = [&](const std::string &bases) {
         std::ostringstream js;
         js << "{\"mountpoint\":\"" << t.str("mnt") << "\",\"readonly\":true,\"layers\":["
-           << "{\"type\":\"zip\",\"source\":\"" << t.str("a.zip") << "\",\"target\":\"a\"},"
-           << "{\"type\":\"delta\",\"source\":\"" << t.str("d.vgdelta") << "\",\"target\":\"b\","
-           <<  "\"baseTargets\":" << bases << "}]}";
+           << "{\"type\":\"zip\",\"source\":\"" << t.str("a.zip") << "\",\"target\":\"a\",\"cid\":\"QmA\"},"
+           << "{\"type\":\"delta\",\"source\":\"" << t.str("d.vgdelta") << "\",\"target\":\"b\""
+           << (bases.empty() ? "" : ",\"bases\":" + bases) << "}]}";
         writeFile(t / "spec.json", js.str());
         Spec sp; std::string err;
         const bool ok = ParseSpec(t.str("spec.json"), sp, err);
         return std::make_pair(ok, err);
     };
-    CHECK(!spec("[\"a\", 7]").first);                 // a non-string entry
-    CHECK(!spec("\"a\"").first);                      // a bare string where a list belongs
-    const auto Ok = spec("[\"a\"]");                  // ...and the well-formed shape still parses
+    CHECK(!spec("").first);                           // no bases: a delta names what it was built over
+    CHECK(spec("[]").first);                          // an empty list parses: the plan reports the delta (it names no base)
+    CHECK(!spec("[\"QmA\", 7]").first);               // a non-CID entry
+    CHECK(!spec("[\"\"]").first);                     // an empty CID
+    CHECK(!spec("\"QmA\"").first);                    // a bare CID where a list belongs
+    CHECK(!spec("[\"QmA\", \"QmA\"]").first);         // one file named twice
+    {   // a cid on a layer that is not a zip or a delta, and bases on a layer that is not a delta
+        std::ostringstream js;
+        js << "{\"mountpoint\":\"" << t.str("mnt") << "\",\"readonly\":true,\"layers\":["
+           << "{\"type\":\"dir\",\"source\":\"" << t.str(".") << "\",\"target\":\"a\"},"
+           << "{\"type\":\"dir\",\"source\":\"" << t.str(".") << "\",\"target\":\"c\",\"cid\":\"QmD\"}]}";
+        writeFile(t / "spec.json", js.str());
+        Spec sp; std::string err;
+        CHECK(!ParseSpec(t.str("spec.json"), sp, err));       // only a zip or a delta carries a cid
+        std::ostringstream js2;
+        js2 << "{\"mountpoint\":\"" << t.str("mnt") << "\",\"readonly\":true,\"layers\":["
+            << "{\"type\":\"zip\",\"source\":\"" << t.str("a.zip") << "\",\"target\":\"a\"},"
+            << "{\"type\":\"zip\",\"source\":\"" << t.str("a.zip") << "\",\"target\":\"b\",\"bases\":[\"QmA\"]}]}";
+        writeFile(t / "spec.json", js2.str());
+        CHECK(!ParseSpec(t.str("spec.json"), sp, err));
+    }
+    const auto Ok = spec("[\"QmA\"]");                // ...and the well-formed shape still parses (a CID no layer carries is the plan's to report)
     CHECK(Ok.first);
     if (!Ok.first) std::cerr << "    parse error was: " << Ok.second << "\n";
 }
 
 // END TO END, through the REAL handoff: the spec JSON VidyaGod writes → ParseSpec → VfsState::Init → a read.
 // The pieces above (ConcatByteSource, DeltaByteSource) were already unit-tested while the FLOW into them was
-// dead — `baseTargets` never appeared in a spec because the mount builder only read the singular key. A unit
+// dead — the bases never reached a spec because the mount builder only read the singular key. A unit
 // test that pins a function while nothing reaches it reads as coverage and is worse than none.
 TEST(multi_base_delta_mounts_from_a_spec_file) {
     TmpDir t;
@@ -686,23 +707,19 @@ TEST(multi_base_delta_mounts_from_a_spec_file) {
     CHECK(delta.size() < tgt.size());                       // it must be deduping, not just storing the target
     { std::ofstream o(t / "c.vgdelta", std::ios::binary); o.write((const char *)delta.data(), (std::streamsize)delta.size()); }
 
-    // The spec exactly as VidyaGod's BuildLayerSpec writes it — `baseTargets` plural, in order.
+    // The spec exactly as VidyaGod's BuildLayerSpec writes it — each zip's `cid`, the delta's `bases` by CID, in order.
     std::ostringstream js;
     js << "{\"mountpoint\":\"" << t.str("mnt") << "\",\"readonly\":true,\"layers\":["
-       << "{\"type\":\"zip\",\"source\":\"" << t.str("a.zip") << "\",\"target\":\"a\"},"
-       << "{\"type\":\"zip\",\"source\":\"" << t.str("b.zip") << "\",\"target\":\"b\"},"
+       << "{\"type\":\"zip\",\"source\":\"" << t.str("a.zip") << "\",\"target\":\"a\",\"cid\":\"QmA\"},"
+       << "{\"type\":\"zip\",\"source\":\"" << t.str("b.zip") << "\",\"target\":\"b\",\"cid\":\"QmB\"},"
        << "{\"type\":\"delta\",\"source\":\"" << t.str("c.vgdelta") << "\",\"target\":\"c\","
-       <<  "\"baseTargets\":[\"a\",\"b\"]}]}";
+       <<  "\"bases\":[\"QmA\",\"QmB\"]}]}";
     writeFile(t / "spec.json", js.str());
 
     Spec sp; std::string err;
     CHECK(ParseSpec(t.str("spec.json"), sp, err));
     CHECK_EQ(sp.layers.size(), size_t(3));
-    CHECK_EQ(sp.layers[2].baseTargets.size(), size_t(2));
-    if (sp.layers[2].baseTargets.size() == 2) {          // guarded: indexing past a failed size check aborts
-        CHECK_EQ(sp.layers[2].baseTargets[0], std::string("a"));
-        CHECK_EQ(sp.layers[2].baseTargets[1], std::string("b"));
-    }
+    CHECK(sp.layers[2].bases == (std::vector<std::string>{ "QmA", "QmB" }));
 
     VfsState S;
     CHECK(S.Init(sp, err));
@@ -724,9 +741,8 @@ TEST(multi_base_delta_mounts_from_a_spec_file) {
 }
 
 // One delta-built node contained TWICE at one target: whole, and again with a TAKE renaming a folder of it (a
-// runner taking wine-mono-11.3.0 as "wine-mono" too, the link its build shipped). Each occurrence is its own chain
-// (base zip + deltas): the first surfaces whole, the second only its renamed folder. Teeth: one chain per target
-// (only the last chain's top surfaces, so the whole tree vanishes).
+// runner taking wine-mono-11.3.0 as "wine-mono" too, the link its build shipped). One file, placed twice: each delta
+// copy surfaces (whole, and its renamed folder), and every placement of the base beneath them is hidden.
 TEST(a_delta_chain_contained_twice_at_one_target_mounts_both) {
     TmpDir t;
     std::string f1(3000, 'q'); for (size_t i = 0; i < f1.size(); ++i) f1[i] = char('a' + (i * 5) % 26);
@@ -742,10 +758,10 @@ TEST(a_delta_chain_contained_twice_at_one_target_mounts_both) {
     { std::ofstream o(t / "next.vgdelta", std::ios::binary); o.write((const char *)delta.data(), (std::streamsize)delta.size()); }
     std::ostringstream js;
     js << "{\"mountpoint\":\"" << t.str("mnt") << "\",\"readonly\":true,\"layers\":["
-       << "{\"type\":\"zip\",\"source\":\"" << t.str("base.zip") << "\",\"target\":\"share/mono\"},"
-       << "{\"type\":\"delta\",\"source\":\"" << t.str("next.vgdelta") << "\",\"target\":\"share/mono\"},"
-       << "{\"type\":\"zip\",\"source\":\"" << t.str("base.zip") << "\",\"target\":\"share/mono\",\"submounts\":[\"mono-2.0:share/mono/mono\"]},"
-       << "{\"type\":\"delta\",\"source\":\"" << t.str("next.vgdelta") << "\",\"target\":\"share/mono\",\"submounts\":[\"mono-2.0:share/mono/mono\"]}]}";
+       << "{\"type\":\"zip\",\"source\":\"" << t.str("base.zip") << "\",\"target\":\"share/mono\",\"cid\":\"QmBase\"},"
+       << "{\"type\":\"delta\",\"source\":\"" << t.str("next.vgdelta") << "\",\"target\":\"share/mono\",\"cid\":\"QmNext\",\"bases\":[\"QmBase\"]},"
+       << "{\"type\":\"zip\",\"source\":\"" << t.str("base.zip") << "\",\"target\":\"share/mono\",\"cid\":\"QmBase\",\"submounts\":[\"mono-2.0:share/mono/mono\"]},"
+       << "{\"type\":\"delta\",\"source\":\"" << t.str("next.vgdelta") << "\",\"target\":\"share/mono\",\"cid\":\"QmNext\",\"bases\":[\"QmBase\"],\"submounts\":[\"mono-2.0:share/mono/mono\"]}]}";
     writeFile(t / "spec.json", js.str());
     Spec sp; std::string err;
     CHECK(ParseSpec(t.str("spec.json"), sp, err));
@@ -772,8 +788,9 @@ static void writeDelta(const fs::path &out, const std::string &base, const fs::p
     auto d = vgdelta::GenerateDelta((const uint8_t *)base.data(), base.size(), (const uint8_t *)tgt.data(), tgt.size());
     std::ofstream o(out, std::ios::binary); o.write((const char *)d.data(), (std::streamsize)d.size());
 }
-static LayerSpec deltaLayer(const std::string &src, const std::string &target, std::vector<std::string> bases = {}) {
-    LayerSpec L; L.type = LayerType::Delta; L.source = src; L.target = NormalizeVPath(target); L.baseTargets = std::move(bases);
+// A delta over the files it names (by their paths, the CIDs zipLayer and deltaLayer give them).
+static LayerSpec deltaLayer(const std::string &src, const std::string &target, std::vector<std::string> bases) {
+    LayerSpec L; L.type = LayerType::Delta; L.source = src; L.cid = src; L.target = NormalizeVPath(target); L.bases = std::move(bases);
     return L;
 }
 
@@ -786,7 +803,7 @@ TEST(a_delta_hides_its_base_and_not_another_depot_beneath_it) {
     writeDelta(t / "en2.vgdelta", slurpFile(t / "en1.zip"), t / "en2.zip");
 
     Spec sp; sp.readOnly = true;
-    sp.layers = { zipLayer(t.str("main.zip")), zipLayer(t.str("en1.zip")), deltaLayer(t.str("en2.vgdelta"), "") };
+    sp.layers = { zipLayer(t.str("main.zip")), zipLayer(t.str("en1.zip")), deltaLayer(t.str("en2.vgdelta"), "", { t.str("en1.zip") }) };
     VfsState S; std::string err;
     CHECK(S.Init(sp, err));
     VfsAttr at;
@@ -800,7 +817,282 @@ TEST(a_delta_hides_its_base_and_not_another_depot_beneath_it) {
     checkReaddirSubsetGetattr(S, "Localization");
 }
 
-// A base at ANOTHER address (BASE_TARGETS) is hidden where the delta surfaces, wherever it was mounted: a game's CD
+// A zip stacked over a delta is an ordinary layer above it, never folded into it: a no-CD exe over a delta-converted
+// base wins (Halo CE served the retail SafeDisc exe when overlays above a chain were folded away). Teeth: hide or fold
+// the layers above a delta at its target.
+TEST(a_zip_above_a_delta_is_an_overlay_above_it) {
+    TmpDir t;
+    std::string game(4000, 'g'); for (size_t i = 0; i < game.size(); ++i) game[i] = char('a' + (i * 7) % 26);
+    writeStoreZip(t / "v1.zip", { { "game.exe", game, false }, { "old.dll", "OLD", false } });
+    writeStoreZip(t / "v2.zip", { { "game.exe", game + "V2", false } });
+    writeStoreZip(t / "nocd.zip", { { "game.exe", "NOCD", false } });
+    writeDelta(t / "v2.vgdelta", slurpFile(t / "v1.zip"), t / "v2.zip");
+    Spec sp; sp.readOnly = true;
+    sp.layers = { zipLayer(t.str("v1.zip")), deltaLayer(t.str("v2.vgdelta"), "", { t.str("v1.zip") }), zipLayer(t.str("nocd.zip")) };
+    VfsState S; std::string err;
+    CHECK(S.Init(sp, err));
+    VfsAttr at;
+    CHECK_EQ(VfsGetattr(S, "game.exe", at), 0);
+    CHECK_EQ(at.size, (uint64_t)4);                                      // the overlay's exe
+    CHECK(VfsGetattr(S, "old.dll", at) != 0);                            // v1, replaced by its delta
+}
+
+// A delta that does not reconstruct (it names the wrong bytes) mounts nothing, and HIDES nothing: what it named stays
+// as it was, so the failure shows as the old version rather than an empty game. Teeth: hide a delta's bases before
+// knowing it rebuilt.
+TEST(a_delta_that_does_not_rebuild_hides_nothing) {
+    TmpDir t;
+    std::string game(4000, 'g'); for (size_t i = 0; i < game.size(); ++i) game[i] = char('a' + (i * 7) % 26);
+    writeStoreZip(t / "v1.zip", { { "game.exe", game, false } });
+    writeStoreZip(t / "other.zip", { { "other.bin", game + "OTHER-BYTES", false } });
+    writeStoreZip(t / "v2.zip", { { "game.exe", game + "V2", false } });
+    writeDelta(t / "v2.vgdelta", slurpFile(t / "v1.zip"), t / "v2.zip");
+    Spec sp; sp.readOnly = true;
+    sp.layers = { zipLayer(t.str("v1.zip")), zipLayer(t.str("other.zip")), deltaLayer(t.str("v2.vgdelta"), "", { t.str("other.zip") }) };
+    VfsState S; std::string err;
+    CHECK(S.Init(sp, err));
+    VfsAttr at;
+    CHECK_EQ(VfsGetattr(S, "game.exe", at), 0);
+    CHECK_EQ(at.size, (uint64_t)game.size());                            // v1, the delta did not mount
+    CHECK_EQ(VfsGetattr(S, "other.bin", at), 0);                         // the base it misnamed is still there
+}
+
+// A base surfacing at two places (a TAKE projecting two folders of one archive), one inside its delta and one outside,
+// keeps the one outside: only a base hidden at EVERY place is a byte input only. Teeth: drop it when any place is
+// inside the delta.
+TEST(a_base_partly_outside_its_delta_keeps_the_rest) {
+    TmpDir t;
+    std::string game(4000, 'g'); for (size_t i = 0; i < game.size(); ++i) game[i] = char('a' + (i * 7) % 26);
+    writeStoreZip(t / "v1.zip", { { "bin/game.exe", game, false }, { "docs/manual.txt", "MANUAL", false } });
+    writeStoreZip(t / "v2.zip", { { "bin/game.exe", game + "V2", false } });
+    writeDelta(t / "v2.vgdelta", slurpFile(t / "v1.zip"), t / "v2.zip");
+    LayerSpec v1 = zipLayer(t.str("v1.zip"));
+    v1.submounts = { { "bin", "g/bin" }, { "docs", "manual" } };
+    Spec sp; sp.readOnly = true;
+    sp.layers = { v1, deltaLayer(t.str("v2.vgdelta"), "g", { t.str("v1.zip") }) };
+    VfsState S; std::string err;
+    CHECK(S.Init(sp, err));
+    VfsAttr at;
+    CHECK_EQ(VfsGetattr(S, "manual/manual.txt", at), 0);                 // the place outside the delta
+    CHECK_EQ(VfsGetattr(S, "g/bin/game.exe", at), 0);                    // the delta's own tree
+    CHECK_EQ(at.size, (uint64_t)game.size() + 2);
+}
+
+// A bytes-only layer (a base no TAKE shows) is read by the delta that names it and surfaces nowhere. Teeth: surface it.
+TEST(a_bytes_only_base_feeds_its_delta_and_shows_nowhere) {
+    TmpDir t;
+    std::string game(4000, 'g'); for (size_t i = 0; i < game.size(); ++i) game[i] = char('a' + (i * 7) % 26);
+    writeStoreZip(t / "win.zip", { { "game.exe", game, false } });
+    writeStoreZip(t / "mac.zip", { { "Game.app/game", game + "MAC", false } });
+    writeDelta(t / "mac.vgdelta", slurpFile(t / "win.zip"), t / "mac.zip");
+    LayerSpec win = zipLayer(t.str("win.zip"), "win");
+    win.bytesOnly = true;
+    Spec sp; sp.readOnly = true;
+    sp.layers = { win, deltaLayer(t.str("mac.vgdelta"), "mac", { t.str("win.zip") }) };
+    VfsState S; std::string err;
+    CHECK(S.Init(sp, err));
+    VfsAttr at;
+    CHECK_EQ(VfsGetattr(S, "mac/Game.app/game", at), 0);
+    CHECK(VfsGetattr(S, "win", at) != 0);
+}
+
+// One file placed twice beneath its delta (a package containing Base, and a Patch that contains Base again plus a
+// delta over it): EVERY placement inside the delta's target is hidden, so what the new version dropped never leaks.
+// Teeth: hide only the copy nearest the delta.
+TEST(every_placement_of_a_base_beneath_its_delta_is_hidden) {
+    TmpDir t;
+    std::string game(4000, 'g'); for (size_t i = 0; i < game.size(); ++i) game[i] = char('a' + (i * 7) % 26);
+    writeStoreZip(t / "v1.zip", { { "game.exe", game, false }, { "old.dll", "DROPPED", false } });
+    writeStoreZip(t / "v2.zip", { { "game.exe", game + "V2", false } });
+    writeDelta(t / "v2.vgdelta", slurpFile(t / "v1.zip"), t / "v2.zip");
+    Spec sp; sp.readOnly = true;
+    sp.layers = { zipLayer(t.str("v1.zip"), "g"), zipLayer(t.str("v1.zip"), "g"), deltaLayer(t.str("v2.vgdelta"), "g", { t.str("v1.zip") }) };
+    VfsState S; std::string err;
+    CHECK(S.Init(sp, err));
+    VfsAttr at;
+    CHECK(VfsGetattr(S, "g/old.dll", at) != 0);
+    CHECK_EQ(VfsGetattr(S, "g/game.exe", at), 0);
+    CHECK_EQ(at.size, (uint64_t)game.size() + 2);
+}
+
+// A base's bytes are its file's wherever it is placed — even above its delta (a macOS build listed before the Windows
+// depots it is built over); only what lies BENEATH a delta is hidden by it. Teeth: look for bases beneath only.
+TEST(a_base_placed_above_its_delta_still_gives_its_bytes) {
+    TmpDir t;
+    std::string game(4000, 'g'); for (size_t i = 0; i < game.size(); ++i) game[i] = char('a' + (i * 7) % 26);
+    writeStoreZip(t / "win.zip", { { "game.exe", game, false } });
+    writeStoreZip(t / "mac.zip", { { "Game.app/game", game + "MAC", false } });
+    writeDelta(t / "mac.vgdelta", slurpFile(t / "win.zip"), t / "mac.zip");
+    Spec sp; sp.readOnly = true;
+    sp.layers = { deltaLayer(t.str("mac.vgdelta"), "", { t.str("win.zip") }), zipLayer(t.str("win.zip"), "") };
+    VfsState S; std::string err;
+    CHECK(S.Init(sp, err));
+    VfsAttr at;
+    CHECK_EQ(VfsGetattr(S, "Game.app/game", at), 0);
+    CHECK_EQ(VfsGetattr(S, "game.exe", at), 0);                          // above it, so never hidden by it
+}
+
+// A delta naming a file nothing here carries, or two deltas naming each other, cannot rebuild: the plan says so by
+// name, the mount leaves them out, and the rest mounts. Teeth: drop the problem; loop on the ring.
+TEST(a_delta_with_no_file_for_its_base_or_a_ring_is_reported_and_left_out) {
+    TmpDir t;
+    writeStoreZip(t / "z.zip", { { "z.txt", "Z", false } });
+    { std::ofstream(t / "a.vgdelta") << "x"; std::ofstream(t / "b.vgdelta") << "x"; std::ofstream(t / "c.vgdelta") << "x"; }
+    Spec sp; sp.readOnly = true;
+    sp.layers = { zipLayer(t.str("z.zip")), deltaLayer(t.str("a.vgdelta"), "a", { t.str("b.vgdelta") }),
+                  deltaLayer(t.str("b.vgdelta"), "b", { t.str("a.vgdelta") }), deltaLayer(t.str("c.vgdelta"), "c", { "QmNowhere" }) };
+    const TreePlan P = PlanTree(sp);
+    CHECK(P.broken[1] && P.broken[2] && P.broken[3] && !P.broken[0]);
+    CHECK_EQ(P.problems.size(), size_t(3));
+    bool Named = false, Ring = false;
+    for (const auto &Pr : P.problems) { Named = Named || Pr.find("QmNowhere") != std::string::npos; Ring = Ring || Pr.find("ring") != std::string::npos; }
+    CHECK(Named && Ring);
+    VfsState S; std::string err;
+    CHECK(S.Init(sp, err));
+    VfsAttr at;
+    CHECK_EQ(VfsGetattr(S, "z.txt", at), 0);
+    CHECK(VfsGetattr(S, "c", at) != 0);
+}
+
+// A bytes-only delta (no TAKE shows it; another delta reads it) appears nowhere, so it hides nothing: the base it was
+// built over stays where the package placed it. Teeth: give a bytes-only layer its target as a place.
+TEST(a_bytes_only_delta_hides_nothing) {
+    TmpDir t;
+    std::string game(4000, 'g'); for (size_t i = 0; i < game.size(); ++i) game[i] = char('a' + (i * 7) % 26);
+    writeStoreZip(t / "v1.zip", { { "game.exe", game, false } });
+    writeStoreZip(t / "v2.zip", { { "game.exe", game + "V2", false } });
+    writeStoreZip(t / "v3.zip", { { "game.exe", game + "V23", false } });
+    writeDelta(t / "v2.vgdelta", slurpFile(t / "v1.zip"), t / "v2.zip");
+    writeDelta(t / "v3.vgdelta", slurpFile(t / "v2.zip"), t / "v3.zip");
+    LayerSpec D2 = deltaLayer(t.str("v2.vgdelta"), "g", { t.str("v1.zip") });
+    D2.bytesOnly = true;
+    Spec sp; sp.readOnly = true;
+    sp.layers = { zipLayer(t.str("v1.zip"), "g"), D2, deltaLayer(t.str("v3.vgdelta"), "out", { t.str("v2.vgdelta") }) };
+    VfsState S; std::string err;
+    CHECK(S.Init(sp, err));
+    VfsAttr at;
+    CHECK_EQ(VfsGetattr(S, "g/game.exe", at), 0);
+    CHECK_EQ(at.size, (uint64_t)game.size());                            // v1, still there
+    CHECK_EQ(VfsGetattr(S, "out/game.exe", at), 0);
+    CHECK_EQ(at.size, (uint64_t)game.size() + 3);
+}
+
+// A delta over a bytes-only delta replaces what that one was rebuilt from too: v1 at g, v2 read only for its bytes,
+// v3 at g over v2 — v1's dropped file does not leak. Teeth: replace only the CIDs a delta names itself.
+TEST(a_delta_replaces_what_its_bases_were_rebuilt_from) {
+    TmpDir t;
+    std::string game(4000, 'g'); for (size_t i = 0; i < game.size(); ++i) game[i] = char('a' + (i * 7) % 26);
+    writeStoreZip(t / "v1.zip", { { "game.exe", game, false }, { "old.dll", "DROPPED", false } });
+    writeStoreZip(t / "v2.zip", { { "game.exe", game + "V2", false } });
+    writeStoreZip(t / "v3.zip", { { "game.exe", game + "V23", false } });
+    writeDelta(t / "v2.vgdelta", slurpFile(t / "v1.zip"), t / "v2.zip");
+    writeDelta(t / "v3.vgdelta", slurpFile(t / "v2.zip"), t / "v3.zip");
+    LayerSpec D2 = deltaLayer(t.str("v2.vgdelta"), "g", { t.str("v1.zip") });
+    D2.bytesOnly = true;
+    Spec sp; sp.readOnly = true;
+    sp.layers = { zipLayer(t.str("v1.zip"), "g"), D2, deltaLayer(t.str("v3.vgdelta"), "g", { t.str("v2.vgdelta") }) };
+    VfsState S; std::string err;
+    CHECK(S.Init(sp, err));
+    VfsAttr at;
+    CHECK(VfsGetattr(S, "g/old.dll", at) != 0);
+    CHECK_EQ(VfsGetattr(S, "g/game.exe", at), 0);
+    CHECK_EQ(at.size, (uint64_t)game.size() + 3);
+}
+
+// Two versions of a chain that do not rebuild (a partial download: v3's and v4's deltas gone): the mount surfaces what
+// each failure stopped hiding, until none is left — v2, not an empty tree. Teeth: stop re-planning after one round.
+TEST(failures_found_while_surfacing_are_followed_down_the_chain) {
+    TmpDir t;
+    std::string game(4000, 'g'); for (size_t i = 0; i < game.size(); ++i) game[i] = char('a' + (i * 7) % 26);
+    writeStoreZip(t / "v1.zip", { { "game.exe", game, false } });
+    writeStoreZip(t / "v2.zip", { { "game.exe", game + "V2", false } });
+    writeDelta(t / "v2.vgdelta", slurpFile(t / "v1.zip"), t / "v2.zip");
+    Spec sp; sp.readOnly = true;
+    sp.layers = { zipLayer(t.str("v1.zip"), "g"), deltaLayer(t.str("v2.vgdelta"), "g", { t.str("v1.zip") }),
+                  deltaLayer(t.str("v3.vgdelta"), "g", { t.str("v2.vgdelta") }), deltaLayer(t.str("v4.vgdelta"), "g", { t.str("v3.vgdelta") }) };
+    VfsState S; std::string err;
+    CHECK(S.Init(sp, err));
+    VfsAttr at;
+    CHECK_EQ(VfsGetattr(S, "g/game.exe", at), 0);
+    CHECK_EQ(at.size, (uint64_t)game.size() + 2);
+}
+
+// A version chain holds one rebuilt map at a time: each base's bytes are released once the last delta over it is
+// built, unless it surfaces. Teeth: keep every view built (a 900-version chain held 900 maps at mount).
+TEST(a_chain_releases_each_version_once_the_next_is_built) {
+    TmpDir t;
+    std::string game(4000, 'g'); for (size_t i = 0; i < game.size(); ++i) game[i] = char('a' + (i * 7) % 26);
+    writeStoreZip(t / "v0.zip", { { "game.exe", game, false } });
+    Spec sp; sp.readOnly = true;
+    sp.layers = { zipLayer(t.str("v0.zip"), "g") };
+    std::string prev = slurpFile(t / "v0.zip");
+    for (int v = 1; v <= 4; ++v)
+    {
+        const std::string n = "v" + std::to_string(v);
+        writeStoreZip(t / (n + ".zip"), { { "game.exe", game + n, false } });
+        writeDelta(t / (n + ".vgdelta"), prev, t / (n + ".zip"));
+        prev = slurpFile(t / (n + ".zip"));
+        sp.layers.push_back(deltaLayer(t.str(n + ".vgdelta"), "g", { sp.layers.back().cid }));
+    }
+    const TreePlan P = PlanTree(sp);
+    std::vector<bool> Keep(sp.layers.size(), false);
+    Keep.back() = true;
+    LayerBytes B(sp, P, Keep);
+    auto Top = B.Get(sp.layers.size() - 1);
+    CHECK(Top != nullptr);
+    CHECK_EQ(B.Held(), size_t(1));
+}
+
+// The tree's case conflicts, as the mount places names: a hidden base spells nothing, a TAKE-moved folder collides
+// where it lands, and one file mounted twice is no conflict with itself. Renames follow the tree's first spelling,
+// back through the mount that put the name there. Teeth: ignore masks; ignore mounts; compare sources.
+TEST(case_conflicts_and_renames_follow_the_tree) {
+    Spec sp; sp.readOnly = true;
+    LayerSpec A = zipLayer("/a.zip"), B = zipLayer("/b.zip"), C = zipLayer("/c.zip"), A2 = zipLayer("/a.zip");
+    C.submounts = { { "inner/Data", "data" } };              // its inner/Data lands at data
+    sp.layers = { A, B, C, A2 };
+    const std::map<size_t, std::vector<std::string>> E = {
+        { 0, { "Data/x.dat", "Data/" } }, { 1, { "DATA/x.dat" } }, { 2, { "inner/Data/w.dat", "w.dat" } }, { 3, { "Data/x.dat" } } };
+    const EntriesFn Fn = [&](size_t I) { return &E.at(I); };
+    const TreePlan P = PlanTree(sp);
+    const auto Cs = CaseConflicts(sp, P, Fn);
+    CHECK_EQ(Cs.size(), size_t(1));                           // "data" once, a folder: DATA (b) against Data (a)
+    if (!Cs.empty()) { CHECK_EQ(Cs[0].key, std::string("data")); CHECK(Cs[0].dir); CHECK_EQ(Cs[0].first, size_t(0)); CHECK_EQ(Cs[0].second, size_t(1)); }
+    {   // c's folder lands at data: against a's Data/w.dat it collides where it lands, not where its source holds it
+        Spec Two; Two.readOnly = true;
+        Two.layers = { A, C };
+        const std::map<size_t, std::vector<std::string>> E3 = { { 0, { "Data/w.dat" } }, { 1, { "inner/Data/w.dat" } } };
+        const EntriesFn Fn3 = [&](size_t I) { return &E3.at(I); };
+        CHECK_EQ(CaseConflicts(Two, PlanTree(Two), Fn3).size(), size_t(1));
+    }
+    const auto R = CaseRenames(sp, P, Fn);
+    CHECK(R.count(1) && R.at(1).at("DATA/x.dat") == "Data/x.dat");
+    CHECK(!R.count(2));                                       // only its place would change case: not its entries to fix
+    CHECK(!R.count(0) && !R.count(3));
+    // A base hidden only partly (it reaches outside its delta) spells nothing where it is hidden; and names that collide
+    // inside ONE archive are the upstream content's own, not a conflict between layers.
+    {
+        Spec P3; P3.readOnly = true;
+        P3.layers = { zipLayer("/root.zip"), deltaLayer("/new.vgdelta", "g", { "/root.zip" }), zipLayer("/patch.zip", "g"), zipLayer("/own.zip", "o") };
+        const std::map<size_t, std::vector<std::string>> E3 = { { 0, { "boot.ini", "g/LUXOR.exe" } }, { 1, { "readme.txt" } },
+                                                                { 2, { "luxor.exe" } }, { 3, { "MAPS/foo", "maps/foo" } } };
+        const EntriesFn Fn3 = [&](size_t I) { return &E3.at(I); };
+        CHECK(CaseConflicts(P3, PlanTree(P3), Fn3).empty());
+    }
+    // A base hidden by its delta spells nothing.
+    Spec sp2; sp2.readOnly = true;
+    sp2.layers = { zipLayer("/old.zip", "g"), deltaLayer("/new.vgdelta", "g", { "/old.zip" }), zipLayer("/patch.zip", "g") };
+    const std::map<size_t, std::vector<std::string>> E2 = { { 0, { "LUXOR.exe" } }, { 1, { "Luxor.exe" } }, { 2, { "LUXOR.exe" } } };
+    const EntriesFn Fn2 = [&](size_t I) { return &E2.at(I); };
+    const TreePlan P2 = PlanTree(sp2);
+    const auto Cs2 = CaseConflicts(sp2, P2, Fn2);
+    CHECK_EQ(Cs2.size(), size_t(1));
+    if (!Cs2.empty()) { CHECK_EQ(Cs2[0].first, size_t(1)); CHECK_EQ(Cs2[0].second, size_t(2)); }
+    const auto R2 = CaseRenames(sp2, P2, Fn2);
+    CHECK(R2.count(2) && R2.at(2).at("LUXOR.exe") == "Luxor.exe");
+}
+
+// A base at ANOTHER address is hidden where the delta surfaces, wherever it was mounted: a game's CD
 // music folder that a later release ships inside its own tree does not leak the tracks that release dropped, nor
 // the folders only the old layout had. A base outside the delta's subtree keeps the rest of itself.
 TEST(a_delta_hides_the_bases_it_names_under_itself_only) {
@@ -818,7 +1110,7 @@ TEST(a_delta_hides_the_bases_it_names_under_itself_only) {
     Spec sp; sp.readOnly = true;
     sp.layers = { zipLayer(t.str("root.zip")), zipLayer(t.str("game.zip"), "g"), zipLayer(t.str("music.zip"), "g/music"),
                   zipLayer(t.str("cd/deep.zip"), "g/cd/deep"),
-                  deltaLayer(t.str("new.vgdelta"), "g", { "", "g", "g/music", "g/cd/deep" }) };
+                  deltaLayer(t.str("new.vgdelta"), "g", { t.str("root.zip"), t.str("game.zip"), t.str("music.zip"), t.str("cd/deep.zip") }) };
     VfsState S; std::string err;
     CHECK(S.Init(sp, err));
     VfsAttr at;
@@ -835,8 +1127,8 @@ TEST(a_delta_hides_the_bases_it_names_under_itself_only) {
     checkReaddirSubsetGetattr(S, "g");
 }
 
-// A base named by a delta deep in a chain stays hidden under the chain's TOP: that delta is folded (a byte input
-// only, it never surfaces), so it cannot hide anything itself; its bases must carry up to whatever surfaces.
+// A base named by a delta deep in a chain stays hidden under the chain's TOP: that delta is hidden whole by the top
+// (a byte input only, it never surfaces), so it cannot hide anything itself; its bases carry up to whatever surfaces.
 TEST(a_base_named_inside_a_chain_stays_hidden_under_its_top) {
     TmpDir t;
     std::string game(4000, 'g'); for (size_t i = 0; i < game.size(); ++i) game[i] = char('a' + (i * 7) % 26);
@@ -844,25 +1136,27 @@ TEST(a_base_named_inside_a_chain_stays_hidden_under_its_top) {
     writeStoreZip(t / "music.zip", { { "track01.wav", "TRACK-ONE", false }, { "track02.wav", "DROPPED", false } });
     writeStoreZip(t / "v2.zip", { { "game.exe", game + "2", false }, { "music/track01.wav", "TRACK-ONE", false } });
     writeStoreZip(t / "v3.zip", { { "game.exe", game + "23", false }, { "music/track01.wav", "TRACK-ONE", false } });
-    writeDelta(t / "v2.vgdelta", slurpFile(t / "game.zip") + slurpFile(t / "music.zip"), t / "v2.zip");
+    writeStoreZip(t / "root.zip", { { "boot.ini", "ROOT", false }, { "g/old.cfg", "OLD-CFG", false } });   // partly outside g
+    writeDelta(t / "v2.vgdelta", slurpFile(t / "root.zip") + slurpFile(t / "game.zip") + slurpFile(t / "music.zip"), t / "v2.zip");
     writeDelta(t / "v3.vgdelta", slurpFile(t / "v2.zip"), t / "v3.zip");
 
     Spec sp; sp.readOnly = true;
-    sp.layers = { zipLayer(t.str("game.zip"), "g"), zipLayer(t.str("music.zip"), "g/music"),
-                  deltaLayer(t.str("v2.vgdelta"), "g", { "g", "g/music" }), deltaLayer(t.str("v3.vgdelta"), "g") };
+    sp.layers = { zipLayer(t.str("root.zip")), zipLayer(t.str("game.zip"), "g"), zipLayer(t.str("music.zip"), "g/music"),
+                  deltaLayer(t.str("v2.vgdelta"), "g", { t.str("root.zip"), t.str("game.zip"), t.str("music.zip") }), deltaLayer(t.str("v3.vgdelta"), "g", { t.str("v2.vgdelta") }) };
     VfsState S; std::string err;
     CHECK(S.Init(sp, err));
     VfsAttr at;
+    CHECK(VfsGetattr(S, "g/old.cfg", at) != 0);                          // the root base, under the top (v2 never surfaced)
+    CHECK_EQ(VfsGetattr(S, "boot.ini", at), 0);                          // ...and outside it, still there
     CHECK_EQ(VfsGetattr(S, "g/game.exe", at), 0);
     CHECK_EQ(at.size, (uint64_t)game.size() + 2);
     CHECK(VfsGetattr(S, "g/music/track02.wav", at) != 0);
     CHECK(readdirNames(S, "g/music") == (std::set<std::string>{ "track01.wav" }));
 }
 
-// A delta whose declared bases leave out its own target was not built over what lies beneath it there: it starts a
-// chain of its own and folds nothing away. A language depot's delta deduped over another address must not swallow
-// the main depot beneath it (whole, or the top of its own chain), and a zip below every chain at a target is still
-// that target's byte view for a delta elsewhere. Teeth: any delta at a target used to extend the run below it.
+// A delta hides only what it names: a language depot's delta deduped over another address must not swallow the main
+// depot beneath it at its target (whole, or the top of its own chain), and a zip a delta elsewhere names stays where it
+// is. Teeth: hide what lies beneath a delta at its target.
 TEST(a_delta_based_elsewhere_does_not_swallow_the_depot_beneath_it) {
     TmpDir t;
     std::string big(5000, 'b'); for (size_t i = 0; i < big.size(); ++i) big[i] = char('a' + (i * 11) % 26);
@@ -872,7 +1166,7 @@ TEST(a_delta_based_elsewhere_does_not_swallow_the_depot_beneath_it) {
     writeDelta(t / "main.vgdelta", slurpFile(t / "x.zip"), t / "main.zip");
     {   // the language depot beneath a delta based at "x"
         Spec sp; sp.readOnly = true;
-        sp.layers = { zipLayer(t.str("lang.zip")), zipLayer(t.str("x.zip"), "x"), deltaLayer(t.str("main.vgdelta"), "", { "x" }) };
+        sp.layers = { zipLayer(t.str("lang.zip")), zipLayer(t.str("x.zip"), "x"), deltaLayer(t.str("main.vgdelta"), "", { t.str("x.zip") }) };
         VfsState S; std::string err;
         CHECK(S.Init(sp, err));
         VfsAttr at;
@@ -887,8 +1181,8 @@ TEST(a_delta_based_elsewhere_does_not_swallow_the_depot_beneath_it) {
         writeStoreZip(t / "l2.zip", { { "Localization/english.pak", big + "EN", false } });
         writeDelta(t / "l2.vgdelta", slurpFile(t / "x.zip"), t / "l2.zip");
         Spec sp; sp.readOnly = true;
-        sp.layers = { zipLayer(t.str("m1.zip")), deltaLayer(t.str("m2.vgdelta"), ""), zipLayer(t.str("x.zip"), "x"),
-                      deltaLayer(t.str("l2.vgdelta"), "", { "x" }) };
+        sp.layers = { zipLayer(t.str("m1.zip")), deltaLayer(t.str("m2.vgdelta"), "", { t.str("m1.zip") }), zipLayer(t.str("x.zip"), "x"),
+                      deltaLayer(t.str("l2.vgdelta"), "", { t.str("x.zip") }) };
         VfsState S; std::string err;
         CHECK(S.Init(sp, err));
         VfsAttr at;
@@ -901,8 +1195,8 @@ TEST(a_delta_based_elsewhere_does_not_swallow_the_depot_beneath_it) {
         writeStoreZip(t / "out.zip", { { "o.bin", big.substr(100, 4000) + "OUT", false } });
         writeDelta(t / "out.vgdelta", slurpFile(t / "main.zip"), t / "out.zip");
         Spec sp; sp.readOnly = true;
-        sp.layers = { zipLayer(t.str("main.zip")), deltaLayer(t.str("out.vgdelta"), "out", { "" }),
-                      zipLayer(t.str("x.zip"), "x"), deltaLayer(t.str("l2.vgdelta"), "", { "x" }) };
+        sp.layers = { zipLayer(t.str("main.zip")), deltaLayer(t.str("out.vgdelta"), "out", { t.str("main.zip") }),
+                      zipLayer(t.str("x.zip"), "x"), deltaLayer(t.str("l2.vgdelta"), "", { t.str("x.zip") }) };
         VfsState S; std::string err;
         CHECK(S.Init(sp, err));
         VfsAttr at;
@@ -923,7 +1217,7 @@ TEST(a_hidden_base_lends_no_spelling_to_a_case_insensitive_mount) {
     writeDelta(t / "new.vgdelta", slurpFile(t / "game.zip") + slurpFile(t / "music.zip"), t / "new.zip");
     Spec sp; sp.readOnly = true; sp.caseInsensitive = true;
     sp.layers = { zipLayer(t.str("game.zip"), "h"), zipLayer(t.str("music.zip"), "h/music"),
-                  deltaLayer(t.str("new.vgdelta"), "h", { "h", "h/music" }) };
+                  deltaLayer(t.str("new.vgdelta"), "h", { t.str("game.zip"), t.str("music.zip") }) };
     VfsState S; std::string err;
     CHECK(S.Init(sp, err));
     VfsAttr at;

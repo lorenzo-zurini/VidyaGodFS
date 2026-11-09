@@ -35,14 +35,21 @@ the one VidyaGod's validator/publisher enforce.)
 
 ## Delta layers
 
-A `delta` layer is a random-access binary diff over a **base** — by default the composed view already mounted at the
-same `target`, i.e. everything below it. Entries are reconstructed on demand, and a chain of deltas **flattens**, so
-reads stay `O(log n)` however deep the history goes: 900 versions of one game mount as a single chain rather than 900
-archives.
+A `delta` layer is a random-access binary diff over a **base** it names: **`bases`** lists the CIDs of the files it was
+built over, and their bytes, **concatenated in that order**, are the base. Each zip or delta layer carries its own
+**`cid`**; a base is any layer carrying that CID, wherever it is placed (one CID is one file: a zip's file, or a
+delta's rebuilt archive). There is no implicit base. Entries are reconstructed on demand, and a chain of deltas
+**flattens**, so reads stay `O(log n)` however deep the history goes: 900 versions of one game mount as a single chain
+rather than 900 archives, holding one rebuilt map at a time while they are built.
 
-- **`baseTarget`** names a *different* base, for a delta that is not over the thing it mounts onto.
-- **`baseTargets`** (array) makes the base the **concatenation** of several composed views, in order — so one delta can
-  dedup against a wine build ‖ a DXVK build ‖ the previous prefix at once.
+- One delta can dedup against several sources at once: a wine build ‖ a DXVK build ‖ the previous prefix, or a macOS
+  build over the Windows build mounted elsewhere.
+- A delta hides every placement beneath it of what it replaces (its bases, and whatever they were rebuilt from)
+  **inside its own `target`**; outside it a base stays as it is, a plain source of bytes. A delta that cannot rebuild
+  (a base no layer carries, bases naming each other in a ring, bytes that do not rebuild) mounts nothing and hides
+  nothing, and says why.
+- `treeplan.h` is that reading of a spec — places, bases, what is hidden, case conflicts and renames — decided before
+  any byte is read. The mount, VidyaGod's pre-mount check and its validator all use it.
 - A delta must reconstruct a **complete** tree. Authoring one from an *overlay* zip (only the changed files) produces a
   delta that masks its base instead of replacing it.
 
@@ -71,8 +78,8 @@ vidyagodfs <spec.json> <mountpoint> [--watch-pid <pid>] [fuse opts...]
   "writelayer": "/…/WRITELAYER",
   "layers": [
     { "type": "dir",   "source": "/…/DEFPREFIX",   "target": "",             "rw": false },
-    { "type": "zip",   "source": "/…/game.zip",    "target": "drive_c/7804", "rw": false },
-    { "type": "delta", "source": "/…/1.20.2.vgdelta", "target": "drive_c/7804" },
+    { "type": "zip",   "source": "/…/game.zip",    "target": "drive_c/7804", "cid": "bafy…game", "rw": false },
+    { "type": "delta", "source": "/…/1.20.2.vgdelta", "target": "drive_c/7804", "cid": "bafy…1202", "bases": ["bafy…game"] },
     { "type": "file",  "source": "/…/rom.sfc",     "target": "",             "rw": false }
   ]
 }
@@ -80,7 +87,7 @@ vidyagodfs <spec.json> <mountpoint> [--watch-pid <pid>] [fuse opts...]
 
 - **`layers`** — array order is union priority, **lowest first**. Each layer is mounted under its `target` (relative to
   the mount root). `zip` serves the archive's entries; `dir` walks a directory tree; `file` places one file; `delta`
-  reconstructs an archive from a diff over what is below it (see above).
+  reconstructs an archive from a diff over the files its `bases` name by CID (see above).
 - **`submounts`** — optional per-layer `source/path:dest/path` entries that relocate a subtree of a layer elsewhere in
   the runtime without repacking it.
 - **`writelayer`** — the writable copy-on-write branch, highest priority. Writes land here; the lower layers are never

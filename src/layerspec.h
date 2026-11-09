@@ -16,15 +16,10 @@ struct LayerSpec {
     LayerType   type = LayerType::Dir;
     std::string source;      // absolute host path (dir / archive / single file)
     std::string target;      // normalized virtual subtree root: no leading/trailing '/', "" == mount root
-    std::vector<std::string> baseTargets;  // DELTA only: the delta's byte-base is the CONCATENATION (in this exact
-                             // order) of the composed views at these targets — one entry is the ordinary
-                             // cross-target delta, several let one delta dedup against independent sources at once
-                             // (a prefix over [wine, dxvk, prev-prefix]). A base inside `target` is hidden there (the
-                             // delta replaces it), so a dedup-only source must lie outside. EMPTY means no base was declared: the base
-                             // is then the composed view at `target` itself (the overlay-relative delta, the common
-                             // case). There is deliberately no singular key — "" is a real target (the mount root),
-                             // so a lone string could not tell "based at the root" apart from "no base declared",
-                             // and the FS would silently reconstruct against the wrong bytes.
+    std::string cid;         // zip/delta: the CID of `source`'s bytes — what a delta names it by ("" = none)
+    std::vector<std::string> bases;   // DELTA only, REQUIRED: the CIDs of the files whose bytes, joined in this order,
+                             // are the delta's base (a zip's file; a delta's rebuilt archive). Where those files are
+                             // placed never matters to the bytes; it only decides what the delta hides (treeplan.h).
     // SUBMOUNTS (dir/zip/DELTA): Docker-style "src:dst" mounts of paths WITHIN source. Each (source,target)
     // pair is normalized and fanned out into its own single-subpath internal layer at Init. Empty → mount the
     // whole source at `target`. A pair's `first` is the in-source path ("" == whole source), `second` the dest.
@@ -33,6 +28,7 @@ struct LayerSpec {
     // (e.g. share/default_pfx:pfx) in a single self-contained mount, zero-copy.
     std::vector<std::pair<std::string,std::string>> submounts;
     bool        rw = false;  // rw:true dir layer = RW passthrough straight to source (durable persist)
+    bool        bytesOnly = false;   // zip/delta: read as a later delta's base, surfacing nowhere (a TAKE shows none of it)
 };
 
 struct Spec {
@@ -47,8 +43,9 @@ struct Spec {
     bool                    caseInsensitive = false;
 };
 
-//Parses the spec file at Path into Out. Returns false (with Err set) on read/parse error.
+//Parses the spec file at Path (or the spec JSON Text) into Out. Returns false (with Err set) on read/parse error.
 bool ParseSpec(const std::string &Path, Spec &Out, std::string &Err);
+bool ParseSpecText(const std::string &Text, Spec &Out, std::string &Err);
 
 //Strips leading/trailing '/' from a virtual path; "/" and "" both normalize to "".
 std::string NormalizeVPath(const std::string &Path);

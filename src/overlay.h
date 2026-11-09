@@ -34,8 +34,8 @@ struct Layer {
     // A delta reconstructs a complete archive OF WHAT IT REPLACES: the base it was diffed against. So it masks that
     // base (a file deleted in the newer version must not leak up from the older one), and nothing else: another
     // depot's archive at the same target shows through it like through any zip. maskedUnder = the virtual subtrees
-    // (the mount targets of the deltas built over this layer) where this layer is hidden. A same-target base is
-    // folded into its delta and never surfaces; this covers the rest (a base at another address, BASE_TARGETS).
+    // (the mount targets of the deltas built over this layer) where this layer is hidden. A base hidden whole by its
+    // delta never surfaces at all; this covers the rest (a base surfacing partly outside the delta).
     std::vector<std::string> maskedUnder;
     int         priority = 0;
     std::shared_ptr<ZipIndex> zip;  // Zip layers only

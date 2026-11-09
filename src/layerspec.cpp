@@ -1,5 +1,7 @@
 #include "layerspec.h"
 
+#include <algorithm>
+
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <sstream>
@@ -17,9 +19,15 @@ bool ParseSpec(const std::string &Path, Spec &Out, std::string &Err)
 {
     std::ifstream In(Path, std::ios::binary);
     if (!In) { Err = "cannot open spec file: " + Path; return false; }
+    std::stringstream Text;
+    Text << In.rdbuf();
+    return ParseSpecText(Text.str(), Out, Err);
+}
 
+bool ParseSpecText(const std::string &Text, Spec &Out, std::string &Err)
+{
     nlohmann::json J;
-    try { In >> J; }
+    try { J = nlohmann::json::parse(Text); }
     catch (const std::exception &E) { Err = std::string("spec JSON parse error: ") + E.what(); return false; }
 
     try
@@ -43,23 +51,40 @@ bool ParseSpec(const std::string &Path, Spec &Out, std::string &Err)
             if      (Type == "dir")   LS.type = LayerType::Dir;
             else if (Type == "zip")   LS.type = LayerType::Zip;
             else if (Type == "file")  LS.type = LayerType::File;
-            else if (Type == "delta") LS.type = LayerType::Delta;   // a .vgdelta over the layer below (same target, or `baseTarget` for cross-target)
+            else if (Type == "delta") LS.type = LayerType::Delta;   // a .vgdelta over the earlier layers it names (`bases`)
             else { Err = "unknown layer type: " + Type; return false; }
             LS.source  = L.at("source").get<std::string>();
             LS.target  = NormalizeVPath(L.value("target", std::string()));
-            //A delta's declared byte-bases, in order (absent = based on this layer's own target). A non-string
-            //entry is REFUSED rather than skipped: dropping it would shorten the concatenation, and a base of the
-            //wrong length fails the delta's size check and silently costs the layer its content.
-            if (L.contains("baseTargets"))
+            //A zip's or delta's own CID: what a delta names it by. A delta's bases: the CIDs of the files whose bytes,
+            //joined in this order, it was built over — REQUIRED, none twice. A malformed shape is REFUSED rather than
+            //repaired (a base dropped is a base of the wrong bytes); a base no layer here carries is the plan's to
+            //report (PlanTree), and costs only that delta.
+            const size_t Self = Out.layers.size();
+            const auto Bad = [&](const std::string &Why) { Err = "layer " + std::to_string(Self) + ": " + Why; return false; };
+            const bool Archive = LS.type == LayerType::Zip || LS.type == LayerType::Delta;
+            if (L.contains("cid"))
             {
-                if (!L["baseTargets"].is_array()) { Err = "layer baseTargets must be an array"; return false; }
-                for (const auto &T : L["baseTargets"])
+                if (!Archive) return Bad("only a zip or a delta has a cid");
+                if (!L["cid"].is_string() || L["cid"].get<std::string>().empty()) return Bad("cid must be a non-empty string");
+                LS.cid = L["cid"].get<std::string>();
+            }
+            if (L.contains("bases") != (LS.type == LayerType::Delta))
+                return Bad(L.contains("bases") ? "only a delta has bases" : "a delta must name its bases");
+            if (LS.type == LayerType::Delta)
+            {
+                if (!L["bases"].is_array()) return Bad("bases must be an array of CIDs");   // empty: the plan reports it
+                for (const auto &B : L["bases"])
                 {
-                    if (!T.is_string()) { Err = "layer baseTargets contains a non-string entry"; return false; }
-                    LS.baseTargets.push_back(NormalizeVPath(T.get<std::string>()));
+                    if (!B.is_string() || B.get<std::string>().empty()) return Bad("a base must be a CID");
+                    if (std::find(LS.bases.begin(), LS.bases.end(), B.get<std::string>()) != LS.bases.end())
+                        return Bad("base " + B.get<std::string>() + " is named twice");
+                    LS.bases.push_back(B.get<std::string>());
                 }
             }
             LS.rw      = L.value("rw", false);
+            LS.bytesOnly = L.value("bytesOnly", false);
+            if (LS.bytesOnly && !Archive)
+                return Bad("only a zip or a delta can be bytes-only");
             // SUBMOUNTS: array of Docker-style "src:dst" strings → (source,target) pairs (split on first ':').
             if (L.contains("submounts") && L["submounts"].is_array())
                 for (const auto &E : L["submounts"])
