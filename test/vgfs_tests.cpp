@@ -27,6 +27,9 @@
 #include <iostream>
 #include <set>
 #include <map>
+#include <tuple>
+#include <iterator>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1282,6 +1285,292 @@ struct OverReadingSource : ByteSource {
     }
     uint64_t size() const override { return declared; }
 };
+
+// Counts what is read of a source and records what is asked for ahead (prefetch), passing both through.
+struct CountingSource : ByteSource {
+    std::shared_ptr<ByteSource> inner;
+    std::atomic<int> reads{0};
+    std::vector<std::pair<uint64_t, uint64_t>> asked;   // prefetch (off, n), in order
+    std::vector<std::string> order;                     // "p" a prefetch, "r" a read
+    std::mutex mu;
+    std::function<bool(uint64_t)> failAt;               // a read at this offset fails (once the function says so)
+    explicit CountingSource(std::shared_ptr<ByteSource> s) : inner(std::move(s)) {}
+    ssize_t pread(void *buf, size_t n, uint64_t off) override {
+        { std::lock_guard<std::mutex> g(mu); order.push_back("r"); }
+        if (failAt && failAt(off)) return -EIO;
+        ++reads; return inner->pread(buf, n, off);
+    }
+    void prefetch(uint64_t off, uint64_t n) override {
+        std::lock_guard<std::mutex> g(mu); asked.push_back({ off, n }); order.push_back("p");
+    }
+    uint64_t size() const override { return inner->size(); }
+};
+
+static std::shared_ptr<ByteSource> fileSource(const fs::path &p) {
+    std::ifstream f(p, std::ios::binary);
+    std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return std::make_shared<MemByteSource>(std::move(b));
+}
+
+// Indexing an archive reads its central directory and nothing per member: where a member's bytes start is read from
+// its local header when it is first opened, once. On a disk that seeks a read per member was minutes for a runner's
+// thousands. Teeth: read each local header while indexing (reads grow with the members); forget the offset (a
+// second open reads the header again).
+TEST(an_archive_is_indexed_without_reading_its_members) {
+    TmpDir t;
+    std::vector<std::tuple<std::string, std::string, bool>> few, many;
+    for (int i = 0; i < 4; ++i) few.push_back({ "f" + std::to_string(i) + ".txt", "x" + std::to_string(i), false });
+    for (int i = 0; i < 400; ++i) many.push_back({ "m" + std::to_string(i) + ".txt", "y" + std::to_string(i), false });
+    writeStoreZip(t / "few.zip", few);
+    writeStoreZip(t / "many.zip", many);
+    auto fewSrc = std::make_shared<CountingSource>(fileSource(t / "few.zip"));
+    auto manySrc = std::make_shared<CountingSource>(fileSource(t / "many.zip"));
+    auto F = BuildZipIndex(fewSrc, "few.zip");
+    auto M = BuildZipIndex(manySrc, "many.zip");
+    CHECK(F && M);
+    if (!F || !M) return;
+    CHECK_EQ(M->byName.size(), (size_t)400);
+    CHECK(manySrc->reads.load() <= fewSrc->reads.load() + 4);   // the directory is bigger, not read member by member
+    const ZipEntry &E = M->byName.at("m123.txt");
+    ZipReader R;
+    const int before = manySrc->reads.load();
+    CHECK_EQ(OpenZipEntry(*M, E, R), 0);
+    char buf[16] = {0};
+    CHECK_EQ(ReadZipEntry(R, buf, sizeof buf, 0), 4);
+    CHECK_EQ(std::string(buf, 4), std::string("y123"));
+    const int opened = manySrc->reads.load();
+    CHECK(opened > before);
+    ZipReader R2;
+    CHECK_EQ(OpenZipEntry(*M, E, R2), 0);
+    CHECK_EQ(manySrc->reads.load(), opened);                    // its header is known now
+}
+
+// A member whose local header is not one (a damaged archive) is still listed, and refuses to open: its bytes are not
+// served from a guessed place. Teeth: serve it at the central directory's offset (reads the header as content).
+TEST(a_member_whose_local_header_is_damaged_does_not_open) {
+    TmpDir t;
+    writeStoreZip(t / "a.zip", { { "ok.txt", "fine", false }, { "bad.txt", "broken", false } });
+    auto Z0 = BuildZipIndex(fileSource(t / "a.zip"), "a.zip");
+    CHECK(Z0);
+    if (!Z0) return;
+    std::ifstream f(t / "a.zip", std::ios::binary);
+    std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    b[Z0->byName.at("bad.txt").localHeader] = 'X';            // "PK\3\4" no more
+    auto Z = BuildZipIndex(std::make_shared<MemByteSource>(b), "a.zip");
+    CHECK(Z && Z->byName.count("bad.txt"));
+    if (!Z) return;
+    ZipReader R;
+    CHECK_EQ(OpenZipEntry(*Z, Z->byName.at("bad.txt"), R), -EIO);
+    CHECK_EQ(ZipDataOffset(*Z, Z->byName.at("bad.txt")), UINT64_MAX);
+    CHECK_EQ(OpenZipEntry(*Z, Z->byName.at("ok.txt"), R), 0);
+}
+
+// A link is worked out once: a prefix's links are looked up over and over, and each lookup read the target again. One
+// whose bytes did not read is tried again next time, not taken for a link that leads nowhere. Teeth: resolve every
+// time (reads grow per lookup); remember a failed read as "no file" (the second lookup stays null).
+TEST(an_archive_link_is_resolved_once_and_a_failed_read_again) {
+    TmpDir t;
+    writeStoreZip(t / "a.zip", { { "lib/real.dll", "MZcontent", false }, { "pfx/sys/real.dll", "../../lib/real.dll", true } });
+    auto Src = std::make_shared<CountingSource>(fileSource(t / "a.zip"));
+    auto Z = BuildZipIndex(Src, "a.zip");
+    CHECK(Z);
+    if (!Z) return;
+    const ZipEntry &L = Z->byName.at("pfx/sys/real.dll");
+    bool fail = true;
+    const uint64_t at = L.localHeader;
+    Src->failAt = [&](uint64_t off) { return fail && off >= at && off < at + 128; };
+    CHECK(ResolveZipSymlink(*Z, L) == nullptr);                 // the link did not read
+    fail = false;
+    const ZipEntry *T = ResolveZipSymlink(*Z, L);
+    CHECK(T && T->name == "lib/real.dll");
+    const int after = Src->reads.load();
+    for (int i = 0; i < 5; ++i) CHECK(ResolveZipSymlink(*Z, L) == T);
+    CHECK_EQ(Src->reads.load(), after);
+}
+
+// A delta's view of a file is short runs from all over its base and blocks of its delta: a read across them asks for
+// every one first, then reads (a disk serves the queue in one sweep — measured ten times faster than one after
+// another); opening a small file in such a view asks for all of it. Teeth: drop the prefetch from pread (the first
+// thing the base sees is a read), or from the open; ask on every open (a plain archive's file is asked for too).
+TEST(a_read_through_a_delta_asks_for_its_runs_before_reading_them) {
+    std::string base(1 << 16, 0);
+    for (size_t i = 0; i < base.size(); ++i) base[i] = (char)((i * 2654435761u) >> 13);
+    std::string tgt;
+    for (int k = 0; k < 16; ++k) {                              // runs of the base far apart, between new bytes
+        tgt += base.substr((size_t)((k * 37) % 61) * 1000, 900);
+        tgt += std::string(300, (char)('a' + k));
+    }
+    auto delta = vgdelta::GenerateDelta((const uint8_t *)base.data(), base.size(), (const uint8_t *)tgt.data(), tgt.size(), 4096);
+    auto Base = std::make_shared<CountingSource>(std::make_shared<MemByteSource>(std::vector<uint8_t>(base.begin(), base.end())));
+    auto File = std::make_shared<CountingSource>(std::make_shared<MemByteSource>(delta));
+    std::string err;
+    auto D = vgdelta::DeltaByteSource::Create(File, Base, err, false);
+    CHECK(D != nullptr);
+    if (!D) return;
+    Base->order.clear(); File->order.clear(); Base->asked.clear(); File->asked.clear();
+    std::vector<uint8_t> out(tgt.size());
+    CHECK(D->preadAll(out.data(), out.size(), 0));
+    CHECK(std::memcmp(out.data(), tgt.data(), tgt.size()) == 0);
+    CHECK(!Base->order.empty() && Base->order.front() == "p");
+    CHECK(Base->asked.size() >= 8);                             // the runs, each where it is in the base
+    CHECK(!File->order.empty() && File->order.front() == "p");  // and the delta's blocks
+    //Opening a small file inside the view asks for the whole of it at once; one in a plain archive (one run, which the
+    //host reads ahead itself) is not asked for.
+    struct Rec : ByteSource {
+        std::vector<std::pair<uint64_t, uint64_t>> asked; std::shared_ptr<ByteSource> in; bool scat = true;
+        ssize_t pread(void *b, size_t n, uint64_t o) override { return in->pread(b, n, o); }
+        void prefetch(uint64_t o, uint64_t n) override { asked.push_back({ o, n }); }
+        bool scattered() const override { return scat; }
+        uint64_t size() const override { return in->size(); }
+    };
+    TmpDir t;
+    writeStoreZip(t / "z.zip", { { "a.dll", std::string(5000, 'q'), false } });
+    auto R = std::make_shared<Rec>(); R->in = fileSource(t / "z.zip");
+    auto Z = BuildZipIndex(R, "z.zip");
+    CHECK(Z);
+    if (!Z) return;
+    R->asked.clear();
+    ZipReader Zr;
+    CHECK_EQ(OpenZipEntry(*Z, Z->byName.at("a.dll"), Zr), 0);
+    CHECK_EQ(R->asked.size(), (size_t)1);
+    if (!R->asked.empty()) { CHECK_EQ(R->asked[0].first, Zr.dataOffset); CHECK_EQ(R->asked[0].second, (uint64_t)5000); }
+    R->scat = false;
+    CHECK_EQ(OpenZipEntry(*Z, Z->byName.at("a.dll"), Zr), 0);
+    CHECK_EQ(R->asked.size(), (size_t)1);
+}
+
+// The decompressed blocks of a delta are kept while they are used: reading a file again does not read its delta again.
+// They go with the delta file's view. Teeth: keep nothing (the second read reads the delta again); drop nothing when the
+// view goes (the cache still holds its bytes).
+TEST(delta_blocks_are_kept_while_used_and_go_with_their_view) {
+    auto make = [](char seed) {
+        std::string base(1 << 15, seed), tgt;
+        for (size_t i = 0; i < 100000; ++i) tgt += (char)(seed + (i * 7919) % 251);
+        return std::make_pair(base, tgt);
+    };
+    auto [b1, t1] = make('a');
+    auto [b2, t2] = make('k');
+    auto d1 = vgdelta::GenerateDelta((const uint8_t *)b1.data(), b1.size(), (const uint8_t *)t1.data(), t1.size(), 4096);
+    auto d2 = vgdelta::GenerateDelta((const uint8_t *)b2.data(), b2.size(), (const uint8_t *)t2.data(), t2.size(), 4096);
+    std::string err;
+    const size_t heldBefore = vgdelta::CachedBlockBytes();
+    {
+        auto File = std::make_shared<CountingSource>(std::make_shared<MemByteSource>(d1));
+        auto D = vgdelta::DeltaByteSource::Create(File, std::make_shared<MemByteSource>(std::vector<uint8_t>(b1.begin(), b1.end())), err, false);
+        CHECK(D != nullptr);
+        if (!D) return;
+        std::vector<uint8_t> out(t1.size());
+        CHECK(D->preadAll(out.data(), out.size(), 0));
+        const int once = File->reads.load();
+        CHECK(D->preadAll(out.data(), out.size(), 0));
+        CHECK_EQ(File->reads.load(), once);
+        CHECK(std::memcmp(out.data(), t1.data(), t1.size()) == 0);
+        CHECK(vgdelta::CachedBlockBytes() > heldBefore);
+    }
+    CHECK_EQ(vgdelta::CachedBlockBytes(), heldBefore);
+    auto D2 = vgdelta::DeltaByteSource::Create(std::make_shared<MemByteSource>(d2),
+                                               std::make_shared<MemByteSource>(std::vector<uint8_t>(b2.begin(), b2.end())), err, false);
+    CHECK(D2 != nullptr);
+    if (!D2) return;
+    std::vector<uint8_t> out(t2.size());
+    CHECK(D2->preadAll(out.data(), out.size(), 0));
+    CHECK(std::memcmp(out.data(), t2.data(), t2.size()) == 0);
+}
+
+// Views of one chain share the delta files' blocks: a version read after the one beneath it reads none of that one's
+// delta again. Teeth: keep blocks per view (the upper view reads the lower delta's blocks again).
+TEST(views_of_one_chain_share_their_delta_blocks) {
+    std::string base(1 << 14, 'b'), v1, v2;
+    for (size_t i = 0; i < 60000; ++i) v1 += (char)((i * 7919) % 251);
+    v2 = v1; v2.replace(30000, 500, std::string(500, '!'));
+    auto d1 = vgdelta::GenerateDelta((const uint8_t *)base.data(), base.size(), (const uint8_t *)v1.data(), v1.size(), 4096);
+    auto d2 = vgdelta::GenerateDelta((const uint8_t *)v1.data(), v1.size(), (const uint8_t *)v2.data(), v2.size(), 4096);
+    auto F1 = std::make_shared<CountingSource>(std::make_shared<MemByteSource>(d1));
+    std::string err;
+    auto V1 = vgdelta::DeltaByteSource::Create(F1, std::make_shared<MemByteSource>(std::vector<uint8_t>(base.begin(), base.end())), err, false);
+    CHECK(V1 != nullptr);
+    if (!V1) return;
+    auto V2 = vgdelta::DeltaByteSource::Create(std::make_shared<MemByteSource>(d2), V1, err, false);
+    CHECK(V2 != nullptr);
+    if (!V2) return;
+    std::vector<uint8_t> out(v1.size());
+    CHECK(V1->preadAll(out.data(), out.size(), 0));
+    const int read1 = F1->reads.load();
+    CHECK(V2->preadAll(out.data(), out.size(), 0));
+    CHECK(std::memcmp(out.data(), v2.data(), v2.size()) == 0);
+    CHECK_EQ(F1->reads.load(), read1);
+}
+
+// The cache keeps no more than its budget, whatever is read: the least recently used blocks go first. Teeth: never
+// evict (the bytes held grow with what was read).
+TEST(the_block_cache_keeps_within_its_budget) {
+    const size_t Block = 1u << 20, Blocks = vgdelta::CachedBlockBudget() / Block + 8;
+    std::string tgt(Blocks * Block, '\0');
+    for (size_t b = 0; b < Blocks; ++b)
+        for (size_t i = 0; i < Block; i += 4) { const uint32_t v = (uint32_t)(b * 2654435761u + 1); std::memcpy(&tgt[b * Block + i], &v, 4); }
+    std::string base(4096, '\0');
+    auto d = vgdelta::GenerateDelta((const uint8_t *)base.data(), base.size(), (const uint8_t *)tgt.data(), tgt.size(), (uint32_t)Block);
+    std::string err;
+    auto D = vgdelta::DeltaByteSource::Create(std::make_shared<MemByteSource>(d), std::make_shared<MemByteSource>(std::vector<uint8_t>(base.begin(), base.end())), err, false);
+    CHECK(D != nullptr);
+    if (!D) return;
+    std::vector<uint8_t> out(Block);
+    bool same = true;
+    for (size_t b = 0; b < Blocks; ++b) {
+        CHECK(D->preadAll(out.data(), Block, b * Block));
+        same = same && std::memcmp(out.data(), &tgt[b * Block], Block) == 0;
+    }
+    CHECK(same);
+    CHECK(vgdelta::CachedBlockBytes() <= vgdelta::CachedBlockBudget());
+    CHECK(vgdelta::CachedBlockBytes() >= vgdelta::CachedBlockBudget() - Block);
+}
+
+// A central directory longer than the window it is read through: every record found, one straddling the window's end
+// included, and members at its far end served. Teeth: refill the window at the wrong place, or only when a record
+// starts past it (a straddling record reads past the window).
+TEST(a_central_directory_longer_than_one_read_is_walked_whole) {
+    TmpDir t;
+    std::vector<std::tuple<std::string, std::string, bool>> es;
+    for (int i = 0; i < 30000; ++i) {
+        char n[48]; std::snprintf(n, sizeof n, "data/sub%02d/entry_%05d.txt", i % 37, i);
+        es.push_back({ n, std::to_string(i), false });
+    }
+    writeStoreZip(t / "big.zip", es);
+    auto Src = fileSource(t / "big.zip");
+    const auto Offs = zipscan::CentralDirOffsets(*Src);
+    CHECK_EQ(Offs.size(), (size_t)30000);
+    auto Z = BuildZipIndex(Src, "big.zip");
+    CHECK(Z);
+    if (!Z) return;
+    for (int i : { 0, 15000, 16131, 29999 }) {
+        char n[48]; std::snprintf(n, sizeof n, "data/sub%02d/entry_%05d.txt", i % 37, i);
+        const auto It = Z->byName.find(n);
+        CHECK(It != Z->byName.end());
+        if (It == Z->byName.end()) continue;
+        ZipReader R; char buf[16] = {0};
+        CHECK_EQ(OpenZipEntry(*Z, It->second, R), 0);
+        const int got = ReadZipEntry(R, buf, sizeof buf, 0);
+        CHECK_EQ(std::string(buf, got > 0 ? (size_t)got : 0), std::to_string(i));
+    }
+}
+
+// Destroyed at exit after everything main makes, as the mount's own static state is: a view still holding cached
+// blocks then drops them into a cache that must still be there. Teeth: the cache as an ordinary static (destroyed
+// first; the drop is a use after free and the run ends in a crash).
+static std::shared_ptr<ByteSource> g_ViewPastExit;
+TEST(a_view_held_past_main_ends_cleanly) {
+    std::string base(4096, 'z'), tgt;
+    for (size_t i = 0; i < 20000; ++i) tgt += (char)((i * 31) % 253);
+    auto d = vgdelta::GenerateDelta((const uint8_t *)base.data(), base.size(), (const uint8_t *)tgt.data(), tgt.size(), 4096);
+    std::string err;
+    auto D = vgdelta::DeltaByteSource::Create(std::make_shared<MemByteSource>(d), std::make_shared<MemByteSource>(std::vector<uint8_t>(base.begin(), base.end())), err, false);
+    CHECK(D != nullptr);
+    if (!D) return;
+    std::vector<uint8_t> out(tgt.size());
+    CHECK(D->preadAll(out.data(), out.size(), 0));
+    CHECK(vgdelta::CachedBlockBytes() > 0);
+    g_ViewPastExit = D;
+}
 
 TEST(concat_part_boundary_is_defined_by_size) {
     std::vector<uint8_t> backing(64, 'x');

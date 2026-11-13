@@ -131,6 +131,8 @@ int Close(Fd fd)
     return ::CloseHandle(h) ? 0 : Err();
 }
 
+void Prefetch(Fd, uint64_t, uint64_t) {}   // the core runs as well without it
+
 ssize_t Pread(Fd fd, void *buf, size_t n, uint64_t off)
 {
     HANDLE h = Grab(fd);

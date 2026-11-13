@@ -3,6 +3,8 @@
 #include <zstd.h>
 
 #include <algorithm>
+#include <map>
+#include <list>
 #include <cerrno>
 #include <atomic>
 #include <chrono>
@@ -245,25 +247,78 @@ std::shared_ptr<DeltaByteSource> DeltaByteSource::Create(std::shared_ptr<ByteSou
     return D;
 }
 
-std::shared_ptr<std::vector<uint8_t>> DeltaByteSource::GetAddBlock(uint32_t addSrc, const AddSource &A, uint64_t blk) {
-    uint64_t key = ((uint64_t)addSrc << 40) ^ blk;
-    {
-        std::lock_guard<std::mutex> g(CacheMu);
-        auto it = BlockCache.find(key);
-        if (it != BlockCache.end()) return it->second;
+namespace {
+// The decompressed ADD blocks of every delta view in the process, least recently used dropped first once their bytes
+// pass the budget. One budget for all views: a chain's views come and go as it is built, and a mount holds a few dozen.
+// A FIFO of 64 blocks per view thrashed: reading wine's 293 MB of DLLs decompressed 5.4 GB, the same 3.7 k blocks over
+// and over (each block holds bits of many files, every file bits of many blocks).
+class BlockLru {
+public:
+    using Block = std::shared_ptr<std::vector<uint8_t>>;
+    Block Get(uint64_t Owner, uint64_t Key) {
+        std::lock_guard<std::mutex> G(Mu);
+        const auto It = Blocks.find({ Owner, Key });
+        if (It == Blocks.end()) return nullptr;
+        Order.splice(Order.begin(), Order, It->second.second);
+        return It->second.first;
     }
+    bool Has(uint64_t Owner, uint64_t Key) {
+        std::lock_guard<std::mutex> G(Mu);
+        return Blocks.count({ Owner, Key }) != 0;
+    }
+    void Put(uint64_t Owner, uint64_t Key, const Block &B) {
+        std::lock_guard<std::mutex> G(Mu);
+        if (Blocks.count({ Owner, Key })) return;
+        Order.push_front({ Owner, Key });
+        Blocks.emplace(Order.front(), std::make_pair(B, Order.begin()));
+        Bytes += B->size();
+        while (Bytes > CachedBlockBudget() && Order.size() > 1) {
+            const auto Last = Blocks.find(Order.back());
+            Bytes -= Last->second.first->size();
+            Blocks.erase(Last);
+            Order.pop_back();
+        }
+    }
+    size_t Held() {
+        std::lock_guard<std::mutex> G(Mu);
+        return Bytes;
+    }
+    void Drop(uint64_t Owner) {
+        std::lock_guard<std::mutex> G(Mu);
+        for (auto It = Blocks.lower_bound({ Owner, 0 }); It != Blocks.end() && It->first.first == Owner;) {
+            Bytes -= It->second.first->size();
+            Order.erase(It->second.second);
+            It = Blocks.erase(It);
+        }
+    }
+private:
+    using Id = std::pair<uint64_t, uint64_t>;
+    std::mutex Mu;
+    std::list<Id> Order;                                              // most recently used first
+    std::map<Id, std::pair<Block, std::list<Id>::iterator>> Blocks;   // ordered: a view's blocks are one range
+    size_t Bytes = 0;
+};
+//Never destroyed: the views that drop their blocks into it can outlive any static (the mount's state is one, and it
+//is destroyed at exit after a cache made later would be — a use after free on every unmount).
+BlockLru &Blocks() { static BlockLru &L = *new BlockLru; return L; }
+std::atomic<uint64_t> g_NextCacheId{ 1 };
+} // namespace
+
+size_t CachedBlockBytes() { return Blocks().Held(); }
+size_t CachedBlockBudget() { return 128u << 20; }
+
+AddSource::AddSource() : cacheId(g_NextCacheId++) {}
+AddSource::~AddSource() { Blocks().Drop(cacheId); }
+
+std::shared_ptr<std::vector<uint8_t>> DeltaByteSource::GetAddBlock(uint32_t addSrc, const AddSource &A, uint64_t blk) {
+    (void)addSrc;
+    if (auto held = Blocks().Get(A.cacheId, blk)) return held;
     const BlockRec &b = A.blocks[blk];                          // decompress outside the lock
     std::vector<uint8_t> comp(b.compLen);
     if (b.compLen && !A.file->preadAll(comp.data(), b.compLen, A.regionOff + b.compOff)) return nullptr;
     auto raw = std::make_shared<std::vector<uint8_t>>(ZDecompress(comp.data(), b.compLen, b.uncompLen));
     if (raw->size() != b.uncompLen) return nullptr;
-    {
-        std::lock_guard<std::mutex> g(CacheMu);
-        if (BlockCache.emplace(key, raw).second) {             // first insert of this key → track for eviction
-            CacheFifo.push_back(key);
-            if (CacheFifo.size() > CacheCap) { BlockCache.erase(CacheFifo.front()); CacheFifo.pop_front(); }
-        }
-    }
+    Blocks().Put(A.cacheId, blk, raw);
     return raw;
 }
 
@@ -282,10 +337,41 @@ int DeltaByteSource::readAdd(uint32_t addSrc, const AddSource &A, uint8_t *buf, 
     return 0;
 }
 
+void DeltaByteSource::prefetch(uint64_t off, uint64_t n) {
+    if (off >= TargetSize || Segs.empty() || n == 0) return;
+    const uint64_t end = n < TargetSize - off ? off + n : TargetSize;
+    //Runs that follow each other in the base are one range; an ADD block is asked for once.
+    uint64_t runOff = 0, runLen = 0;
+    const auto flush = [&] { if (runLen) BaseSrc->prefetch(runOff, runLen); runLen = 0; };
+    uint64_t lastKey = UINT64_MAX;
+    for (size_t idx = SegAt(Segs, off); idx < Segs.size() && Segs[idx].targetOff < end; ++idx) {
+        const FlatSeg &s = Segs[idx];
+        const uint64_t a = off > s.targetOff ? off - s.targetOff : 0;
+        const uint64_t b = std::min<uint64_t>(s.len, end - s.targetOff);
+        if (s.kind == KIND_COPY) {
+            const uint64_t at = s.srcOff + a;
+            if (runLen && runOff + runLen == at) runLen += b - a;
+            else { flush(); runOff = at; runLen = b - a; }
+            continue;
+        }
+        const AddSource &A = *AddSources[s.addSrc];
+        for (uint64_t blk = (s.srcOff + a) / A.blockSize; blk <= (s.srcOff + b - 1) / A.blockSize && blk < A.blocks.size(); ++blk) {
+            const uint64_t key = ((uint64_t)s.addSrc << 40) ^ blk;
+            if (key == lastKey) continue;
+            lastKey = key;
+            if (Blocks().Has(A.cacheId, blk)) continue;
+            A.file->prefetch(A.regionOff + A.blocks[blk].compOff, A.blocks[blk].compLen);
+        }
+    }
+    flush();
+}
+
 ssize_t DeltaByteSource::pread(void *buf, size_t n, uint64_t off) {
     if (off >= TargetSize || Segs.empty()) return 0;
     size_t want = n < (size_t)(TargetSize - off) ? n : (size_t)(TargetSize - off);
     size_t idx = SegAt(Segs, off);
+    //A read across runs from all over the base: every one of them asked for first, then read.
+    if (idx + 1 < Segs.size() && Segs[idx + 1].targetOff < off + want) prefetch(off, want);
 
     uint8_t *out = (uint8_t *)buf;
     size_t done = 0;

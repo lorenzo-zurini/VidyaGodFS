@@ -10,6 +10,26 @@ uint16_t Rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 uint32_t Rd32(const uint8_t *p) { return (uint32_t)(p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24)); }
 uint64_t Rd64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; --i) v = (v << 8) | p[i]; return v; }
 
+namespace {
+// The directory read a window at a time: one read per megabyte of records rather than two per member (a call each,
+// and through a delta's view a lookup of its runs each).
+struct Window {
+    ByteSource &src;
+    uint64_t at = 0;
+    std::vector<uint8_t> buf;
+    bool read(void *dst, size_t n, uint64_t off) {
+        if (off < at || off + n > at + buf.size()) {
+            const uint64_t left = off < src.size() ? src.size() - off : 0;
+            buf.resize((size_t)std::min<uint64_t>(left, std::max<size_t>(n, 1u << 20)));
+            at = off;
+            if (buf.size() < n || !src.preadAll(buf.data(), buf.size(), off)) { buf.clear(); return false; }
+        }
+        std::copy_n(buf.data() + (off - at), n, static_cast<uint8_t *>(dst));
+        return true;
+    }
+};
+} // namespace
+
 bool WalkCentralDir(ByteSource &src, const EntryCb &cb)
 {
     uint64_t fsize = src.size();
@@ -42,11 +62,12 @@ bool WalkCentralDir(ByteSource &src, const EntryCb &cb)
         cdOffset     = Rd64(z64 + 48);
     }
 
+    Window cd{ src, 0, {} };
     uint64_t pos = cdOffset;
     for (uint64_t i = 0; i < totalEntries; ++i)
     {
         uint8_t rec[46];
-        if (!src.preadAll(rec, 46, pos) || Rd32(rec) != 0x02014b50u) return false;
+        if (!cd.read(rec, 46, pos) || Rd32(rec) != 0x02014b50u) return false;
         uint16_t method   = Rd16(rec + 10);
         uint16_t nameLen  = Rd16(rec + 28);
         uint16_t extraLen = Rd16(rec + 30);
@@ -56,13 +77,13 @@ bool WalkCentralDir(ByteSource &src, const EntryCb &cb)
         uint64_t lhOffset     = Rd32(rec + 42);
 
         std::vector<uint8_t> name(nameLen);
-        if (nameLen && !src.preadAll(name.data(), nameLen, pos + 46)) return false;
+        if (nameLen && !cd.read(name.data(), nameLen, pos + 46)) return false;
 
         // Pull the 64-bit local-header offset from the ZIP64 extra when the 32-bit field is a sentinel.
         if (lhOffset == 0xFFFFFFFFu)
         {
             std::vector<uint8_t> extra(extraLen);
-            if (extraLen && src.preadAll(extra.data(), extraLen, pos + 46 + nameLen))
+            if (extraLen && cd.read(extra.data(), extraLen, pos + 46 + nameLen))
             {
                 size_t e = 0;
                 while (e + 4 <= (size_t)extraLen)

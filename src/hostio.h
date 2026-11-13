@@ -64,6 +64,11 @@ using Fd = int;
 Fd      Open (const std::string &path, int flags, uint32_t mode = 0);
 int     Close(Fd fd);
 ssize_t Pread (Fd fd, void *buf, size_t n, uint64_t off);        // positioned, no shared cursor (thread-safe)
+// Asks the host to start reading [off, off+n) into its cache and returns once the reads are queued, without waiting
+// for them (POSIX_FADV_WILLNEED; a full queue can hold it a moment). A disk that seeks serves many such ranges in one
+// sweep, where reads one after another each wait for their own seek.
+// A no-op where the host has no such call.
+void    Prefetch(Fd fd, uint64_t off, uint64_t n);
 ssize_t Pwrite(Fd fd, const void *buf, size_t n, uint64_t off);
 ssize_t Read (Fd fd, void *buf, size_t n);                       // sequential (copy-up stream loop)
 ssize_t Write(Fd fd, const void *buf, size_t n);

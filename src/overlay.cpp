@@ -14,6 +14,7 @@
 #include <iostream>
 
 namespace fs = std::filesystem;
+static constexpr uint64_t kIndexPrefetch = 1ull << 20;   // what a mount reads first of each archive, asked for at once
 
 // ---- small path helpers --------------------------------------------------
 
@@ -86,6 +87,23 @@ bool VfsState::Init(const Spec &S, std::string &Err)
     //plan is made again with it broken, so what it would have hidden surfaces — and again, while that finds more.
     TreePlan P = PlanTree(S);
     for (const std::string &Why : P.problems) std::cerr << "[vidyagodfs] " << Why << " — it is left out\n";
+    //What indexing reads first, asked for at once: an archive's central directory at its end, a delta's header and
+    //segment table at its start. The disk serves them in one sweep, where layer after layer each waited for its seeks.
+    for (size_t I = 0; I < S.layers.size(); ++I)
+    {
+        const LayerSpec &LS = S.layers[I];
+        const bool Zip = LS.type == LayerType::Zip && !P.whole[I], Delta = LS.type == LayerType::Delta && !P.broken[I];
+        if (!Zip && !Delta) continue;
+        HostIO::Fd Fd = HostIO::Open(LS.source, O_RDONLY);
+        if (Fd < 0) continue;
+        HostIO::Stat St;
+        if (HostIO::Fstat(Fd, St) == 0)
+        {
+            const uint64_t Len = St.size < kIndexPrefetch ? St.size : kIndexPrefetch;
+            HostIO::Prefetch(Fd, Zip ? St.size - Len : 0, Len);
+        }
+        HostIO::Close(Fd);
+    }
     std::vector<std::shared_ptr<ZipIndex>> Index(S.layers.size());
     std::vector<bool> Failed(S.layers.size(), false);
     //Each round surfaces what the failures so far stopped hiding, and may find a failure beneath them (a delta whose own

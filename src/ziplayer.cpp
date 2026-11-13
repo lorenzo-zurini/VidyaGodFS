@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cerrno>
 #include <algorithm>
+#include <atomic>
 #include <sys/stat.h>
 #include <iostream>
 
@@ -141,11 +142,7 @@ std::shared_ptr<ZipIndex> BuildZipIndex(std::shared_ptr<ByteSource> Src, const s
             if (storeMethod && !encrypted)
             {
                 auto it = lhOffsets.find(vrel);
-                if (it != lhOffsets.end())
-                {
-                    uint64_t doff = zipscan::LocalDataOffset(*Src, it->second);
-                    if (doff != UINT64_MAX) { e.stored = true; e.dataOffset = doff; }
-                }
+                if (it != lhOffsets.end()) { e.stored = true; e.localHeader = it->second; }
             }
             Z->byName[vrel] = e;
         }
@@ -158,6 +155,19 @@ std::shared_ptr<ZipIndex> BuildZipIndex(std::shared_ptr<ByteSource> Src, const s
 
 // ---- open / read ---------------------------------------------------------
 
+static constexpr uint64_t kPrefetchOnOpen = 16ull << 20;
+const ZipEntry kNoZipTarget{};
+
+uint64_t ZipDataOffset(const ZipIndex &Z, const ZipEntry &E)
+{
+    if (!E.stored) return UINT64_MAX;
+    std::atomic_ref<uint64_t> Known(E.dataOffset);
+    if (const uint64_t K = Known.load(std::memory_order_relaxed); K != UINT64_MAX) return K;
+    const uint64_t D = zipscan::LocalDataOffset(*Z.src, E.localHeader);
+    if (D != UINT64_MAX) Known.store(D, std::memory_order_relaxed);   // a header that did not read is read again
+    return D;
+}
+
 int OpenZipEntry(ZipIndex &Z, const ZipEntry &E, ZipReader &Out)
 {
     Out.size = E.size;
@@ -165,9 +175,19 @@ int OpenZipEntry(ZipIndex &Z, const ZipEntry &E, ZipReader &Out)
     // Only STORED entries are servable — zero-copy through the ByteSource (no materialization).
     if (E.stored)
     {
+        const uint64_t D = ZipDataOffset(Z, E);
+        if (D == UINT64_MAX)
+        {
+            std::cerr << "[vidyagodfs] the local header of '" << E.name << "' in " << Z.archivePath << " does not read\n";
+            return -EIO;
+        }
         Out.stored = true;
         Out.src = Z.src.get();
-        Out.dataOffset = E.dataOffset;
+        Out.dataOffset = D;
+        //A file opened is read whole as a rule (a DLL mapped, a config parsed): a small one whose bytes lie in runs all
+        //over the disk (a delta's view) is asked for whole now, so its runs are read in one sweep rather than each as
+        //the reads reach it. A plain archive's file is one run, which the host's own readahead follows.
+        if (E.size <= kPrefetchOnOpen && Z.src->scattered()) Z.src->prefetch(D, E.size);
         return 0;
     }
 
@@ -218,23 +238,31 @@ static bool JoinNormalized(const std::string &base, const std::string &target, s
 
 const ZipEntry *ResolveZipSymlink(ZipIndex &Z, const ZipEntry &E)
 {
-    const ZipEntry *cur = &E;
-    for (int hop = 0; hop < 8 && cur->symlink; ++hop)
-    {
-        // The link target IS the entry content (STORE archives keep it contiguous — plain pread).
-        if (!cur->stored || cur->size == 0 || cur->size > 4096) return nullptr;
-        std::string tgt(cur->size, '\0');
-        if (Z.src->pread(tgt.data(), tgt.size(), cur->dataOffset) != (ssize_t)tgt.size()) return nullptr;
-        if (!tgt.empty() && tgt[0] == '/') return nullptr;      // absolute → leaves the archive
+    std::atomic_ref<const ZipEntry *> Known(E.linkTo);
+    if (const ZipEntry *K = Known.load(std::memory_order_acquire)) return K == &kNoZipTarget ? nullptr : K;
+    bool Unread = false;
+    const ZipEntry *Found = [&]() -> const ZipEntry * {
+        const ZipEntry *cur = &E;
+        for (int hop = 0; hop < 8 && cur->symlink; ++hop)
+        {
+            // The link target IS the entry content (STORE archives keep it contiguous — plain pread).
+            if (!cur->stored || cur->size == 0 || cur->size > 4096) return nullptr;
+            std::string tgt(cur->size, '\0');
+            const uint64_t D = ZipDataOffset(Z, *cur);
+            if (D == UINT64_MAX || Z.src->pread(tgt.data(), tgt.size(), D) != (ssize_t)tgt.size()) { Unread = true; return nullptr; }
+            if (!tgt.empty() && tgt[0] == '/') return nullptr;      // absolute → leaves the archive
 
-        std::string dir = cur->name.substr(0, cur->name.find_last_of('/') == std::string::npos
-                                                  ? 0 : cur->name.find_last_of('/'));
-        std::string resolved;
-        if (!JoinNormalized(dir, tgt, resolved)) return nullptr; // escapes the archive root
-        auto it = Z.byName.find(resolved);
-        if (it == Z.byName.end()) return nullptr;                // dangling
-        cur = &it->second;
-    }
-    if (cur->symlink || cur->isDir) return nullptr;              // loop guard hit, or a directory target
-    return cur;
+            std::string dir = cur->name.substr(0, cur->name.find_last_of('/') == std::string::npos
+                                                      ? 0 : cur->name.find_last_of('/'));
+            std::string resolved;
+            if (!JoinNormalized(dir, tgt, resolved)) return nullptr; // escapes the archive root
+            auto it = Z.byName.find(resolved);
+            if (it == Z.byName.end()) return nullptr;                // dangling
+            cur = &it->second;
+        }
+        if (cur->symlink || cur->isDir) return nullptr;              // loop guard hit, or a directory target
+        return cur;
+    }();
+    if (!Unread) Known.store(Found ? Found : &kNoZipTarget, std::memory_order_release);
+    return Found;
 }

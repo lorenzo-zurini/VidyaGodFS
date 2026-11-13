@@ -40,6 +40,11 @@ ssize_t Pread(Fd fd, void *buf, size_t n, uint64_t off)
     return r < 0 ? -errno : r;
 }
 
+void Prefetch(Fd fd, uint64_t off, uint64_t n)
+{
+    ::posix_fadvise(fd, static_cast<off_t>(off), static_cast<off_t>(n), POSIX_FADV_WILLNEED);
+}
+
 ssize_t Pwrite(Fd fd, const void *buf, size_t n, uint64_t off)
 {
     ssize_t w = ::pwrite(fd, buf, n, static_cast<off_t>(off));

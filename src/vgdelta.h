@@ -50,11 +50,18 @@ struct BlockRec {
 
 // One .vgdelta file's ADD-block store — the literal bytes it introduced. A flattened DeltaByteSource keeps one
 // per delta file in the collapsed chain, so its ADD segments read straight from the original file (no copy).
+// Its decompressed blocks are kept in the process's one cache under its own id, so every view of a chain that holds
+// this file shares them, and they go with it.
 struct AddSource {
     std::shared_ptr<ByteSource> file;       // the .vgdelta file
     uint64_t                    regionOff = 0;
     uint32_t                    blockSize = DEFAULT_BLOCK;
     std::vector<BlockRec>       blocks;
+    const uint64_t              cacheId;    // its blocks in the cache (never another's, whatever address it lands at)
+    AddSource();
+    ~AddSource();
+    AddSource(const AddSource &) = delete;
+    AddSource &operator=(const AddSource &) = delete;
 };
 
 // A resolved segment in the FLAT map: COPY reads the ultimate base; ADD reads addSources[addSrc].
@@ -81,13 +88,16 @@ public:
                                                    std::string &err, bool verifyBase = false);
 
     ssize_t  pread(void *buf, size_t n, uint64_t off) override;
+    // Every base run and every ADD block not already held that [off, off+n) is made of, queued at once.
+    void     prefetch(uint64_t off, uint64_t n) override;
+    bool     scattered() const override { return true; }
     uint64_t size() const override { return TargetSize; }
 
 private:
     int readAdd(uint32_t addSrc, const AddSource &A, uint8_t *buf, size_t n, uint64_t addOff);
-    // Decompressed ADD block, cached. Reads (esp. zip enumeration: thousands of small scattered reads) otherwise
-    // re-decompress the same block over and over — expensive once blocks are large. FIFO-capped, mutex-guarded
-    // (pread is a concurrent-safe contract). Key = (addSrc << 40) ^ blockIdx.
+    // Decompressed ADD block, kept in the process's one cache of them (least recently used goes first, within a
+    // budget of bytes): a file's bytes come from blocks of every delta in the chain, each block holding bits of many
+    // files, so reading a folder of them returns to the same blocks again and again. Kept under its AddSource.
     std::shared_ptr<std::vector<uint8_t>> GetAddBlock(uint32_t addSrc, const AddSource &A, uint64_t blk);
 
     std::shared_ptr<ByteSource>              BaseSrc;    // the ULTIMATE (non-delta) base — for COPY
@@ -95,11 +105,11 @@ private:
     std::vector<FlatSeg>                     Segs;       // flat, sorted by targetOff, gap-free over [0,TargetSize)
     uint64_t                                 TargetSize = 0;
 
-    std::mutex                                                        CacheMu;
-    std::unordered_map<uint64_t, std::shared_ptr<std::vector<uint8_t>>> BlockCache;
-    std::deque<uint64_t>                                             CacheFifo;
-    static constexpr size_t                                          CacheCap = 64;   // 64 blocks (~16 MB at 256K)
 };
+
+// The bytes of decompressed ADD blocks the process holds now (all delta views together), and the most it keeps.
+size_t CachedBlockBytes();
+size_t CachedBlockBudget();
 
 // Generates a .vgdelta reconstructing `target` from `base` (both addressable as flat memory — mmap them; the target is
 // read once, sequentially). Uses a rolling-hash + greedy-extend matcher; literal runs are stored as per-block zstd.
