@@ -117,10 +117,15 @@ struct Fixture {
 // helper's launch returns (fuse daemonizes: the launch returns once the mount is live). The spawner is put in
 // its own process group, as a shell job or a test runner's child is. It then reports the helper's exit status
 // on `ready` and either exits (`exitAfter`) or waits to be killed. Returns the spawner's pid.
-static pid_t StartSpawner(const Fixture &F, bool exitAfter, int ready)
+//
+// An exiting spawner waits for `go` to close first: its exit is what takes the mount down, so exiting the moment
+// it reports would race the test's own look at the mount table — under load the server unmounted first, and the
+// mount the test was about to see was already gone. `go` is close-on-exec, so the helper never holds it open.
+static pid_t StartSpawner(const Fixture &F, bool exitAfter, int ready, int goRead, int goWrite)
 {
     pid_t S = fork();
     if (S != 0) return S;
+    close(goWrite);
     setpgid(0, 0);
     pid_t H = fork();
     if (H == 0) {
@@ -131,17 +136,20 @@ static pid_t StartSpawner(const Fixture &F, bool exitAfter, int ready)
     int St = 0; waitpid(H, &St, 0);
     const char Ok = (WIFEXITED(St) && WEXITSTATUS(St) == 0) ? 1 : 0;
     if (write(ready, &Ok, 1) != 1) _exit(1);
-    if (exitAfter) _exit(0);
+    if (exitAfter) { char B; while (read(goRead, &B, 1) < 0 && errno == EINTR) {} _exit(0); }
     for (;;) pause();
 }
 
 static bool MountedBySpawner(Fixture &F, pid_t &Spawner, bool exitAfter)
 {
     int P[2]; if (pipe(P) != 0) return false;
-    Spawner = StartSpawner(F, exitAfter, P[1]);
-    close(P[1]);
+    int Go[2]; if (pipe2(Go, O_CLOEXEC) != 0) return false;
+    Spawner = StartSpawner(F, exitAfter, P[1], Go[0], Go[1]);
+    close(P[1]); close(Go[0]);
     char Ok = 0; const bool Got = read(P[0], &Ok, 1) == 1; close(P[0]);
-    return Got && Ok == 1 && Mounted(F.mp);
+    const bool Up = Got && Ok == 1 && Mounted(F.mp);
+    close(Go[1]);   // seen: an exiting spawner may go now
+    return Up;
 }
 
 // ---- tests ------------------------------------------------------------------
