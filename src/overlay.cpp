@@ -1,10 +1,13 @@
 #include "overlay.h"
+
+#include <map>
 #include "treeplan.h"
 #include "vgdelta.h"
 #include "hostio.h"     // all host filesystem I/O goes through the backend-neutral shim
 
 #include <algorithm>
 #include <filesystem>
+#include <map>
 #include <fstream>
 #include <cstring>
 #include <cerrno>
@@ -105,6 +108,8 @@ static void AddAncestors(std::set<std::string> &dst, const std::string &leaf)
 
 static void SeedMasksFromWritelayer(VfsState &S);   // defined with the mask machinery below
 static void SeedKeptMasks(Layer &L);                 // likewise, for each kept folder
+
+static std::string PatchKey(const VfsState &S, const std::string &vrel);
 
 bool VfsState::Init(const Spec &S, std::string &Err)
 {
@@ -263,8 +268,70 @@ bool VfsState::Init(const Spec &S, std::string &Err)
         }
         for (const std::string &D : implicitDirs) canonCase.try_emplace(FoldCase(D), D);
     }
+    //The byte patches, by the path as the layers spell it: in spec order onto each file's bytes (a later one wins on a
+    //byte two cover), then merged into runs.
+    {
+        //Runs by offset, none touching another: a patch goes into the run that reaches it (grown in place) and takes in
+        //every later run it reaches, keeping their bytes past its own.
+        std::unordered_map<std::string, std::map<uint64_t, std::vector<uint8_t>>> Runs;
+        for (const BytePatch &P : S.patches)
+        {
+            if (P.bytes.empty()) continue;
+            auto &M = Runs[PatchKey(*this, NormalizeVPath(P.path))];
+            const uint64_t End = P.at + P.bytes.size();
+            auto Run = M.upper_bound(P.at);
+            if (Run != M.begin() && std::prev(Run)->first + std::prev(Run)->second.size() >= P.at) --Run;
+            else Run = M.emplace(P.at, std::vector<uint8_t>()).first;
+            std::vector<uint8_t> &V = Run->second;
+            const uint64_t Base = Run->first;
+            if (V.size() < End - Base) V.resize((size_t)(End - Base));
+            std::copy(P.bytes.begin(), P.bytes.end(), V.begin() + (std::ptrdiff_t)(P.at - Base));
+            for (auto Next = std::next(Run); Next != M.end() && Next->first <= Base + V.size();)
+            {
+                if (Next->first + Next->second.size() > Base + V.size())
+                    V.insert(V.end(), Next->second.begin() + (std::ptrdiff_t)(Base + V.size() - Next->first), Next->second.end());
+                Next = M.erase(Next);
+            }
+        }
+        for (auto &[Path, M] : Runs)
+        {
+            PatchRuns &R = patches[Path];
+            for (auto &[At, B] : M) R.push_back(PatchRun{ At, std::move(B) });
+        }
+    }
     return true;
     (void)Err;
+}
+
+//A patch's key: its path, folded where names match whatever their case (a folder layer's names are not in canonCase).
+static std::string PatchKey(const VfsState &S, const std::string &vrel) { return S.caseInsensitive ? FoldCase(vrel) : vrel; }
+
+const PatchRuns *PatchesFor(const VfsState &S, const std::string &vrel)
+{
+    if (S.patches.empty()) return nullptr;
+    const auto It = S.patches.find(PatchKey(S, vrel));
+    return It == S.patches.end() ? nullptr : &It->second;
+}
+
+void OverlayPatches(const PatchRuns *P, void *Buf, size_t N, uint64_t Off)
+{
+    if (!P || N == 0) return;
+    auto *Out = static_cast<uint8_t *>(Buf);
+    const uint64_t End = Off + N;
+    //The first run that ends after Off.
+    auto It = std::upper_bound(P->begin(), P->end(), Off, [](uint64_t O, const PatchRun &R) { return O < R.at + R.bytes.size(); });
+    for (; It != P->end() && It->at < End; ++It)
+    {
+        const uint64_t From = std::max(Off, It->at), To = std::min(End, It->at + It->bytes.size());
+        std::memcpy(Out + (From - Off), It->bytes.data() + (From - It->at), (size_t)(To - From));
+    }
+}
+
+bool PatchesOverlap(const PatchRuns *P, uint64_t Off, size_t N)
+{
+    if (!P || N == 0) return false;
+    const auto It = std::upper_bound(P->begin(), P->end(), Off, [](uint64_t O, const PatchRun &R) { return O < R.at + R.bytes.size(); });
+    return It != P->end() && It->at < Off + N;
 }
 
 std::mutex &VfsState::CopyUpLock(const std::string &vrel)
@@ -968,6 +1035,7 @@ static int CopyUpImpl(VfsState &S, const std::string &vrel, const ResolveResult 
     if (out < 0) return out;
 
     int rc = 0;
+    const PatchRuns *Patched = PatchesFor(S, vrel);   // a lower file: its patches go into its copy
     if (rr.kind == HitKind::ZipEntry && rr.zipEntry)
     {
         ZipReader zr;
@@ -981,6 +1049,7 @@ static int CopyUpImpl(VfsState &S, const std::string &vrel, const ResolveResult 
                 int got = ReadZipEntry(zr, buf, sizeof buf, off);
                 if (got < 0) { rc = got; break; }
                 if (got == 0) break;
+                OverlayPatches(Patched, buf, (size_t)got, (uint64_t)off);   // the copy is the file as it was read
                 if (int we = HostIO::FullWrite(out, buf, (size_t)got); we != 0) { rc = we; break; }
                 off += got;
             }
@@ -997,8 +1066,13 @@ static int CopyUpImpl(VfsState &S, const std::string &vrel, const ResolveResult 
         {
             char buf[256 * 1024];
             ssize_t got;
+            uint64_t at = 0;
             while ((got = HostIO::Read(in, buf, sizeof buf)) > 0)
+            {
+                OverlayPatches(Patched, buf, (size_t)got, at);
+                at += (uint64_t)got;
                 if (int we = HostIO::FullWrite(out, buf, (size_t)got); we != 0) { rc = we; break; }
+            }
             if (got < 0 && rc == 0) rc = (int)got;
             HostIO::Close(in);
             // Keep the lower file's mode — but the copy is a COW copy that exists to be WRITTEN: force the owner

@@ -38,6 +38,8 @@ struct OpenFile {
     VfsState                *state = nullptr;
     std::string              vrel;
     int                      flags = 0;
+    //The spec's patches for this file, laid over what fd/zip read (a lower copy); never over the copy-up (it has them).
+    const PatchRuns         *patch = nullptr;
 };
 
 // Neutral file attributes (VfsGetattr output). The backend converts to struct stat (FUSE)

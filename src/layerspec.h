@@ -37,6 +37,15 @@ struct LayerSpec {
     bool        bytesOnly = false;   // zip/delta/file: read as a later delta's base, surfacing nowhere (a TAKE shows none of it)
 };
 
+//Bytes a launch puts into a file a lower layer serves (a BinaryPatch the app resolved against it): every read of the
+//file gets them, and so does its copy when it is copied up into the writelayer. No layer's own file is ever written,
+//and the cost is the patch's size, never the file's. A file the writelayer or a kept folder serves is not patched.
+struct BytePatch {
+    std::string          path;   // the virtual path (normalized)
+    uint64_t             at = 0; // the offset in the file
+    std::vector<uint8_t> bytes;  // what is read there
+};
+
 struct Spec {
     std::string             mountpoint;
     uint32_t                uid = 1000;
@@ -50,6 +59,7 @@ struct Spec {
     //How many mounts the launch that made this one makes (a runner build and the game: 2). They share one budget for
     //decompressed delta blocks — each took a 32nd of the machine's memory, so two mounts a 16th.
     int                     launchMounts = 1;
+    std::vector<BytePatch>  patches;      // in order: a later one wins where two cover the same byte
 };
 
 //Parses the spec file at Path (or the spec JSON Text) into Out. Returns false (with Err set) on read/parse error.

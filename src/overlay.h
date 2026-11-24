@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <unordered_map>
 #include <memory>
 #include <mutex>
 #include <condition_variable>
@@ -66,6 +67,13 @@ struct Layer {
 
 //The whole running filesystem state, built once from a Spec and immutable afterward (lock-free reads),
 //except per-path copy-up serialization.
+//One run of patched bytes in a file (layerspec.h BytePatch, merged): sorted by offset, none touching another.
+struct PatchRun {
+    uint64_t             at = 0;
+    std::vector<uint8_t> bytes;
+};
+using PatchRuns = std::vector<PatchRun>;
+
 struct VfsState {
     std::string           writelayer;   // empty when readOnly
     bool                  readOnly = false;
@@ -79,6 +87,9 @@ struct VfsState {
     uint32_t              gid = 1000;
     std::vector<Layer>    layers;        // ascending priority (index 0 lowest)
     std::set<std::string> implicitDirs;  // synthesized structural dirs (target parents)
+    //The spec's byte patches by the path they patch (folded where names match whatever their case): laid over a file
+    //only while a lower layer serves it — on its reads and its copy-up. Set once at Init, read-only after.
+    std::unordered_map<std::string, PatchRuns> patches;
     // Case-insensitive names (Spec::caseInsensitive): every name the layers know (zip entries and folders, layer
     // targets, structural dirs) by its folded (ASCII-lowercased) path, mapped to the case it has — the lowest layer's
     // when they differ. CanonicalCase maps an incoming path through it. Host-backed names (writelayer, dir layers)
@@ -187,6 +198,12 @@ bool        IsUnderOpaque(const VfsState &S, const std::string &vrel);
 //rest as given (a name being made). vrel itself when the state is case-sensitive. A backend applies it to every path
 //it is handed, so everything below sees one spelling per name: a lookup, a copy-up, a deletion marker.
 std::string CanonicalCase(const VfsState &S, const std::string &vrel);
+//The patch runs for vrel, or null when none: what a lower layer's file at vrel is read with.
+const PatchRuns *PatchesFor(const VfsState &S, const std::string &vrel);
+//Lays the runs over Buf, the N bytes of the file at Off.
+void OverlayPatches(const PatchRuns *P, void *Buf, size_t N, uint64_t Off);
+//Whether any run lies in [Off, Off + N).
+bool PatchesOverlap(const PatchRuns *P, uint64_t Off, size_t N);
 std::string FoldCase(std::string S);   // ASCII lowercase: the key CanonicalCase looks a path up by
 
 //Resolve a vrel: whiteout → None; writelayer entry → WriteLayer; covering layer (highest priority

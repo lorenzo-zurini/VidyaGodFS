@@ -104,6 +104,31 @@ bool ParseSpecText(const std::string &Text, Spec &Out, std::string &Err)
                 }
             Out.layers.push_back(std::move(LS));
         }
+        //"patches": [{ "path": "game/x.iso", "at": 542052, "bytes": "07" }] — refused whole when one is malformed (a patch
+        //half taken serves a file neither the game's nor the package's).
+        if (J.contains("patches"))
+        {
+            if (!J["patches"].is_array()) { Err = "patches must be an array"; return false; }
+            for (const auto &P : J["patches"])
+            {
+                BytePatch B;
+                const std::string Hex = P.is_object() && P.contains("bytes") && P["bytes"].is_string() ? P["bytes"].get<std::string>() : std::string();
+                if (!P.is_object() || !P.contains("path") || !P["path"].is_string() || !P.contains("at")
+                    || !P["at"].is_number_unsigned() || Hex.empty() || Hex.size() % 2 != 0)
+                { Err = "a patch is { path, at, bytes (hex) }: " + P.dump(); return false; }
+                B.path = NormalizeVPath(P["path"].get<std::string>());
+                B.at = P["at"].get<uint64_t>();
+                for (size_t I = 0; I < Hex.size(); I += 2)
+                {
+                    const auto Nib = [](char C) { return C >= '0' && C <= '9' ? C - '0' : C >= 'a' && C <= 'f' ? C - 'a' + 10 : C >= 'A' && C <= 'F' ? C - 'A' + 10 : -1; };
+                    const int Hi = Nib(Hex[I]), Lo = Nib(Hex[I + 1]);
+                    if (Hi < 0 || Lo < 0) { Err = "a patch's bytes are not hex: " + Hex; return false; }
+                    B.bytes.push_back((uint8_t)(Hi << 4 | Lo));
+                }
+                if (B.path.empty() || B.at + B.bytes.size() < B.at) { Err = "a patch names no file, or runs past the end of numbers: " + P.dump(); return false; }
+                Out.patches.push_back(std::move(B));
+            }
+        }
     }
     catch (const std::exception &E) { Err = std::string("spec field error: ") + E.what(); return false; }
 

@@ -269,7 +269,7 @@ int VfsOpen(VfsState &S, const std::string &v, int flags, OpenFile *&out)
         auto *zr = new ZipReader;
         int e = OpenZipEntry(*const_cast<ZipIndex *>(rr.layer->zip.get()), *rr.zipEntry, *zr);
         if (e != 0) { delete zr; return e; }
-        auto *of = new OpenFile; of->zip = zr; out = of;
+        auto *of = new OpenFile; of->zip = zr; of->patch = PatchesFor(S, v); out = of;
         if (Followed) TakeMarker(S, v, of, Seen, rr);
         return 0;
     }
@@ -289,6 +289,7 @@ int VfsOpen(VfsState &S, const std::string &v, int flags, OpenFile *&out)
             of->zip = zr;
         }
         else if ((of->fd = HostIO::Open(rr.hostPath, O_RDONLY)) < 0) { const int e = (int)of->fd; delete of; return e; }
+        of->patch = PatchesFor(S, v);
         TakeMarker(S, v, of, Seen, rr);
         of->flags = flags & ~(O_CREAT | O_EXCL | O_TRUNC);
         ++g_LazyOpens;
@@ -315,6 +316,8 @@ int VfsOpen(VfsState &S, const std::string &v, int flags, OpenFile *&out)
     HostIO::Fd fd = HostIO::Open(host, flags);
     if (fd < 0) return (int)fd;
     auto *of = new OpenFile; of->fd = fd; out = of;
+    //A lower file read as it is: with its patches. A copy (the writelayer's, a kept folder's) is read as it is.
+    if (!wantWrite && !rr.rwPassthrough && (rr.kind == HitKind::DirLayer || rr.kind == HitKind::FileLayer)) of->patch = PatchesFor(S, v);
     if (!wantWrite && Followed) TakeMarker(S, v, of, Seen, rr);
     return 0;
 }
@@ -360,6 +363,7 @@ static int PrivateCopy(OpenFile *of)
                                     : HostIO::Pread(of->fd, buf, sizeof buf, off);
         if (got < 0) { rc = (int)got; break; }
         if (got == 0) break;
+        OverlayPatches(of->patch, buf, (size_t)got, off);
         if (int we = HostIO::FullWrite(out, buf, (size_t)got); we != 0) { rc = we; break; }
         off += (uint64_t)got;
     }
@@ -409,6 +413,7 @@ bool VfsReadFrom(OpenFile *of, size_t size, uint64_t off, int &fd, uint64_t &pos
 {
     if (!of) return false;
     if (const int Up = UpperOf(of); Up >= 0) { fd = Up; pos = off; len = size; return true; }
+    if (PatchesOverlap(of->patch, off, size)) return false;   // patched bytes: read through VfsRead
     if (of->zip)
     {
         const ZipReader &R = *of->zip;
@@ -428,9 +433,11 @@ ssize_t VfsRead(OpenFile *of, void *buf, size_t size, uint64_t off)
 {
     if (!of) return -EBADF;
     if (const int Up = UpperOf(of); Up >= 0) return HostIO::Pread(Up, buf, size, off);
-    if (of->zip) return ReadZipEntry(*of->zip, static_cast<char *>(buf), size, (off_t)off);
-    if (of->fd >= 0) return HostIO::Pread(of->fd, buf, size, off);
-    return -EBADF;
+    ssize_t Got = -EBADF;
+    if (of->zip) Got = ReadZipEntry(*of->zip, static_cast<char *>(buf), size, (off_t)off);
+    else if (of->fd >= 0) Got = HostIO::Pread(of->fd, buf, size, off);
+    if (Got > 0) OverlayPatches(of->patch, buf, (size_t)Got, off);
+    return Got;
 }
 
 ssize_t VfsWrite(VfsState &S, OpenFile *of, const void *buf, size_t size, uint64_t off)

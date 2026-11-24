@@ -319,6 +319,43 @@ TEST(a_file_read_through_the_mount_is_handed_over_from_its_file) {
     CHECK(F.TornDown(std::chrono::seconds(10)));
 }
 
+// A file with byte patches reads patched through the kernel — the reads handed over from the file (splice) as well as
+// the copied ones: a read that holds a patch is copied through the patches, the rest still handed over. Teeth: a
+// splice that ignores the patches (the kernel reads the file's own byte); no splice at all for a patched file.
+TEST(a_patched_file_reads_patched_through_the_mount) {
+    Fixture F; pid_t S = 0;
+    std::string Big(3 << 20, '\0');
+    for (size_t I = 0; I < Big.size(); ++I) Big[I] = (char)(I * 31 + I / 4096);
+    std::ofstream(F.root / "layer" / "disc.iso", std::ios::binary) << Big;
+    std::ofstream(F.spec) << "{\"mountpoint\":\"" << F.mp.string() << "\",\"readonly\":true,\"layers\":["
+                          << "{\"type\":\"dir\",\"source\":\"" << (F.root / "layer").string() << "\",\"target\":\"\"}],"
+                          << "\"patches\":[{\"path\":\"disc.iso\",\"at\":542052,\"bytes\":\"07\"},"
+                          << "{\"path\":\"disc.iso\",\"at\":3145726,\"bytes\":\"abcdef\"}]}";
+    const fs::path Log = F.root / "ops.log";
+    ::setenv("VGFS_OPLOG", Log.c_str(), 1);
+    CHECK(MountedBySpawner(F, S, false));
+    ::unsetenv("VGFS_OPLOG");
+    std::string Got;
+    {
+        std::ifstream In(F.mp / "disc.iso", std::ios::binary);
+        Got.assign((std::istreambuf_iterator<char>(In)), std::istreambuf_iterator<char>());
+    }
+    std::string Want = Big;
+    Want[542052] = 0x07;
+    Want[3145726] = (char)0xab; Want[3145727] = (char)0xcd;                 // a patch past the end is cut at it
+    CHECK(Got.size() == Want.size());
+    CHECK(Got == Want);
+    std::ifstream L(Log);
+    int Handed = 0;
+    for (std::string Line; std::getline(L, Line); ) Handed += Line == "read_buf fd";
+    CHECK(Handed > 0);
+    std::ifstream Disk(F.root / "layer" / "disc.iso", std::ios::binary);
+    CHECK(std::string((std::istreambuf_iterator<char>(Disk)), std::istreambuf_iterator<char>()) == Big);
+    CHECK(::kill(-S, SIGKILL) == 0);
+    waitpid(S, nullptr, 0);
+    CHECK(F.TornDown(std::chrono::seconds(10)));
+}
+
 // A spawner that is already gone when the helper starts gets no mount at all: nothing would ever take it down.
 TEST(a_spawner_already_gone_gets_no_mount) {
     Fixture F;

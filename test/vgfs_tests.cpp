@@ -336,6 +336,128 @@ TEST(writelayer_copyup_of_a_zip_entry_keeps_it_executable) {
     CHECK((a.perms & 0111) == 0111);
 }
 
+// ---- byte patches (spec "patches") ----------------------------------------------------------------------------
+
+static std::string readAll(VfsState &S, const std::string &v, size_t Chunk) {
+    OpenFile *of = nullptr;
+    if (VfsOpen(S, v, 0, of) != 0 || !of) return "<open failed>";
+    std::string Out; std::vector<char> Buf(Chunk);
+    for (uint64_t Off = 0;;) {
+        const ssize_t N = VfsRead(of, Buf.data(), Buf.size(), Off);
+        if (N <= 0) break;
+        Out.append(Buf.data(), (size_t)N); Off += (uint64_t)N;
+    }
+    VfsRelease(of);
+    return Out;
+}
+static BytePatch bytePatch(const std::string &Path, uint64_t At, const std::string &Bytes) {
+    BytePatch B; B.path = Path; B.at = At; B.bytes.assign(Bytes.begin(), Bytes.end()); return B;
+}
+
+// A file a lower layer serves is read with its patches, whatever the reads' sizes and offsets (a run across two
+// reads), a later patch winning where two cover a byte; the layer's own file is never written. Teeth: patches
+// ignored; only a read that holds a whole run patched; the first patch winning.
+TEST(patches_are_read_over_a_lower_file) {
+    TmpDir t;
+    std::string Body(100000, 'a');
+    for (size_t I = 0; I < Body.size(); ++I) Body[I] = (char)('a' + I % 26);
+    writeFile(t / "disc.iso", Body);
+    writeStoreZip(t / "game.zip", { { "bin/game.exe", Body, false } });
+    LayerSpec F; F.type = LayerType::File; F.source = t.str("disc.iso"); F.target = "media";
+    Spec sp; sp.layers = { F, zipLayer(t.str("game.zip")) };
+    sp.patches = { bytePatch("media/disc.iso", 200, "ABCD"), bytePatch("media/disc.iso", 198, "XYZ"),   // over the start of one before
+                   bytePatch("media/disc.iso", 4095, "XYZ"), bytePatch("media/disc.iso", 4096, "Q"),
+                   bytePatch("/bin/game.exe", 99998, "!!"), bytePatch("bin/game.exe", 10, "#") };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    std::string Want = Body; Want.replace(4095, 3, "XQZ"); Want.replace(198, 6, "XYZBCD");
+    for (size_t Chunk : { (size_t)4096, (size_t)1000, (size_t)65536, (size_t)1 << 20 })
+        CHECK(readAll(S, "media/disc.iso", Chunk) == Want);
+    std::string WantExe = Body; WantExe[10] = '#'; WantExe.replace(99998, 2, "!!");
+    CHECK(readAll(S, "bin/game.exe", 777) == WantExe);
+    std::ifstream In(t / "disc.iso", std::ios::binary); std::stringstream Disk; Disk << In.rdbuf();
+    CHECK(Disk.str() == Body);
+    //A read the backend would hand the kernel from the file itself (splice) does not, where it holds a patch.
+    OpenFile *of = nullptr;
+    CHECK_EQ(VfsOpen(S, "media/disc.iso", 0, of), 0);
+    int Fd = -1; uint64_t Pos = 0; size_t Len = 0;
+    CHECK(!VfsReadFrom(of, 10, 4090, Fd, Pos, Len));
+    CHECK(VfsReadFrom(of, 10, 5000, Fd, Pos, Len));
+    CHECK(VfsReadFrom(of, 198, 0, Fd, Pos, Len));
+    CHECK(!VfsReadFrom(of, 199, 0, Fd, Pos, Len));
+    VfsRelease(of);
+    CHECK_EQ(VfsOpen(S, "bin/game.exe", 0, of), 0);
+    CHECK(!VfsReadFrom(of, 1, 10, Fd, Pos, Len));
+    CHECK(VfsReadFrom(of, 1, 11, Fd, Pos, Len));
+    VfsRelease(of);
+}
+
+// A copy-up of a patched file copies it as it was read, patches in — from a folder or an archive, made at a write
+// through a lazy handle or an open that writes — and is then read as it is. A file the writelayer already serves is
+// not patched. Teeth: a copy-up without the patches (the game's first write loses them); patches laid over the copy.
+TEST(patches_go_into_a_copy_up_and_not_over_a_writelayer_file) {
+    TmpDir t;
+    writeFile(t / "lower/a.bin", "0123456789");
+    writeFile(t / "lower/b.bin", "0123456789");
+    writeFile(t / "lower/c.bin", "0123456789");
+    writeFile(t / "lower/d.bin", "0123456789");
+    writeStoreZip(t / "z.zip", { { "z.bin", "0123456789", false } });
+    writeFile(t / "wl/c.bin", "abcdefghij");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { dirLayer(t.str("lower")), zipLayer(t.str("z.zip")) };
+    sp.patches = { bytePatch("a.bin", 2, "AB"), bytePatch("b.bin", 2, "AB"), bytePatch("c.bin", 2, "AB"), bytePatch("z.bin", 8, "ZZ"),
+                   bytePatch("d.bin", 5, "D") };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    OpenFile *of = nullptr;
+    CHECK_EQ(VfsOpen(S, "a.bin", 2 /*O_RDWR*/, of), 0);                 // lazy: the copy waits for the write
+    char B[16] = {0};
+    CHECK_EQ(VfsRead(of, B, 10, 0), (ssize_t)10);
+    CHECK_EQ(std::string(B, 10), std::string("01AB456789"));
+    CHECK(VfsWrite(S, of, "x", 1, 0) == 1);
+    CHECK_EQ(VfsRead(of, B, 10, 0), (ssize_t)10);
+    CHECK_EQ(std::string(B, 10), std::string("x1AB456789"));
+    VfsRelease(of);
+    CHECK_EQ(VfsOpen(S, "b.bin", 01001 /*O_WRONLY|O_TRUNC*/, of), 0);   // a rewrite: nothing to keep
+    VfsRelease(of);
+    CHECK_EQ(VfsOpen(S, "z.bin", 1 /*O_WRONLY*/, of), 0);               // an open that writes: copied up at the open
+    CHECK(VfsWrite(S, of, "y", 1, 0) == 1);
+    VfsRelease(of);
+    std::ifstream A(t / "wl/a.bin", std::ios::binary); std::stringstream AS; AS << A.rdbuf();
+    CHECK_EQ(AS.str(), std::string("x1AB456789"));
+    CHECK_EQ(readAll(S, "a.bin", 4), std::string("x1AB456789"));
+    CHECK_EQ(readAll(S, "b.bin", 4), std::string(""));
+    CHECK_EQ(readAll(S, "z.bin", 3), std::string("y1234567ZZ"));
+    CHECK_EQ(readAll(S, "c.bin", 4), std::string("abcdefghij"));
+    //A handle whose file was deleted under it writes a copy of its own: of what it read, patches in.
+    CHECK_EQ(VfsOpen(S, "d.bin", 2 /*O_RDWR*/, of), 0);
+    CHECK_EQ(VfsUnlink(S, "d.bin"), 0);
+    CHECK(VfsWrite(S, of, "w", 1, 0) == 1);
+    CHECK_EQ(VfsRead(of, B, 10, 0), (ssize_t)10);
+    CHECK_EQ(std::string(B, 10), std::string("w1234D6789"));
+    VfsRelease(of);
+}
+
+// Patch paths take the package's case where names match whatever their case; a malformed patch refuses the spec.
+TEST(patches_take_the_package_case_and_a_bad_one_refuses_the_spec) {
+    TmpDir t;
+    writeFile(t / "src/Data/Game.EXE", "0123456789");
+    writeStoreZip(t / "z.zip", { { "Bin/Tool.EXE", "0123456789", false } });
+    Spec sp; sp.caseInsensitive = true; sp.layers = { fixedDirLayer(t.str("src")), zipLayer(t.str("z.zip")) };
+    sp.patches = { bytePatch("data/game.exe", 0, "Z"), bytePatch("BIN/tool.exe", 9, "Y") };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK_EQ(readAll(S, "Data/Game.EXE", 4), std::string("Z123456789"));   // a folder's name, as the host spells it
+    CHECK_EQ(readAll(S, CanonicalCase(S, "bin/TOOL.exe"), 4), std::string("012345678Y"));
+    Spec Out;
+    std::string E;
+    CHECK(ParseSpecText(R"({"mountpoint":"/m","layers":[],"patches":[{"path":"a","at":3,"bytes":"0aFF"}]})", Out, E));
+    CHECK(Out.patches.size() == 1 && Out.patches[0].at == 3 && Out.patches[0].bytes == std::vector<uint8_t>({ 0x0a, 0xff }));
+    for (const char *Bad : { R"([{"path":"a","at":3,"bytes":"0"}])", R"([{"path":"a","at":3,"bytes":"zz"}])",
+                             R"([{"path":"","at":3,"bytes":"00"}])", R"([{"path":"a","at":-1,"bytes":"00"}])",
+                             R"([{"path":"a","bytes":"00"}])", R"({})" })
+    {
+        Spec X; std::string Why;
+        CHECK(!ParseSpecText(std::string(R"({"mountpoint":"/m","layers":[],"patches":)") + Bad + "}", X, Why));
+    }
+}
+
 // The listing says what each entry is: a zip's folders (implicit: no directory entries) list as folders, its files as
 // files. An untyped listing (DT_UNKNOWN) made Xenia, which walks a game folder by d_type, see no folders at all.
 TEST(a_typed_listing_says_which_entries_are_folders) {

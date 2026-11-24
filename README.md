@@ -82,6 +82,9 @@ vidyagodfs <spec.json> <mountpoint> [--watch-pid <pid>] [fuse opts...]
     { "type": "zip",   "source": "/…/game.zip",    "target": "drive_c/7804", "cid": "bafy…game", "rw": false },
     { "type": "delta", "source": "/…/1.20.2.vgdelta", "target": "drive_c/7804", "cid": "bafy…1202", "bases": ["bafy…game"] },
     { "type": "file",  "source": "/…/rom.sfc",     "target": "",             "rw": false }
+  ],
+  "patches": [
+    { "path": "media/game.iso", "at": 542052, "bytes": "07" }
   ]
 }
 ```
@@ -94,6 +97,11 @@ vidyagodfs <spec.json> <mountpoint> [--watch-pid <pid>] [fuse opts...]
 - **`writelayer`** — the writable copy-on-write branch, highest priority. Writes land here; the lower layers are never
   modified. `readonly: true` omits it (a fully read-only mount).
 - **`rw: true`** layers are durable passthroughs (persisted user state), unioned above the read-only content.
+- **`patches`** — bytes laid over a file a lower layer serves, at `at` (an offset in the file), as hex `bytes`; a later
+  patch wins on a byte two cover. Every read of the file gets them, and so does its copy when it is copied up into the
+  writelayer; the layer's own file is never written, and the cost is the patch's size, never the file's (a one-byte fix
+  to a disc image of gigabytes). A file the writelayer or an `rw` layer serves is read as it is. VidyaGod resolves a
+  package's binary patches against the files as this mount will serve them and hands it the bytes here.
 
 ## Source layout
 
