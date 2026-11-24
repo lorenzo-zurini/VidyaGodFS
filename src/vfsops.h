@@ -29,6 +29,15 @@
 struct OpenFile {
     HostIO::Fd fd  = -1;
     ZipReader *zip = nullptr;
+    //Opened over a lower copy on a writable mount — to read, or to read and write with the copy-up waiting for the first
+    //write or truncate: fd/zip read from below (never changed after the open) until the path is copied up, through
+    //this handle or any other; from then on the copy, held by the path's marker (pending->upper). The lower handles
+    //stay open until the release, so a read in flight never meets a closed descriptor. Null pending: an ordinary
+    //handle.
+    std::shared_ptr<VfsState::PendingCopy> pending;
+    VfsState                *state = nullptr;
+    std::string              vrel;
+    int                      flags = 0;
 };
 
 // Neutral file attributes (VfsGetattr output). The backend converts to struct stat (FUSE)
@@ -57,6 +66,12 @@ using TypedDirFiller = std::function<void(const std::string &name, const VfsAttr
 int     VfsReaddirTyped(VfsState &S, const std::string &vrel, const TypedDirFiller &fill);
 int     VfsOpen    (VfsState &S, const std::string &vrel, int flags, OpenFile *&out);          // out=nullptr → dir (no handle), returns 0
 int     VfsCreate  (VfsState &S, const std::string &vrel, uint32_t mode, int flags, OpenFile *&out);
+// Where a read's bytes lie in a host file, when they lie in one as stored (a plain file; a STORED member of an archive
+// read straight from its file): the backend hands the kernel that file and offset (splice) instead of copying them
+// through a buffer. False otherwise (a delta's view, a compressed member): then VfsRead.
+long long DebugLazyOpens();    // TEST ONLY: files opened for writing whose copy-up waits for a change
+long long DebugLazyCopies();   // TEST ONLY: of those, copied up at their first change
+bool    VfsReadFrom(OpenFile *of, size_t size, uint64_t off, int &fd, uint64_t &pos, size_t &len);
 ssize_t VfsRead    (OpenFile *of, void *buf, size_t size, uint64_t off);                        // bytes read (>=0) or -errno
 ssize_t VfsWrite   (VfsState &S, OpenFile *of, const void *buf, size_t size, uint64_t off);
 void    VfsRelease (OpenFile *of);                                                              // closes fd / frees reader / deletes handle

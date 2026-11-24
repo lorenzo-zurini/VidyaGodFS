@@ -51,6 +51,9 @@ extern const ZipEntry kNoZipTarget;
 //Indexes every entry of the zip served by `Src` (synthesizing missing parent dirs). `Name` is used only for
 //diagnostics. nullptr on failure.
 std::shared_ptr<ZipIndex> BuildZipIndex(std::shared_ptr<ByteSource> Src, const std::string &Name);
+//The same through libzip's own reading of the archive: what BuildZipIndex falls back to for an archive whose central
+//directory its walk cannot follow.
+std::shared_ptr<ZipIndex> BuildZipIndexLibzip(std::shared_ptr<ByteSource> Src, const std::string &Name);
 
 //Per-open reader for a STORED entry — serves reads via `src->pread` (the shared ZipIndex::src, borrowed —
 //NOT owned). There is no materialization (no memory buffer, no temp file).

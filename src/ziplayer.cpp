@@ -78,7 +78,50 @@ static void RegisterParents(ZipIndex &Z, const std::string &vrel)
     }
 }
 
+//The index from one walk of the central directory (zipscan::WalkCentralDirFull): what libzip's open read one member at
+//a time (two small reads each — through a delta's view a lookup of its runs each), then the offsets walked again. Null
+//when the directory cannot be walked: libzip has its go at it then.
+static std::shared_ptr<ZipIndex> IndexFromDirectory(std::shared_ptr<ByteSource> Src, const std::string &Name)
+{
+    auto Z = std::make_shared<ZipIndex>();
+    Z->archivePath = Name;
+    Z->src = Src;
+    const bool Walked = zipscan::WalkCentralDirFull(*Src, [&](const zipscan::CdEntry &C) {
+        const std::string &raw = C.utf8Name;
+        const bool isDir = !raw.empty() && raw.back() == '/';
+        const std::string vrel = NormalizeVPath(raw);
+        if (vrel.empty()) return true;                      // a root entry
+        ZipEntry e; e.name = vrel; e.index = C.index; e.isDir = isDir; e.mtime = C.mtime;
+        if (isDir)
+        {
+            Z->byName[vrel] = e;
+            Z->dirChildren.try_emplace(vrel);
+        }
+        else
+        {
+            e.size = C.uncompSize;
+            // Unix symlink: S_IFLNK in the high 16 bits of the external attributes, made on Unix (3).
+            e.symlink = (C.madeBy >> 8) == 3 && (((C.extAttr >> 16) & 0170000u) == 0120000u);
+            // STORED + unencrypted (no encryption bit, not AES) → served zero-copy from its local header on.
+            if (C.method == 0 && !(C.flags & 0x1))
+            { e.stored = true; e.localHeader = C.lhOffset; }
+            Z->byName[vrel] = e;
+        }
+        RegisterParents(*Z, vrel);
+        return true;
+    });
+    if (!Walked) return nullptr;
+    return Z;
+}
+
 std::shared_ptr<ZipIndex> BuildZipIndex(std::shared_ptr<ByteSource> Src, const std::string &Name)
+{
+    if (!Src) return nullptr;
+    if (auto Z = IndexFromDirectory(Src, Name)) return Z;
+    return BuildZipIndexLibzip(std::move(Src), Name);
+}
+
+std::shared_ptr<ZipIndex> BuildZipIndexLibzip(std::shared_ptr<ByteSource> Src, const std::string &Name)
 {
     if (!Src) return nullptr;
 
@@ -92,9 +135,11 @@ std::shared_ptr<ZipIndex> BuildZipIndex(std::shared_ptr<ByteSource> Src, const s
     if (!za)
     {
         std::cerr << "[vidyagodfs] zip_open failed for " << Name << " (" << zip_error_strerror(&ze) << ")\n";
+        zip_error_fini(&ze);   // its message was made for the line above
         zip_source_free(zs);   // invokes ZIP_SOURCE_FREE → deletes ud
         return nullptr;
     }
+    zip_error_fini(&ze);
 
     auto Z = std::make_shared<ZipIndex>();
     Z->archivePath = Name;

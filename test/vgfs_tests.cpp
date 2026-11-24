@@ -3,7 +3,10 @@
 // directly, VfsState::Init, then drive Resolve / CollectChildren / the VfsOps surface. No mounting, no
 // HostIO mocking — the POSIX shim is exercised for real. Fixtures are torn down per test.
 
+#include <random>
+#include <thread>
 #include "overlay.h"
+#include "hostio.h"
 #include "treeplan.h"
 #include "vfsops.h"
 #include "layerspec.h"
@@ -87,6 +90,10 @@ static LayerSpec zipLayer(const std::string &src, const std::string &target = ""
 }
 static LayerSpec dirLayer(const std::string &src, const std::string &target = "", bool rw = false) {
     LayerSpec L; L.type = LayerType::Dir; L.source = src; L.target = NormalizeVPath(target); L.rw = rw; return L;
+}
+// A folder layer whose source does not change while mounted (package content, DefaultData): answered from a listing.
+static LayerSpec fixedDirLayer(const std::string &src, const std::string &target = "") {
+    LayerSpec L = dirLayer(src, target); L.fixed = true; return L;
 }
 
 static std::set<std::string> readdirNames(VfsState &S, const std::string &vrel) {
@@ -216,6 +223,26 @@ TEST(case_insensitive_names_take_the_package_case) {
     Spec cs = sp; cs.caseInsensitive = false;   // Linux: names as spelled
     VfsState C; CHECK(C.Init(cs, err));
     CHECK_EQ(CanonicalCase(C, "DRIVE_C/749/AGE2_X1/DATA/GRAPHICS.DRS"), std::string("DRIVE_C/749/AGE2_X1/DATA/GRAPHICS.DRS"));
+}
+
+// Submounts of one archive, case-insensitive: each spells what lies under its own subpath, walked from there — not the
+// whole archive looked over once per submount. Teeth: look over every member for each submount (the walks grow with
+// the archive, not with what each submount holds).
+TEST(case_names_of_a_submount_come_from_its_own_subtree) {
+    TmpDir t;
+    std::vector<std::tuple<std::string, std::string, bool>> es = { { "Bin/Game.EXE", "g", false }, { "Docs/Read.ME", "r", false } };
+    for (int I = 0; I < 500; ++I) es.push_back({ "Other/f" + std::to_string(I) + ".dat", "o", false });
+    writeStoreZip(t / "pak.zip", es);
+    LayerSpec L = zipLayer(t.str("pak.zip"), "");
+    L.submounts = { { "Bin", "g/bin" }, { "Docs", "manual" } };
+    Spec sp; sp.readOnly = true; sp.caseInsensitive = true; sp.layers = { L };
+    const long long Before = DebugCaseWalks();
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK(DebugCaseWalks() - Before < 10);
+    CHECK_EQ(CanonicalCase(S, "G/BIN/GAME.exe"), std::string("g/bin/Game.EXE"));
+    CHECK_EQ(CanonicalCase(S, "MANUAL/read.me"), std::string("manual/Read.ME"));
+    VfsAttr a;
+    CHECK_EQ(VfsGetattr(S, CanonicalCase(S, "g/BIN/game.exe"), a), 0);
 }
 
 TEST(two_zip_layers_upper_masks) {
@@ -399,6 +426,82 @@ TEST(bug_opaque_readdir_subset_getattr) {
     checkReaddirSubsetGetattr(S, "");
 }
 
+// A mount over a kept folder (saves, mods: thousands of files) learns its deletion markers from one listing of it,
+// typed by the listing: a stat per entry to learn whether it was a folder made a large kept folder seconds of stats
+// at every mount. A marker deep inside is still found. Teeth: stat every entry again (hundreds of stats).
+TEST(a_kept_folder_is_seeded_without_a_stat_per_entry) {
+    TmpDir t;
+    for (int I = 0; I < 300; ++I) writeFile(t / ("saves/s" + std::to_string(I) + ".sav"), "x");
+    writeFile(t / "saves/deep/er/.wh.gone.sav", "");
+    writeFile(t / "base/deep/er/gone.sav", "old");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl");
+    sp.layers = { dirLayer(t.str("base")), dirLayer(t.str("saves"), "", true) };
+    const long long Before = HostIO::DebugLstats();
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK(HostIO::DebugLstats() - Before < 50);
+    VfsAttr a;
+    CHECK_EQ(VfsGetattr(S, "deep/er/gone.sav", a), -ENOENT);   // the marker deep inside was seen
+    CHECK_EQ(VfsGetattr(S, "s7.sav", a), 0);
+}
+
+// A small read-only folder layer above the content (DefaultData: the package's edits) is listed at the mount: a name
+// it does not hold is passed by without a stat of the host — every lookup in the mount stat'd it. What it holds is
+// served; one holding a link is not listed (a path through a linked folder cannot be known without the host).
+// Teeth: stat it at every lookup (a stat per miss); list one with a link (the path through it is lost).
+TEST(a_small_read_only_folder_layer_is_passed_by_without_a_stat) {
+    TmpDir t;
+    std::vector<std::tuple<std::string, std::string, bool>> es;
+    for (int I = 0; I < 50; ++I) es.push_back({ "game/f" + std::to_string(I) + ".dat", "z", false });
+    writeStoreZip(t / "game.zip", es);
+    writeFile(t / "dd/game/settings.ini", "edited");
+    fs::create_directories(t / "real/sub");
+    writeFile(t / "real/sub/x.txt", "x");
+    std::error_code ec;
+    fs::create_directories(t / "linked", ec);
+    fs::create_symlink(t / "real/sub", t / "linked/sub", ec);
+    Spec sp; sp.readOnly = true; sp.layers = { zipLayer(t.str("game.zip")), fixedDirLayer(t.str("dd")), fixedDirLayer(t.str("linked")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    VfsAttr a;
+    const long long Before = HostIO::DebugLstats();
+    for (int I = 0; I < 50; ++I) CHECK_EQ(VfsGetattr(S, "game/f" + std::to_string(I) + ".dat", a), 0);
+    const long long Stats = HostIO::DebugLstats() - Before;
+    CHECK(Stats < 60);                                              // the linked layer's stat each; none for DefaultData
+    CHECK_EQ(VfsGetattr(S, "game/settings.ini", a), 0);
+    CHECK_EQ(a.size, (uint64_t)6);
+    CHECK_EQ(VfsGetattr(S, "sub/x.txt", a), 0);                     // through the link: found on the host
+}
+
+// Only a folder layer the spec says is fixed is answered from a listing: one another mount fills, or the user's, finds
+// a file put there after the mount. A fixed one with a folder it cannot list, or (folded) a name past ASCII, asks the
+// host. Listing it stats only what its listing does not type. Teeth: list every read-only folder layer; take a folder
+// it cannot read for empty; list a folded non-ASCII name; stat every regular file while listing.
+TEST(only_a_fixed_folder_layer_is_answered_from_a_listing) {
+    TmpDir t;
+    fs::create_directories(t / "late");
+    for (int I = 0; I < 100; ++I) writeFile(t / ("fixed/f" + std::to_string(I)), "x");
+    writeFile(t / "shut/d/in.txt", "in");
+    writeFile(t / "wide/\xc3\x9c.txt", "u");
+    const long long ListStats = HostIO::DebugLstats();
+    Spec sp; sp.readOnly = true;
+    sp.layers = { dirLayer(t.str("late")), fixedDirLayer(t.str("fixed")), fixedDirLayer(t.str("shut"), "s") };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK(HostIO::DebugLstats() - ListStats < 20);                  // 100 typed files listed without a stat each
+    writeFile(t / "late/new.txt", "new");                            // filled after the mount
+    VfsAttr a;
+    CHECK_EQ(VfsGetattr(S, "new.txt", a), 0);
+    // A folder that cannot be listed: its files are still found (the host is asked).
+    fs::permissions(t / "shut/d", fs::perms::owner_exec);
+    VfsState S2; CHECK(S2.Init(sp, err));
+    CHECK_EQ(VfsGetattr(S2, "s/d/in.txt", a), 0);
+    fs::permissions(t / "shut/d", fs::perms::owner_all);
+    // Folded, a name past ASCII: not listed (a miss asks the host, which matches what FoldCase cannot).
+    Spec sw; sw.readOnly = true; sw.caseInsensitive = true; sw.layers = { fixedDirLayer(t.str("wide")) };
+    VfsState S3; CHECK(S3.Init(sw, err));
+    const long long Miss = HostIO::DebugLstats();
+    CHECK(VfsGetattr(S3, "nothing.txt", a) != 0);
+    CHECK(HostIO::DebugLstats() - Miss >= 1);
+}
+
 // Bug #2 (SECURITY): a dir-layer symlink pointing at an absolute host path outside the layer source must
 // NOT serve that host file (flatten must not escape the layer). rw layers stay exempt.
 TEST(bug_dirlayer_symlink_host_escape) {
@@ -432,6 +535,334 @@ TEST(bug_dirsymlink_copyup_as_dir) {
     int e = VfsMkdir(S, "link/newsub", 0755);
     CHECK_EQ(e, 0);
     CHECK(fs::is_directory(t / "wl/link"));               // copy-up produced a directory, not a file
+}
+
+// An installer deleting thousands of a package's files: each stays deleted, one made again shows, and the deletion
+// mask is copied whole only now and then — not at every delete (10,000 deletes were 50 M string copies). Teeth: fold
+// at every change (as many folds as deletes); lose the changes at a fold (a deleted file comes back).
+TEST(many_deletes_keep_their_mask_small_to_change) {
+    TmpDir t;
+    std::vector<std::tuple<std::string, std::string, bool>> es;
+    for (int I = 0; I < 3000; ++I) es.push_back({ "data/f" + std::to_string(I) + ".bin", "x", false });
+    writeStoreZip(t / "base.zip", es);
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl");
+    LayerSpec Z; Z.type = LayerType::Zip; Z.source = t.str("base.zip"); Z.target = "";
+    sp.layers = { Z };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    const long long Folds = DebugMaskFolds();
+    int Gone = 0;
+    for (int I = 0; I < 3000; ++I) Gone += VfsUnlink(S, "data/f" + std::to_string(I) + ".bin") == 0;
+    CHECK_EQ(Gone, 3000);
+    CHECK(DebugMaskFolds() - Folds < 30);
+    VfsAttr a;
+    int Hidden = 0;
+    for (int I = 0; I < 3000; ++I) Hidden += VfsGetattr(S, "data/f" + std::to_string(I) + ".bin", a) == -ENOENT;
+    CHECK_EQ(Hidden, 3000);
+    OpenFile *of = nullptr;
+    CHECK_EQ(VfsCreate(S, "data/f1234.bin", 0644, O_WRONLY, of), 0);   // made again: shows
+    if (of) VfsRelease(of);
+    CHECK_EQ(VfsGetattr(S, "data/f1234.bin", a), 0);
+    CHECK_EQ(VfsGetattr(S, "data/f1235.bin", a), -ENOENT);
+}
+
+// A file opened to read and write is copied up at its first change, not at the open: old games open their data files
+// read-write and never write them (each open copied gigabytes into the writelayer, every launch). Every handle on it
+// reads the change once one is made; a truncate by path counts as one; a file deleted while open is not brought back
+// by a write. Teeth: copy at the open again (a copy with nothing written); a second handle that keeps reading below
+// (it misses the first one's write); a truncate by path not seen by an open handle.
+TEST(a_file_opened_to_read_and_write_is_copied_only_when_changed) {
+    TmpDir t;
+    writeStoreZip(t / "base.zip", { { "data/big.dat", "0123456789", false }, { "data/gone.dat", "bye", false } });
+    writeFile(t / "host/cfg.ini", "a=1");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl");
+    sp.layers = { zipLayer(t.str("base.zip")), dirLayer(t.str("host")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    const long long Opens = DebugLazyOpens(), Copies = DebugLazyCopies();
+    OpenFile *A = nullptr, *B = nullptr;
+    CHECK_EQ(VfsOpen(S, "data/big.dat", O_RDWR, A), 0);
+    CHECK_EQ(VfsOpen(S, "data/big.dat", O_RDWR, B), 0);
+    CHECK(!fs::exists(t / "wl/data/big.dat"));                        // opened, nothing copied
+    char buf[16] = {0};
+    CHECK_EQ(VfsRead(A, buf, 10, 0), (ssize_t)10);
+    CHECK_EQ(std::string(buf, 10), std::string("0123456789"));
+    CHECK_EQ(VfsWrite(S, A, "AB", 2, 0), (ssize_t)2);                   // the first change: copied now
+    CHECK(fs::exists(t / "wl/data/big.dat"));
+    CHECK_EQ(VfsRead(B, buf, 10, 0), (ssize_t)10);                      // the other handle reads the change
+    CHECK_EQ(std::string(buf, 10), std::string("AB23456789"));
+    CHECK_EQ(DebugLazyOpens() - Opens, 2LL);
+    CHECK_EQ(DebugLazyCopies() - Copies, 1LL);
+    VfsRelease(A); VfsRelease(B);
+    // Opened and closed without a change: no copy.
+    OpenFile *C = nullptr;
+    CHECK_EQ(VfsOpen(S, "cfg.ini", O_RDWR, C), 0);
+    CHECK_EQ(VfsRead(C, buf, 3, 0), (ssize_t)3);
+    VfsRelease(C);
+    CHECK(!fs::exists(t / "wl/cfg.ini"));
+    // A truncate by path is a change every open handle sees.
+    OpenFile *D = nullptr;
+    CHECK_EQ(VfsOpen(S, "cfg.ini", O_RDWR, D), 0);
+    CHECK_EQ(VfsTruncate(S, "cfg.ini", nullptr, 1), 0);
+    CHECK_EQ(VfsRead(D, buf, 3, 0), (ssize_t)1);
+    CHECK_EQ(VfsTruncate(S, "cfg.ini", D, 0), 0);                     // and one through the handle
+    VfsAttr a;
+    CHECK_EQ(VfsGetattr(S, "cfg.ini", a), 0);
+    CHECK_EQ(a.size, (uint64_t)0);
+    VfsRelease(D);
+    // Deleted while open: a write goes to the handle's own file (POSIX: an unlinked file stays writable through its
+    // handles) and does not bring it back, nor leave anything in the writelayer.
+    OpenFile *E = nullptr;
+    CHECK_EQ(VfsOpen(S, "data/gone.dat", O_RDWR, E), 0);
+    CHECK_EQ(VfsUnlink(S, "data/gone.dat"), 0);
+    CHECK_EQ(VfsWrite(S, E, "x", 1, 0), (ssize_t)1);
+    CHECK_EQ(VfsRead(E, buf, 3, 0), (ssize_t)3);
+    CHECK_EQ(std::string(buf, 3), std::string("xye"));
+    CHECK_EQ(VfsGetattr(S, "data/gone.dat", a), -ENOENT);
+    VfsRelease(E);
+    for (const auto &e : fs::recursive_directory_iterator(t / "wl"))
+        CHECK(e.path().filename().string().rfind(".wh..vgfs-copy.", 0) != 0);
+}
+
+// A handle opened to read a lower file follows its copy-up: a write through a lazy handle (or a truncating open)
+// copies the file up, and what every reader reads from then on is the copy. Left on the lower file, a reader read the
+// file as it was before (a game reading back its own saved settings got the old ones). Teeth: no marker for read-only
+// opens; a marker that is told of the copy but not opened into.
+TEST(a_reader_reads_what_a_lazy_writer_wrote) {
+    TmpDir t;
+    writeStoreZip(t / "base.zip", { { "z.dat", "zzzzzzzzzz", false } });
+    writeFile(t / "host/cfg.ini", "a=1");
+    writeFile(t / "host/t.ini", "long text");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl");
+    sp.layers = { zipLayer(t.str("base.zip")), dirLayer(t.str("host")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    char buf[16] = {0};
+    for (const char *P : { "cfg.ini", "z.dat" })
+    {
+        OpenFile *W = nullptr, *R = nullptr;
+        CHECK_EQ(VfsOpen(S, P, O_RDWR, W), 0);
+        CHECK_EQ(VfsOpen(S, P, O_RDONLY, R), 0);
+        CHECK_EQ(VfsWrite(S, W, "XY", 2, 0), (ssize_t)2);
+        CHECK_EQ(VfsRead(R, buf, 2, 0), (ssize_t)2);
+        CHECK_EQ(std::string(buf, 2), std::string("XY"));
+        int fd = -1; uint64_t pos = 0; size_t len = 0;                     // the splice path reads the copy too
+        CHECK(VfsReadFrom(R, 2, 0, fd, pos, len));
+        CHECK_EQ(pread(fd, buf, 2, (off_t)pos), (ssize_t)2);
+        CHECK_EQ(std::string(buf, 2), std::string("XY"));
+        CHECK(VfsWrite(S, R, "Q", 1, 0) < 0);                              // opened to read: never written through
+        VfsRelease(W); VfsRelease(R);
+    }
+    // A truncating open copies up too: an older reader sees it.
+    OpenFile *R = nullptr, *T = nullptr;
+    CHECK_EQ(VfsOpen(S, "t.ini", O_RDONLY, R), 0);
+    CHECK_EQ(VfsOpen(S, "t.ini", O_WRONLY | O_TRUNC, T), 0);
+    CHECK_EQ(VfsRead(R, buf, 9, 0), (ssize_t)0);
+    VfsRelease(R); VfsRelease(T);
+}
+
+// A lazy handle whose name changes before its first write writes the file it was opened on, wherever that is now —
+// never what the name names since. Renamed: the moved file (the rename copied it up, the handle holds the copy).
+// Replaced by another file, or deleted and made again: a copy of its own, the name left as it is. Teeth: look the
+// copy up by its path at the write (each case writes into the file at the name); keep a marker on a replaced name;
+// keep one on a name made again (deleted first, or not).
+TEST(a_lazy_writer_writes_its_own_file_after_its_name_changes) {
+    TmpDir t;
+    writeFile(t / "host/f.dat", "old-f");
+    writeFile(t / "host/r.dat", "old-r");
+    writeFile(t / "host/u.dat", "old-u");
+    writeFile(t / "host/c.dat", "old-c");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { dirLayer(t.str("host")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    auto Read = [&](const char *P) {
+        OpenFile *H = nullptr; char b[32] = {0};
+        if (VfsOpen(S, P, O_RDONLY, H) != 0) return std::string("(none)");
+        const ssize_t n = VfsRead(H, b, sizeof b, 0); VfsRelease(H);
+        return std::string(b, n > 0 ? (size_t)n : 0);
+    };
+    auto Make = [&](const char *P, const char *Text) {
+        OpenFile *H = nullptr;
+        CHECK_EQ(VfsCreate(S, P, 0644, O_WRONLY | O_TRUNC, H), 0);
+        CHECK_EQ(VfsWrite(S, H, Text, std::strlen(Text), 0), (ssize_t)std::strlen(Text));
+        VfsRelease(H);
+    };
+    char buf[16] = {0};
+    // Renamed, and a new file made at its old name.
+    OpenFile *A = nullptr;
+    CHECK_EQ(VfsOpen(S, "f.dat", O_RDWR, A), 0);
+    CHECK_EQ(VfsRename(S, "f.dat", "g.dat"), 0);
+    Make("f.dat", "NEW-f");
+    CHECK_EQ(VfsWrite(S, A, "Z", 1, 0), (ssize_t)1);
+    CHECK_EQ(Read("g.dat"), std::string("Zld-f"));
+    CHECK_EQ(Read("f.dat"), std::string("NEW-f"));
+    VfsRelease(A);
+    // Replaced by a rename over it.
+    OpenFile *B = nullptr;
+    CHECK_EQ(VfsOpen(S, "r.dat", O_RDWR, B), 0);
+    Make("other.dat", "OTHER");
+    CHECK_EQ(VfsRename(S, "other.dat", "r.dat"), 0);
+    CHECK_EQ(VfsWrite(S, B, "Z", 1, 0), (ssize_t)1);
+    CHECK_EQ(Read("r.dat"), std::string("OTHER"));
+    CHECK_EQ(VfsRead(B, buf, 5, 0), (ssize_t)5);
+    CHECK_EQ(std::string(buf, 5), std::string("Zld-r"));                 // it reads its own change
+    VfsRelease(B);
+    // Deleted and made again.
+    OpenFile *C = nullptr;
+    CHECK_EQ(VfsOpen(S, "u.dat", O_RDWR, C), 0);
+    CHECK_EQ(VfsUnlink(S, "u.dat"), 0);
+    Make("u.dat", "NEW-u");
+    CHECK_EQ(VfsWrite(S, C, "Z", 1, 0), (ssize_t)1);
+    CHECK_EQ(Read("u.dat"), std::string("NEW-u"));
+    VfsRelease(C);
+    // Made again over it, with no delete first (a create the kernel sends on a name it last saw missing).
+    OpenFile *D = nullptr;
+    CHECK_EQ(VfsOpen(S, "c.dat", O_RDWR, D), 0);
+    Make("c.dat", "NEW-c");
+    CHECK_EQ(VfsWrite(S, D, "Z", 1, 0), (ssize_t)1);
+    CHECK_EQ(Read("c.dat"), std::string("NEW-c"));
+    VfsRelease(D);
+}
+
+// A name changed in the windows where a handle is between looking and acting — a copy-up being written, an open between
+// resolving its name and taking its marker — never makes a write land in the file the name holds now: an atomic save
+// (written beside, renamed over) during a lazy writer's first copy stays as saved; one landing while a handle opens
+// is not the handle's file either; a name deleted then is written to the handle's own copy. Teeth: the copy-up
+// renamed over what is at the name; an open's marker taken without looking whether its name changed.
+TEST(a_name_changed_while_a_handle_acts_keeps_what_it_names) {
+    for (const char *Window : { "copy-before-rename", "open-before-marker", "open-before-marker:unlink" })
+    {
+        TmpDir t;
+        writeFile(t / "host/save.dat", "OLDSAVE");
+        Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { dirLayer(t.str("host")) };
+        VfsState S; std::string err; CHECK(S.Init(sp, err));
+        const std::string W = Window;
+        const bool Unlink = W.find(":unlink") != std::string::npos;
+        const std::string Point = W.substr(0, W.find(':'));
+        bool Fired = false;
+        S.debugHook = [&](const char *At) {
+            if (Fired || Point != At) return;
+            Fired = true;
+            if (Unlink) { CHECK_EQ(VfsUnlink(S, "save.dat"), 0); return; }
+            OpenFile *T = nullptr;
+            CHECK_EQ(VfsCreate(S, "save.tmp", 0644, O_WRONLY | O_TRUNC, T), 0);
+            CHECK_EQ(VfsWrite(S, T, "NEWSAVE", 7, 0), (ssize_t)7);
+            VfsRelease(T);
+            CHECK_EQ(VfsRename(S, "save.tmp", "save.dat"), 0);
+        };
+        OpenFile *A = nullptr;
+        CHECK_EQ(VfsOpen(S, "save.dat", O_RDWR, A), 0);
+        if (!A) continue;
+        CHECK_EQ(VfsWrite(S, A, "Z", 1, 0), (ssize_t)1);
+        CHECK(Fired);
+        char b[16] = {0};
+        CHECK_EQ(VfsRead(A, b, 7, 0), (ssize_t)7);
+        CHECK_EQ(std::string(b, 7), std::string("ZLDSAVE"));            // its own file, changed
+        S.debugHook = nullptr;
+        OpenFile *R = nullptr;
+        if (Unlink) { VfsAttr a; CHECK_EQ(VfsGetattr(S, "save.dat", a), -ENOENT); }
+        else
+        {
+            CHECK_EQ(VfsOpen(S, "save.dat", O_RDONLY, R), 0);
+            char c[16] = {0};
+            if (R) CHECK_EQ(VfsRead(R, c, 7, 0), (ssize_t)7);
+            CHECK_EQ(std::string(c, 7), std::string("NEWSAVE"));        // the save, as saved
+            if (R) VfsRelease(R);
+        }
+        VfsRelease(A);
+    }
+}
+
+// A lazy writer's first write while a save is renamed over its name (the rename done, its markers not off yet) waits
+// for the change and writes its own copy — never the file renamed in. Teeth: adopt a copy found at the name while a
+// name change runs.
+TEST(a_first_write_during_a_rename_over_its_name_writes_its_own_copy) {
+    TmpDir t;
+    writeFile(t / "host/save.dat", "OLDSAVE");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { dirLayer(t.str("host")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    OpenFile *A = nullptr;
+    CHECK_EQ(VfsOpen(S, "save.dat", O_RDWR, A), 0);
+    if (!A) return;
+    OpenFile *T = nullptr;
+    CHECK_EQ(VfsCreate(S, "save.tmp", 0644, O_WRONLY | O_TRUNC, T), 0);
+    CHECK_EQ(VfsWrite(S, T, "NEWSAVE", 7, 0), (ssize_t)7);
+    VfsRelease(T);
+    std::thread Writer;
+    std::atomic<ssize_t> Wrote{ -100 };
+    S.debugHook = [&](const char *At) {
+        if (std::string(At) != "rename-before-detach" || Writer.joinable()) return;
+        Writer = std::thread([&] { Wrote = VfsWrite(S, A, "Z", 1, 0); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    };
+    CHECK_EQ(VfsRename(S, "save.tmp", "save.dat"), 0);
+    if (Writer.joinable()) Writer.join();
+    S.debugHook = nullptr;
+    CHECK_EQ(Wrote.load(), (ssize_t)1);
+    char b[16] = {0};
+    OpenFile *R = nullptr;
+    CHECK_EQ(VfsOpen(S, "save.dat", O_RDONLY, R), 0);
+    if (R) { CHECK_EQ(VfsRead(R, b, 7, 0), (ssize_t)7); VfsRelease(R); }
+    CHECK_EQ(std::string(b, 7), std::string("NEWSAVE"));
+    CHECK_EQ(VfsRead(A, b, 7, 0), (ssize_t)7);
+    CHECK_EQ(std::string(b, 7), std::string("ZLDSAVE"));
+    VfsRelease(A);
+}
+
+// A folder renamed while a lazy handle under it has not written yet: its first write lands in the moved file, a file
+// made at the old place is left alone. Teeth: a folder rename that does not copy its files up before moving them.
+TEST(a_lazy_writer_under_a_renamed_folder_writes_the_moved_file) {
+    TmpDir t;
+    writeFile(t / "host/D/x.dat", "old-x");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { dirLayer(t.str("host")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    OpenFile *A = nullptr;
+    CHECK_EQ(VfsOpen(S, "D/x.dat", O_RDWR, A), 0);
+    if (!A) return;
+    CHECK_EQ(VfsRename(S, "D", "E"), 0);
+    CHECK_EQ(VfsMkdir(S, "D", 0755), 0);
+    OpenFile *N = nullptr;
+    CHECK_EQ(VfsCreate(S, "D/x.dat", 0644, O_WRONLY | O_TRUNC, N), 0);
+    CHECK_EQ(VfsWrite(S, N, "NEW-x", 5, 0), (ssize_t)5);
+    VfsRelease(N);
+    CHECK_EQ(VfsWrite(S, A, "Z", 1, 0), (ssize_t)1);
+    VfsRelease(A);
+    auto Read = [&](const char *P) {
+        OpenFile *H = nullptr; char b[16] = {0};
+        if (VfsOpen(S, P, O_RDONLY, H) != 0) return std::string("(none)");
+        const ssize_t n = VfsRead(H, b, sizeof b, 0); VfsRelease(H);
+        return std::string(b, n > 0 ? (size_t)n : 0);
+    };
+    CHECK_EQ(Read("E/x.dat"), std::string("Zld-x"));
+    CHECK_EQ(Read("D/x.dat"), std::string("NEW-x"));
+}
+
+// A copy-up is written under a name no listing shows and renamed to its own when whole; one a crash left behind in a
+// kept writelayer is removed at the next mount, never shown and never taken for a deletion marker. Teeth: write the
+// copy in place (a crash leaves a cut-short file under the file's name); keep leftovers.
+TEST(a_copy_up_cut_short_is_never_the_file) {
+    TmpDir t;
+    writeFile(t / "host/d/big.dat", std::string(32 << 20, 'b'));
+    writeFile(t / "wl/d/.wh..vgfs-copy.7", "half");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { dirLayer(t.str("host")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK(!fs::exists(t / "wl/d/.wh..vgfs-copy.7"));
+    VfsAttr a;
+    CHECK_EQ(VfsGetattr(S, "d/.vgfs-copy.7", a), -ENOENT);
+    CHECK(!readdirNames(S, "d").count(".wh..vgfs-copy.7"));
+    // While a copy is written, the file's own name in the writelayer is not there: a reader resolving it meanwhile
+    // reads the lower file, never a part of the copy.
+    std::atomic<bool> Done{false}, SawPart{false};
+    std::thread Watch([&] {
+        while (!Done) {
+            std::error_code ec;
+            const auto n = fs::file_size(t / "wl/d/big.dat", ec);
+            if (!ec && n != (uintmax_t)(32 << 20)) SawPart = true;
+        }
+    });
+    OpenFile *W = nullptr;
+    CHECK_EQ(VfsOpen(S, "d/big.dat", O_RDWR, W), 0);
+    CHECK_EQ(VfsWrite(S, W, "X", 1, 0), (ssize_t)1);
+    Done = true; Watch.join();
+    CHECK(!SawPart.load());
+    CHECK_EQ(fs::file_size(t / "wl/d/big.dat"), (uintmax_t)(32 << 20));
+    VfsRelease(W);
 }
 
 // Bug #8: VfsUnlink of a lower-backed file must persist as a whiteout and getattr must then be ENOENT.
@@ -1365,6 +1796,47 @@ TEST(a_member_whose_local_header_is_damaged_does_not_open) {
     CHECK_EQ(OpenZipEntry(*Z, Z->byName.at("ok.txt"), R), 0);
 }
 
+// A stored member read by handing over its archive's file (the splice path, VfsReadFrom) is handed at its own bytes:
+// the member's data offset plus the read's, cut at the member's end. Teeth: hand the read's offset alone; do not cut
+// at the member's end (the next member's header is read as content).
+TEST(a_stored_member_is_handed_over_at_its_own_bytes) {
+    TmpDir t;
+    writeStoreZip(t / "a.zip", { { "first.txt", "AAAAAAAA", false }, { "m.txt", "0123456789", false }, { "z.txt", "ZZZ", false } });
+    Spec sp; sp.readOnly = true; sp.layers = { zipLayer(t.str("a.zip")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    OpenFile *H = nullptr;
+    CHECK_EQ(VfsOpen(S, "m.txt", O_RDONLY, H), 0);
+    if (!H) return;
+    int fd = -1; uint64_t pos = 0; size_t len = 0;
+    CHECK(VfsReadFrom(H, 4, 3, fd, pos, len));
+    char b[16] = {0};
+    CHECK_EQ(len, (size_t)4);
+    CHECK_EQ(pread(fd, b, len, (off_t)pos), (ssize_t)4);
+    CHECK_EQ(std::string(b, 4), std::string("3456"));
+    CHECK(VfsReadFrom(H, 16, 8, fd, pos, len));                      // past the end: only what is left
+    CHECK_EQ(len, (size_t)2);
+    CHECK_EQ(pread(fd, b, len, (off_t)pos), (ssize_t)2);
+    CHECK_EQ(std::string(b, 2), std::string("89"));
+    VfsRelease(H);
+}
+
+// An archive whose end record counts fewer members than its directory holds is not indexed from that count: the walk
+// served two of three and c.txt was missing, unseen (libzip refuses the archive). Teeth: trust the count.
+TEST(an_archive_counting_fewer_members_than_it_holds_is_not_walked_short) {
+    TmpDir t;
+    writeStoreZip(t / "a.zip", { { "a.txt", "a", false }, { "b.txt", "b", false }, { "c.txt", "c", false } });
+    std::ifstream f(t / "a.zip", std::ios::binary);
+    std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    size_t eocd = b.size() - 22;
+    while (eocd > 0 && !(b[eocd] == 'P' && b[eocd + 1] == 'K' && b[eocd + 2] == 5 && b[eocd + 3] == 6)) --eocd;
+    b[eocd + 8] = 2; b[eocd + 9] = 0; b[eocd + 10] = 2; b[eocd + 11] = 0;   // this disk's count and the total
+    MemByteSource M(b);
+    int Walked = 0;
+    CHECK(!zipscan::WalkCentralDirFull(M, [&](const zipscan::CdEntry &) { ++Walked; return true; }));
+    auto Z = BuildZipIndex(std::make_shared<MemByteSource>(b), "a.zip");
+    CHECK(!Z || Z->byName.count("c.txt"));                     // all of it, or none (refused, said so)
+}
+
 // A link is worked out once: a prefix's links are looked up over and over, and each lookup read the target again. One
 // whose bytes did not read is tried again next time, not taken for a link that leads nowhere. Teeth: resolve every
 // time (reads grow per lookup); remember a failed read as "no file" (the second lookup stays null).
@@ -1504,6 +1976,8 @@ TEST(views_of_one_chain_share_their_delta_blocks) {
 // The cache keeps no more than its budget, whatever is read: the least recently used blocks go first. Teeth: never
 // evict (the bytes held grow with what was read).
 TEST(the_block_cache_keeps_within_its_budget) {
+    vgdelta::SetCachedBlockBudget(32u << 20);                       // a budget this test can fill quickly
+    struct Restore { ~Restore() { vgdelta::SetCachedBlockBudget(0); } } restore;   // the default again after
     const size_t Block = 1u << 20, Blocks = vgdelta::CachedBlockBudget() / Block + 8;
     std::string tgt(Blocks * Block, '\0');
     for (size_t b = 0; b < Blocks; ++b)
@@ -1523,6 +1997,214 @@ TEST(the_block_cache_keeps_within_its_budget) {
     CHECK(same);
     CHECK(vgdelta::CachedBlockBytes() <= vgdelta::CachedBlockBudget());
     CHECK(vgdelta::CachedBlockBytes() >= vgdelta::CachedBlockBudget() - Block);
+}
+
+// The budget is the machine's to set: a 32nd of its memory, never under 128 MiB nor over 1 GiB (a fixed 128 MiB thrashed
+// on a large game's update on any machine). Teeth: a fixed budget (the bounds or the scale broken).
+TEST(the_block_budget_follows_the_machines_memory) {
+    const size_t B = vgdelta::DefaultCachedBlockBudget();
+    CHECK(B >= (128u << 20) && B <= (1u << 30));
+    const long Pages = sysconf(_SC_PHYS_PAGES), Page = sysconf(_SC_PAGE_SIZE);
+    const uint64_t Ram = (uint64_t)Pages * (uint64_t)Page;
+    CHECK_EQ((uint64_t)B, std::clamp<uint64_t>(Ram / 32, 128ull << 20, 1ull << 30));
+    ::setenv("VGFS_BLOCK_CACHE_MB", "300", 1);
+    CHECK_EQ(vgdelta::DefaultCachedBlockBudget(), (size_t)300 << 20);
+    vgdelta::ShareCachedBlockBudget(2);                              // one told how much to keep keeps it whole
+    CHECK_EQ(vgdelta::CachedBlockBudget(), (size_t)300 << 20);
+    ::unsetenv("VGFS_BLOCK_CACHE_MB");
+    vgdelta::SetCachedBlockBudget(0);
+}
+
+// The mounts of one launch (a runner build, the game) share one budget: each took the machine's 32nd, so a launch held
+// twice it. A spec that says how many mounts its launch makes gets its share; one that says nothing, all of it.
+// Teeth: ignore launchMounts (each mount takes the whole budget).
+TEST(the_mounts_of_a_launch_share_one_block_budget) {
+    const fs::path t = fs::temp_directory_path() / ("vgfs_share_" + std::to_string(::getpid()) + ".json");
+    { std::ofstream(t) << "{\"mountpoint\":\"/x\",\"readonly\":true,\"launchMounts\":2,\"layers\":[]}"; }
+    Spec sp; std::string err;
+    CHECK(ParseSpec(t.string(), sp, err));
+    CHECK_EQ(sp.launchMounts, 2);
+    vgdelta::ShareCachedBlockBudget(sp.launchMounts);
+    CHECK_EQ(vgdelta::CachedBlockBudget(), std::max<size_t>(vgdelta::DefaultCachedBlockBudget() / 2, 64u << 20));
+    { std::ofstream(t) << "{\"mountpoint\":\"/x\",\"readonly\":true,\"layers\":[]}"; }
+    Spec one; CHECK(ParseSpec(t.string(), one, err));
+    CHECK_EQ(one.launchMounts, 1);
+    vgdelta::SetCachedBlockBudget(0);
+    fs::remove(t);
+}
+
+// Readers of the same block at the same time decompress it once: the others wait for it (FUSE serves reads at once,
+// and neighbouring files share blocks). Teeth: no flight (each reader decompresses it again).
+TEST(a_block_read_at_once_is_decompressed_once) {
+    std::string base(4096, '\0'), tgt;
+    for (size_t i = 0; i < 300000; ++i) tgt += (char)((i * 131 + i / 977) % 251);
+    auto d = vgdelta::GenerateDelta((const uint8_t *)base.data(), base.size(), (const uint8_t *)tgt.data(), tgt.size(), 1u << 18);
+    std::string err;
+    auto D = vgdelta::DeltaByteSource::Create(std::make_shared<MemByteSource>(d), std::make_shared<MemByteSource>(std::vector<uint8_t>(base.begin(), base.end())), err, false);
+    CHECK(D != nullptr);
+    if (!D) return;
+    vgdelta::DebugSlowDecompress(200);
+    const long long Before = vgdelta::DebugDecompressions();
+    std::vector<std::thread> T;
+    std::atomic<int> Ok{ 0 };
+    for (int I = 0; I < 6; ++I)
+        T.emplace_back([&, I] {
+            std::vector<uint8_t> out(1000);
+            if (D->preadAll(out.data(), out.size(), 1000 * (uint64_t)I) && std::memcmp(out.data(), &tgt[1000 * (size_t)I], out.size()) == 0) ++Ok;
+        });
+    for (auto &X : T) X.join();
+    vgdelta::DebugSlowDecompress(0);
+    CHECK_EQ(Ok.load(), 6);
+    CHECK_EQ(vgdelta::DebugDecompressions() - Before, 1LL);
+}
+
+// A file prefetched whole when opened is not prefetched again, read by read: each read went over every run again.
+// A range outside it is. Teeth: drop the memo (a scan per read).
+TEST(a_range_prefetched_is_not_prefetched_again) {
+    std::string base(1 << 20, '\0');
+    for (size_t i = 0; i < base.size(); ++i) base[i] = (char)(i * 7);
+    std::string tgt;
+    for (size_t i = 0; i < 200; ++i) { tgt += base.substr((i * 4099) % (base.size() - 3000), 3000); tgt += std::string(17, (char)i); }
+    auto d = vgdelta::GenerateDelta((const uint8_t *)base.data(), base.size(), (const uint8_t *)tgt.data(), tgt.size(), 1u << 16);
+    std::string err;
+    auto D = vgdelta::DeltaByteSource::Create(std::make_shared<MemByteSource>(d), std::make_shared<MemByteSource>(std::vector<uint8_t>(base.begin(), base.end())), err, false);
+    CHECK(D != nullptr);
+    if (!D) return;
+    const long long Before = vgdelta::DebugPrefetchScans();
+    D->prefetch(0, 200000);
+    std::vector<uint8_t> out(9000);
+    for (uint64_t At = 0; At + out.size() < 200000; At += 9000) CHECK(D->preadAll(out.data(), out.size(), At));
+    CHECK_EQ(vgdelta::DebugPrefetchScans() - Before, 1LL);
+    CHECK(D->preadAll(out.data(), out.size(), 300000));               // outside it: asked for
+    CHECK_EQ(vgdelta::DebugPrefetchScans() - Before, 2LL);
+}
+
+// A zip written byte by byte: each member {raw name, flags, made-by, external attributes, method, extra field, data}.
+struct RawMember { std::string name; uint16_t flags = 0, madeBy = 0x031E, method = 0; uint32_t ext = 0100644u << 16; std::string extra, data; };
+static void Put16(std::string &o, uint16_t v) { o += (char)(v & 0xFF); o += (char)(v >> 8); }
+static void Put32(std::string &o, uint32_t v) { Put16(o, (uint16_t)(v & 0xFFFF)); Put16(o, (uint16_t)(v >> 16)); }
+static uint32_t TestCrc(const std::string &S) {
+    uint32_t C = 0xFFFFFFFFu;
+    for (unsigned char B : S) { C ^= B; for (int K = 0; K < 8; ++K) C = (C >> 1) ^ (0xEDB88320u & (0u - (C & 1u))); }
+    return ~C;
+}
+static void writeRawZip(const fs::path &p, const std::vector<RawMember> &ms) {
+    std::string out, cd;
+    for (const RawMember &m : ms) {
+        const uint32_t lh = (uint32_t)out.size(), crc = TestCrc(m.data);
+        Put32(out, 0x04034b50); Put16(out, 20); Put16(out, m.flags); Put16(out, m.method); Put16(out, 0x6000); Put16(out, 0x5A21);
+        Put32(out, crc); Put32(out, (uint32_t)m.data.size()); Put32(out, (uint32_t)m.data.size());
+        Put16(out, (uint16_t)m.name.size()); Put16(out, 0); out += m.name; out += m.data;
+        Put32(cd, 0x02014b50); Put16(cd, m.madeBy); Put16(cd, 20); Put16(cd, m.flags); Put16(cd, m.method); Put16(cd, 0x6000); Put16(cd, 0x5A21);
+        Put32(cd, crc); Put32(cd, (uint32_t)m.data.size()); Put32(cd, (uint32_t)m.data.size());
+        Put16(cd, (uint16_t)m.name.size()); Put16(cd, (uint16_t)m.extra.size()); Put16(cd, 0); Put16(cd, 0); Put16(cd, 0);
+        Put32(cd, m.ext); Put32(cd, lh); cd += m.name; cd += m.extra;
+    }
+    const uint32_t cdOff = (uint32_t)out.size();
+    out += cd;
+    Put32(out, 0x06054b50); Put16(out, 0); Put16(out, 0); Put16(out, (uint16_t)ms.size()); Put16(out, (uint16_t)ms.size());
+    Put32(out, (uint32_t)cd.size()); Put32(out, cdOff); Put16(out, 0);
+    writeFile(p, out);
+}
+
+// Two indexes of one archive, entry for entry.
+static void sameIndex(const ZipIndex &A, const ZipIndex &B, const std::string &What) {
+    CHECK_EQ(A.byName.size(), B.byName.size());
+    for (const auto &[N, E] : A.byName) {
+        const auto It = B.byName.find(N);
+        CHECK(It != B.byName.end());
+        if (It == B.byName.end()) { std::cerr << "    " << What << ": not in the other index: " << N << "\n"; continue; }
+        const ZipEntry &F = It->second;
+        //What libzip's index serves zero-copy, this one serves the same way. It serves more: libzip's looked the offset
+        //up by the stored name, which a CP437 or Unicode-path name never matched — such a member was never served.
+        const bool Same = E.index == F.index && E.size == F.size && E.mtime == F.mtime && E.isDir == F.isDir
+                       && E.symlink == F.symlink && (!F.stored || (E.stored && E.localHeader == F.localHeader));
+        CHECK(Same);
+        if (!Same) std::cerr << "    " << What << ": " << N << " differs (mtime " << E.mtime << "/" << F.mtime << ")\n";
+    }
+    CHECK(A.dirChildren == B.dirChildren);
+}
+
+// The index a mount builds from its own walk of the central directory is libzip's, entry for entry: names (UTF-8
+// flagged, UTF-8 unflagged, CP437, an Info-ZIP Unicode path), times (DOS, an extended timestamp), links, folders,
+// what is served zero-copy (stored and not encrypted). VGFS_ZIP_SAMPLE=a.zip:b.zip compares real archives too.
+// Teeth: name a CP437 member by its raw bytes; ignore the extended timestamp; serve an encrypted member.
+TEST(the_index_from_the_directory_walk_is_libzips) {
+    TmpDir t;
+    std::string Ut; Put16(Ut, 0x5455); Put16(Ut, 5); Ut += (char)1; Put32(Ut, 1700000000u);
+    std::string Up; { const std::string Raw = "x\x81.txt", U = "x\xE2\x82\xAC.txt"; /* not what CP437 makes of it (xü) */ Put16(Up, 0x7075); Put16(Up, (uint16_t)(5 + U.size())); Up += (char)1; Put32(Up, TestCrc(Raw)); Up += U; }
+    writeRawZip(t / "raw.zip", {
+        { "ascii.txt", 0, 0x031E, 0, 0100644u << 16, "", "plain" },
+        { "caf\x82.txt", 0, 0x0014, 0, 0, "", "cp437" },
+        { "na\xC3\xAFve.txt", 0x800, 0x031E, 0, 0100644u << 16, "", "utf8 flagged" },
+        { "unflagged \xC3\xA9.txt", 0, 0x031E, 0, 0100644u << 16, "", "utf8 not flagged" },
+        { "x\x81.txt", 0, 0x031E, 0, 0100644u << 16, Up, "unicode path" },
+        { "stamped.txt", 0, 0x031E, 0, 0100644u << 16, Ut, "ut" },
+        { "dir/", 0, 0x031E, 0, 040755u << 16, "", "" },
+        { "dir/link", 0, 0x031E, 0, 0120777u << 16, "", "../ascii.txt" },
+        { "dir/deflated.bin", 0, 0x031E, 8, 0100644u << 16, "", "notreally" },
+        { "secret.bin", 1, 0x031E, 0, 0100644u << 16, "", "encrypted" },
+    });
+    auto Src = fileSource(t / "raw.zip");
+    auto A = BuildZipIndex(Src, "raw.zip"), B = BuildZipIndexLibzip(Src, "raw.zip");
+    CHECK(A && B);
+    if (A && B) sameIndex(*A, *B, "raw.zip");
+    if (A) {
+        CHECK(A->byName.count("caf\xC3\xA9.txt") == 1);                     // CP437 0x82 = é
+        CHECK(A->byName.count("x\xE2\x82\xAC.txt") == 1);                   // the Unicode path's name (x€), not CP437's
+        CHECK(A->byName.count("secret.bin") && !A->byName.at("secret.bin").stored);
+        for (const auto &[N, Want] : std::vector<std::pair<std::string, std::string>>{ { "caf\xC3\xA9.txt", "cp437" }, { "x\xE2\x82\xAC.txt", "unicode path" } }) {
+            const auto It = A->byName.find(N);
+            if (It == A->byName.end()) continue;
+            ZipReader R; char buf[32] = {0};
+            CHECK_EQ(OpenZipEntry(*A, It->second, R), 0);                    // served: its bytes read
+            const int got = ReadZipEntry(R, buf, sizeof buf, 0);
+            CHECK_EQ(std::string(buf, got > 0 ? (size_t)got : 0), Want);
+        }
+    }
+    writeStoreZip(t / "store.zip", { { "a/b/c.txt", "c", false }, { "d/", "", false }, { "e.txt", "e", false } });
+    auto S2 = fileSource(t / "store.zip");
+    auto C = BuildZipIndex(S2, "store.zip"), D = BuildZipIndexLibzip(S2, "store.zip");
+    CHECK(C && D);
+    if (C && D) sameIndex(*C, *D, "store.zip");
+    if (const char *Sample = std::getenv("VGFS_ZIP_SAMPLE"))
+        for (std::string Rest = Sample; !Rest.empty();) {
+            const size_t Cut = Rest.find(':');
+            const std::string P = Rest.substr(0, Cut);
+            Rest = Cut == std::string::npos ? "" : Rest.substr(Cut + 1);
+            auto Real = fileSource(P);
+            auto X = BuildZipIndex(Real, P), Y = BuildZipIndexLibzip(Real, P);
+            CHECK(X && Y);
+            if (X && Y) sameIndex(*X, *Y, P);
+            std::cerr << "    compared " << (X ? X->byName.size() : 0) << " entries of " << P << "\n";
+        }
+}
+
+// A chain whose later delta takes back what an earlier one put in reads as the base again — and its flat map is one
+// run over the base, not the pieces the composition cut it into (the map grew with every level, a pread per piece).
+// Teeth: no joining (two runs); join across a gap (the bytes differ).
+TEST(a_chains_flat_map_joins_runs_that_continue_each_other) {
+    std::string b0(200000, '\0');
+    std::mt19937 Rng(42);                                              // no run of it repeats elsewhere
+    for (char &C : b0) C = (char)(Rng() & 0xFF);
+    std::string ins(5000, 'Q');
+    const std::string t1 = b0.substr(0, 90000) + ins + b0.substr(90000);
+    auto d1 = vgdelta::GenerateDelta((const uint8_t *)b0.data(), b0.size(), (const uint8_t *)t1.data(), t1.size(), 4096);
+    auto d2 = vgdelta::GenerateDelta((const uint8_t *)t1.data(), t1.size(), (const uint8_t *)b0.data(), b0.size(), 4096);
+    std::string err;
+    auto V1 = vgdelta::DeltaByteSource::Create(std::make_shared<MemByteSource>(d1), std::make_shared<MemByteSource>(std::vector<uint8_t>(b0.begin(), b0.end())), err, false);
+    CHECK(V1 != nullptr);
+    if (!V1) return;
+    auto V2 = vgdelta::DeltaByteSource::Create(std::make_shared<MemByteSource>(d2), V1, err, false);
+    CHECK(V2 != nullptr);
+    if (!V2) return;
+    if (std::getenv("VGFS_SHOW_RUNS"))
+        for (const auto &R : V2->flatRuns()) std::cerr << "    run kind " << (int)R.kind << " len " << R.len << " src " << R.srcOff << " add " << R.addSrc << "\n";
+    CHECK(!V2->runsLeftUnjoined());
+    CHECK_EQ(V2->runs(), (size_t)1);                               // the base again, whole
+    std::vector<uint8_t> out(b0.size());
+    CHECK(V2->preadAll(out.data(), out.size(), 0));
+    CHECK(std::memcmp(out.data(), b0.data(), b0.size()) == 0);
 }
 
 // A central directory longer than the window it is read through: every record found, one straddling the window's end

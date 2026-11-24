@@ -3,6 +3,7 @@
 
 #include "layerspec.h"
 #include "ziplayer.h"
+#include "hostio.h"
 
 #include <array>
 #include <string>
@@ -10,18 +11,31 @@
 #include <set>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <cstdint>
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
+
+//A deletion mask as its readers see it: a large set shared by every version of it, and the few changes made since they
+//were last folded in. A change copies only those few (folded in once they pass an eighth of the set): copying the
+//whole set at every delete made an installer's 10,000 deletes 50 M string copies. Invariant: removed ⊆ *base,
+//added ∩ *base = ∅.
+struct MaskSnap {
+    std::shared_ptr<const std::set<std::string>> base = std::make_shared<const std::set<std::string>>();
+    std::set<std::string> added, removed;
+    size_t count(const std::string &K) const { return !removed.count(K) && (added.count(K) || base->count(K)) ? 1 : 0; }
+    bool   empty() const { return added.empty() && removed.size() == base->size(); }
+};
 
 //A kept folder's deletion markers mirrored in memory, like the writelayer's (VfsState::whiteoutSet): the names
 //deleted there and the directories made again over deleted ones (opaque), as paths relative to the layer's source
 //(SourceRel). Seeded from the folder at Init, swapped copy-on-write under VfsState::maskWriteMtx on every change, so
 //lookups through a kept folder never touch the disk for them.
 struct KeptMasks {
-    std::atomic<std::shared_ptr<const std::set<std::string>>> deleted;
-    std::atomic<std::shared_ptr<const std::set<std::string>>> opaque;
+    std::atomic<std::shared_ptr<const MaskSnap>> deleted;
+    std::atomic<std::shared_ptr<const MaskSnap>> opaque;
 };
 
 //A resolved layer in the running filesystem.
@@ -42,6 +56,12 @@ struct Layer {
     std::string fileVPath;   // File layers only: target [+ "/"] + basename(source)
     std::string fileBase;    // File layers only: basename(source)
     std::shared_ptr<KeptMasks> kept;   // rw Dir layers (kept folders) only
+    std::string sourceCanon;  // Dir layers: source with every link resolved, worked out once (SymlinkContained)
+    //Read-only Dir layers small enough to list at Init (DefaultData, a package's small folders): every path it holds,
+    //relative to source (folded, case-insensitive). A name it does not hold is a miss without a stat of the host —
+    //DefaultData sits above all content, and every lookup in the mount stat'd it. Null: not listed (large, or holding
+    //a link, through which a path cannot be known without the host).
+    std::shared_ptr<const std::unordered_set<std::string>> listed;
 };
 
 //The whole running filesystem state, built once from a Spec and immutable afterward (lock-free reads),
@@ -73,8 +93,8 @@ struct VfsState {
     // rmdir marker sweep, dir renames) updates disk AND swaps the set copy-on-write under maskWriteMtx.
     // Known seam: a guest literally creating a `.wh.foo` file through the mount lands on disk but not in
     // the set, so it masks only from the NEXT mount — no real guest does this.
-    std::atomic<std::shared_ptr<const std::set<std::string>>> whiteoutSet;
-    std::atomic<std::shared_ptr<const std::set<std::string>>> opaqueSet;
+    std::atomic<std::shared_ptr<const MaskSnap>> whiteoutSet;
+    std::atomic<std::shared_ptr<const MaskSnap>> opaqueSet;
     std::mutex                                                maskWriteMtx;   // serializes set writers
 
     // Fixed shard array of copy-up locks keyed by hash(vrel) % N — avoids the old per-path map that grew
@@ -84,7 +104,53 @@ struct VfsState {
 
     bool Init(const Spec &S, std::string &Err);
     std::mutex &CopyUpLock(const std::string &vrel);   // sharded by hash(vrel); see copyUpShards
+    //Files opened over a lower copy (VfsOpen: to read, or to read and write with the copy-up waiting for the first
+    //change): one marker per path, shared by the path's handles. A copy-up of the path opens the copy once, into the
+    //marker (`upper`): every handle reads — and writes — the copy from then on, through a rename, an unlink or a
+    //replace of its name (the descriptor follows the file). A name unlinked, renamed or made again takes its marker off
+    //(`detached`): a file there later is another file, and a handle detached before any copy writes a copy of its own.
+    struct PendingCopy {
+        std::atomic<int>  upper{ -1 };        // HostIO::Fd of the copy, opened once
+        std::atomic<bool> detached{ false };
+        std::mutex        mu;                 // a detached handle's own copy, made once
+        PendingCopy() = default;
+        PendingCopy(const PendingCopy &) = delete;
+        PendingCopy &operator=(const PendingCopy &) = delete;
+        ~PendingCopy();
+    };
+    std::mutex                                                       pendingMu;
+    std::unordered_map<std::string, std::weak_ptr<PendingCopy>>      pendingCopies;   // by PendingKey
+    size_t                                                           pendingPruneAt = 64;
+    std::atomic<unsigned long long>                                  copyUps{ 0 };    // copy-ups made, ever
+    //Name changes (unlink, rename, create) begun or done: bumped before the host change (BeginNameChange) and again
+    //when its markers come off (DetachPendingLocked). An open that saw none between resolving a name and taking its
+    //marker knows the marker's name still names its file.
+    std::atomic<unsigned long long>                                  detaches{ 0 };
+    std::function<void(const char *)>                                debugHook;   // TEST ONLY: called at named points
+    std::string                  PendingKey(const std::string &vrel) const;   // folded on a case-insensitive mount
+    //This path's marker, made if none — or, when a name changed since SeenDetaches and StillOpened() says the path no
+    //longer names the open's file, a marker of the handle's own, detached.
+    std::shared_ptr<PendingCopy> PendingFor(const std::string &vrel, unsigned long long SeenDetaches,
+                                            const std::function<bool()> &StillOpened);
+    //A copy-up's copy, open (Fd, owned from here): into the path's marker, unless none waits or one is there already.
+    void                         MarkCopied(const std::string &vrel, HostIO::Fd Fd);
+    //A copy found at host (made before the marker was taken): opened into the path's marker, once no name change is
+    //running. Logged when it cannot be opened.
+    void                         AdoptCopy(const std::string &vrel, const std::string &host);
+    //A name change around its host change (no lock held across it): begun, then ended with the names whose markers come
+    //off — every path ends it, a failed change with none. A copy is adopted only while none is running.
+    void                         BeginNameChange();
+    void                         EndNameChange(const std::vector<std::pair<std::string, bool>> &Detach);
+    int                          nameChanges = 0;            // running, under pendingMu
+    std::condition_variable      nameChangeCv;
+    //The name (and, for a folder, every name under it) names another file from now on: its markers come off (pendingMu
+    //held).
+    void                         DetachPendingLocked(const std::string &vrel, bool subtree);
 };
+
+//A copy-up's file while it is written (CopyUp): a marker's prefix, so no listing shows it and no guest can make one;
+//one left by a crash is removed when the folder's markers are read.
+inline constexpr const char *kCopyTmpPrefix = ".wh..vgfs-copy.";
 
 enum class HitKind { None, ImplicitDir, WriteLayer, DirLayer, FileLayer, ZipEntry };
 
@@ -110,6 +176,8 @@ void        RemoveWhiteout(VfsState &S, const std::string &vrel);          // di
 // A directory rename relocates the .wh. markers stored inside its writelayer subtree; mirror that in the
 // in-memory sets by rewriting every entry under oldv to the newv prefix (both whiteouts and opaque dirs).
 void        RenameMaskPrefix(VfsState &S, const std::string &oldv, const std::string &newv);
+long long   DebugMaskFolds();
+long long   DebugCaseWalks();   // TEST ONLY: archive members a submount's case names were walked over   // TEST ONLY: times a mask's changes were folded into its whole set
 
 void        MarkOpaque(VfsState &S, const std::string &vrel);
 void        UnmarkOpaque(VfsState &S, const std::string &vrel);   // mask erase only (caller owns the disk marker)

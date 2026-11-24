@@ -5,7 +5,9 @@
 
 #include <cerrno>
 #include <dirent.h>
+#include <atomic>
 #include <fcntl.h>
+#include <cstdio>     // renameat2 (glibc)
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -77,8 +79,12 @@ int Fstat(Fd fd, Stat &out)
 
 // ---- path-based ------------------------------------------------------------
 
+static std::atomic<long long> g_Lstats{0};
+long long DebugLstats() { return g_Lstats.load(); }
+
 int Lstat(const std::string &path, Stat &out)
 {
+    ++g_Lstats;
     struct stat st;
     if (::lstat(path.c_str(), &st) != 0) return -errno;
     FromStat(st, out);
@@ -97,6 +103,17 @@ int Mkdir(const std::string &path, uint32_t mode) { return ::mkdir(path.c_str(),
 int Unlink(const std::string &path)               { return ::unlink(path.c_str()) == 0 ? 0 : -errno; }
 int Rmdir(const std::string &path)                { return ::rmdir(path.c_str()) == 0 ? 0 : -errno; }
 int Rename(const std::string &from, const std::string &to) { return ::rename(from.c_str(), to.c_str()) == 0 ? 0 : -errno; }
+int RenameNoReplace(const std::string &from, const std::string &to)
+{
+#ifdef RENAME_NOREPLACE
+    if (::renameat2(AT_FDCWD, from.c_str(), AT_FDCWD, to.c_str(), RENAME_NOREPLACE) == 0) return 0;
+    if (errno != EINVAL && errno != ENOSYS) return -errno;
+#endif
+    //A file system without it: a link fails where the name is taken, then the old name goes.
+    if (::link(from.c_str(), to.c_str()) != 0) return -errno;
+    ::unlink(from.c_str());
+    return 0;
+}
 int Link(const std::string &existing, const std::string &newpath) { return ::link(existing.c_str(), newpath.c_str()) == 0 ? 0 : -errno; }
 int Truncate(const std::string &path, uint64_t size)       { return ::truncate(path.c_str(), static_cast<off_t>(size)) == 0 ? 0 : -errno; }
 int Chmod(const std::string &path, uint32_t mode)          { return ::chmod(path.c_str(), static_cast<mode_t>(mode)) == 0 ? 0 : -errno; }
@@ -147,6 +164,20 @@ int ReadDir(const std::string &path, const std::function<void(const std::string 
         const char *n = e->d_name;
         if (n[0] == '.' && (n[1] == '\0' || (n[1] == '.' && n[2] == '\0'))) continue;   // skip "." / ".."
         cb(std::string(n));
+    }
+    ::closedir(d);
+    return 0;
+}
+
+int ReadDirTyped(const std::string &path, const std::function<void(const std::string &, int)> &cb)
+{
+    DIR *d = ::opendir(path.c_str());
+    if (!d) return -errno;
+    while (dirent *e = ::readdir(d))
+    {
+        const char *n = e->d_name;
+        if (n[0] == '.' && (n[1] == '\0' || (n[1] == '.' && n[2] == '\0'))) continue;   // skip "." / ".."
+        cb(std::string(n), e->d_type == DT_UNKNOWN ? -1 : e->d_type == DT_DIR ? 1 : e->d_type == DT_LNK ? 2 : 0);
     }
     ::closedir(d);
     return 0;

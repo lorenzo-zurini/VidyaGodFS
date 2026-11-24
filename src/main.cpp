@@ -1,4 +1,5 @@
 #include "layerspec.h"
+#include "vgdelta.h"     // ShareCachedBlockBudget
 #include "overlay.h"
 #include "mountsession.h"
 
@@ -44,6 +45,7 @@ int main(int argc, char **argv)
     std::string err;
     if (!ParseSpec(specPath, spec, err)) { std::cerr << "[vidyagodfs] " << err << "\n"; return 1; }
     if (spec.mountpoint.empty()) spec.mountpoint = mountpoint;
+    vgdelta::ShareCachedBlockBudget(spec.launchMounts);
 
     static VfsState state;
     state.flattenSymlinks = !keepSymlinks;

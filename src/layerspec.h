@@ -28,6 +28,10 @@ struct LayerSpec {
     // (e.g. share/default_pfx:pfx) in a single self-contained mount, zero-copy.
     std::vector<std::pair<std::string,std::string>> submounts;
     bool        rw = false;  // rw:true dir layer = RW passthrough straight to source (durable persist)
+    //dir: its source cannot change while mounted (package content, a folder built before the mount) — its lookups are
+    //answered from one listing taken at the mount (a small enough one). A folder another mount fills, or the user's,
+    //is not: each lookup asks the host.
+    bool        fixed = false;
     bool        bytesOnly = false;   // zip/delta: read as a later delta's base, surfacing nowhere (a TAKE shows none of it)
 };
 
@@ -41,6 +45,9 @@ struct Spec {
     // Names match whatever their case (Windows: a program asks for "DATA\\X.DRS" in a package that has
     // "Data/x.drs"). Spec key "caseInsensitive"; default on for a Windows build only. See CanonicalCase.
     bool                    caseInsensitive = false;
+    //How many mounts the launch that made this one makes (a runner build and the game: 2). They share one budget for
+    //decompressed delta blocks — each took a 32nd of the machine's memory, so two mounts a 16th.
+    int                     launchMounts = 1;
 };
 
 //Parses the spec file at Path (or the spec JSON Text) into Out. Returns false (with Err set) on read/parse error.

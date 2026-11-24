@@ -1,3 +1,7 @@
+#include <mutex>
+#include <cstdlib>
+#include <thread>
+#include <condition_variable>
 #include "vgdelta.h"
 
 #include <zstd.h>
@@ -20,6 +24,7 @@
 #include <unistd.h>     //   … write/fdatasync/close, and getpid for the scratch-name salt
 #else
 #include <process.h>    // _getpid — unistd.h does not exist here
+#include <windows.h>    // GlobalMemoryStatusEx: the block budget
 #endif
 
 namespace vgdelta {
@@ -242,6 +247,26 @@ std::shared_ptr<DeltaByteSource> DeltaByteSource::Create(std::shared_ptr<ByteSou
         for (const RawSeg &s : P.segs) D->Segs.push_back({ 0, s.len, s.srcOff, 0, s.kind });
     }
 
+    //Runs that continue each other (the same kind, from where the last one ended, of the same file) are one run: a
+    //chain's composition splits a run at every boundary of the level below, and the map only grew with its depth —
+    //and a read issues a pread per run.
+    {
+        size_t W = 0;
+        for (size_t R = 0; R < D->Segs.size(); ++R)
+        {
+            const FlatSeg &s = D->Segs[R];
+            if (s.len == 0) continue;
+            if (W > 0)
+            {
+                FlatSeg &p = D->Segs[W - 1];
+                if (p.kind == s.kind && p.srcOff + p.len == s.srcOff && (s.kind == KIND_COPY || p.addSrc == s.addSrc))
+                { p.len += s.len; continue; }
+            }
+            D->Segs[W++] = s;
+        }
+        D->Segs.resize(W);
+        D->Segs.shrink_to_fit();
+    }
     uint64_t t = 0; for (FlatSeg &s : D->Segs) { s.targetOff = t; t += s.len; }
     if (t != D->TargetSize) { err = "vgdelta: flat segments do not cover target"; return nullptr; }
     return D;
@@ -305,7 +330,53 @@ std::atomic<uint64_t> g_NextCacheId{ 1 };
 } // namespace
 
 size_t CachedBlockBytes() { return Blocks().Held(); }
-size_t CachedBlockBudget() { return 128u << 20; }
+
+namespace {
+std::atomic<size_t> g_Budget{ 0 };
+std::atomic<long long> g_Decompressions{ 0 }, g_PrefetchScans{ 0 };
+std::atomic<int> g_SlowDecompressMs{ 0 };
+
+//A 32nd of the machine's memory, between 128 MiB and 1 GiB (VGFS_BLOCK_CACHE_MB overrides): a fixed 128 MiB was too
+//small for a large game's update (its patch blocks decompressed again and again once they passed it) on a machine
+//with memory to spare, and the same on a Deck and on a 64 GB desktop.
+size_t DefaultBudget()
+{
+    if (const char *E = std::getenv("VGFS_BLOCK_CACHE_MB"); E && *E)
+        if (const long long Mb = std::atoll(E); Mb > 0) return (size_t)Mb << 20;
+    uint64_t Ram = 0;
+#ifdef _WIN32
+    MEMORYSTATUSEX M{}; M.dwLength = sizeof M;
+    if (GlobalMemoryStatusEx(&M)) Ram = M.ullTotalPhys;
+#else
+    const long Pages = sysconf(_SC_PHYS_PAGES), Page = sysconf(_SC_PAGE_SIZE);
+    if (Pages > 0 && Page > 0) Ram = (uint64_t)Pages * (uint64_t)Page;
+#endif
+    return (size_t)std::clamp<uint64_t>(Ram / 32, 128ull << 20, 1ull << 30);
+}
+
+//A block being decompressed: every other reader of it waits for this one, instead of decompressing it again.
+struct Flight { std::mutex Mu; std::condition_variable Cv; bool Done = false; std::shared_ptr<std::vector<uint8_t>> Raw; };
+std::mutex g_FlightMu;
+std::map<std::pair<uint64_t, uint64_t>, std::shared_ptr<Flight>> g_Flights;
+}
+
+size_t CachedBlockBudget()
+{
+    if (const size_t B = g_Budget.load()) return B;
+    const size_t B = DefaultBudget();
+    g_Budget.store(B);
+    return B;
+}
+size_t DefaultCachedBlockBudget() { return DefaultBudget(); }
+void SetCachedBlockBudget(size_t Bytes) { g_Budget.store(Bytes); }
+void ShareCachedBlockBudget(int Mounts)
+{
+    if (const char *E = std::getenv("VGFS_BLOCK_CACHE_MB"); E && *E) return;
+    g_Budget.store(std::max<size_t>(DefaultBudget() / (size_t)std::max(1, Mounts), 64u << 20));
+}
+long long DebugDecompressions() { return g_Decompressions.load(); }
+long long DebugPrefetchScans() { return g_PrefetchScans.load(); }
+void DebugSlowDecompress(int Ms) { g_SlowDecompressMs.store(Ms); }
 
 AddSource::AddSource() : cacheId(g_NextCacheId++) {}
 AddSource::~AddSource() { Blocks().Drop(cacheId); }
@@ -313,12 +384,46 @@ AddSource::~AddSource() { Blocks().Drop(cacheId); }
 std::shared_ptr<std::vector<uint8_t>> DeltaByteSource::GetAddBlock(uint32_t addSrc, const AddSource &A, uint64_t blk) {
     (void)addSrc;
     if (auto held = Blocks().Get(A.cacheId, blk)) return held;
-    const BlockRec &b = A.blocks[blk];                          // decompress outside the lock
-    std::vector<uint8_t> comp(b.compLen);
-    if (b.compLen && !A.file->preadAll(comp.data(), b.compLen, A.regionOff + b.compOff)) return nullptr;
-    auto raw = std::make_shared<std::vector<uint8_t>>(ZDecompress(comp.data(), b.compLen, b.uncompLen));
-    if (raw->size() != b.uncompLen) return nullptr;
-    Blocks().Put(A.cacheId, blk, raw);
+    //One reader decompresses a block; the others reading it meanwhile (FUSE serves several reads at once, and a file's
+    //neighbours share its blocks) wait for that one: each decompressed the same 256 KiB again.
+    const std::pair<uint64_t, uint64_t> Key{ A.cacheId, blk };
+    std::shared_ptr<Flight> F;
+    bool Mine = false;
+    {
+        std::lock_guard<std::mutex> G(g_FlightMu);
+        auto &Slot = g_Flights[Key];
+        if (!Slot) { Slot = std::make_shared<Flight>(); Mine = true; }
+        F = Slot;
+    }
+    if (!Mine)
+    {
+        std::unique_lock<std::mutex> L(F->Mu);
+        F->Cv.wait(L, [&] { return F->Done; });
+        return F->Raw;                                           // null when that read failed: this one fails too
+    }
+    std::shared_ptr<std::vector<uint8_t>> raw = Blocks().Get(A.cacheId, blk);   // landed between the look and the flight
+    if (!raw)
+    {
+        const BlockRec &b = A.blocks[blk];                      // decompress outside every lock
+        std::vector<uint8_t> comp(b.compLen);
+        if (!b.compLen || A.file->preadAll(comp.data(), b.compLen, A.regionOff + b.compOff))
+        {
+            ++g_Decompressions;
+            if (const int Ms = g_SlowDecompressMs.load()) std::this_thread::sleep_for(std::chrono::milliseconds(Ms));
+            auto r = std::make_shared<std::vector<uint8_t>>(ZDecompress(comp.data(), b.compLen, b.uncompLen));
+            if (r->size() == b.uncompLen) { Blocks().Put(A.cacheId, blk, r); raw = std::move(r); }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> G(g_FlightMu);
+        g_Flights.erase(Key);
+    }
+    {
+        std::lock_guard<std::mutex> L(F->Mu);
+        F->Raw = raw;
+        F->Done = true;
+    }
+    F->Cv.notify_all();
     return raw;
 }
 
@@ -340,6 +445,14 @@ int DeltaByteSource::readAdd(uint32_t addSrc, const AddSource &A, uint8_t *buf, 
 void DeltaByteSource::prefetch(uint64_t off, uint64_t n) {
     if (off >= TargetSize || Segs.empty() || n == 0) return;
     const uint64_t end = n < TargetSize - off ? off + n : TargetSize;
+    //Inside a range asked for a moment ago (a file prefetched whole when it was opened, then read piece by piece): asked
+    //for already. Each read went over every run again, a hint to the kernel per run and a look in the cache per block.
+    {
+        std::lock_guard<std::mutex> G(PrefMu);
+        for (const auto &[A, B] : Prefetched) if (off >= A && end <= B) return;
+        Prefetched[PrefNext++ % Prefetched.size()] = { off, end };
+    }
+    ++g_PrefetchScans;
     //Runs that follow each other in the base are one range; an ADD block is asked for once.
     uint64_t runOff = 0, runLen = 0;
     const auto flush = [&] { if (runLen) BaseSrc->prefetch(runOff, runLen); runLen = 0; };

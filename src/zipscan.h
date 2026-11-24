@@ -25,6 +25,21 @@ uint64_t Rd64(const uint8_t *p);
 using EntryCb = std::function<bool(const std::string &, uint16_t, uint64_t)>;
 bool WalkCentralDir(ByteSource &src, const EntryCb &cb);
 
+// Everything one central-directory record says about its member (ZIP64 sizes and offset resolved): what a mount's
+// index is built from, in the one walk — libzip's own read of the directory made two small reads per member, and the
+// index then walked it again for the offsets.
+struct CdEntry {
+    std::string rawName;               // as stored
+    std::string utf8Name;              // as libzip names it: the Unicode path extra, else UTF-8 as is, else CP437
+    uint16_t    method = 0, flags = 0, madeBy = 0;
+    uint32_t    extAttr = 0;
+    uint64_t    compSize = 0, uncompSize = 0, lhOffset = 0, index = 0;
+    time_t      mtime = 0;             // as libzip gives it: the DOS time, in local time (an extended timestamp unread)
+};
+using FullCb = std::function<bool(const CdEntry &)>;
+// The walk, every record whole. The directory is asked for at once first (a read hint), then read a window at a time.
+bool WalkCentralDirFull(ByteSource &src, const FullCb &cb);
+
 // Walks the central directory → normalized-name → local-header offset (ZIP64-aware).
 // Empty on any parse failure (callers fall back to libzip — no STORED zero-copy).
 std::unordered_map<std::string, uint64_t> CentralDirOffsets(ByteSource &src);

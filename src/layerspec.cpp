@@ -36,6 +36,7 @@ bool ParseSpecText(const std::string &Text, Spec &Out, std::string &Err)
         Out.uid        = J.value("uid", 1000u);
         Out.gid        = J.value("gid", 1000u);
         Out.readOnly   = J.value("readonly", false);
+        Out.launchMounts = std::max(1, J.value("launchMounts", 1));
 #ifdef _WIN32
         Out.caseInsensitive = J.value("caseInsensitive", true);    // Windows programs name files in any case
 #else
@@ -83,6 +84,7 @@ bool ParseSpecText(const std::string &Text, Spec &Out, std::string &Err)
             }
             LS.rw      = L.value("rw", false);
             LS.bytesOnly = L.value("bytesOnly", false);
+            LS.fixed   = L.value("fixed", false);
             if (LS.bytesOnly && !Archive)
                 return Bad("only a zip or a delta can be bytes-only");
             // SUBMOUNTS: array of Docker-style "src:dst" strings → (source,target) pairs (split on first ':').

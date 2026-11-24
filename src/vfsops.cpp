@@ -212,9 +212,35 @@ int VfsReaddirTyped(VfsState &S, const std::string &v, const TypedDirFiller &fil
     return 0;
 }
 
+static std::atomic<long long> g_LazyOpens{ 0 }, g_LazyCopies{ 0 };
+long long DebugLazyOpens() { return g_LazyOpens.load(); }
+long long DebugLazyCopies() { return g_LazyCopies.load(); }
+
+//A handle over a lower copy on a writable mount takes the path's marker: a copy-up of the path from now on is what it
+//reads (and, lazy, writes). A name change since the path was resolved (Seen.detaches) is looked at: when the path no
+//longer names the file this handle has, the marker is the handle's own. A copy-up made since (Seen.copyUps), before
+//the marker was there, is taken as this file's copy — when no name changed meanwhile.
+struct OpenSeen { unsigned long long copyUps, detaches; };
+static void TakeMarker(VfsState &S, const std::string &v, OpenFile *of, const OpenSeen &Seen, const ResolveResult &rr)
+{
+    if (S.debugHook) S.debugHook("open-before-marker");
+    of->pending = S.PendingFor(v, Seen.detaches, [&] {
+        const ResolveResult now = Resolve(S, v);
+        return now.kind == rr.kind && now.hostPath == rr.hostPath && now.zipEntry == rr.zipEntry && now.layer == rr.layer;
+    });
+    of->state = &S;
+    of->vrel = v;
+    if (of->pending->detached.load() || S.copyUps.load() == Seen.copyUps) return;
+    std::string dst;
+    if (!PassthroughHost(S, v, dst)) dst = WLPath(S, v);
+    HostIO::Stat st;
+    if (HostIO::Lstat(dst, st) == 0 && !st.isDir) S.AdoptCopy(v, dst);
+}
+
 int VfsOpen(VfsState &S, const std::string &v, int flags, OpenFile *&out)
 {
     out = nullptr;
+    const OpenSeen Seen{ S.copyUps.load(), S.detaches.load() };
     ResolveResult rr = Resolve(S, v);
     if (rr.kind == HitKind::None) return -ENOENT;
 
@@ -232,6 +258,11 @@ int VfsOpen(VfsState &S, const std::string &v, int flags, OpenFile *&out)
 
     if (wantWrite && S.readOnly) return -EROFS;
 
+    //A lower copy a write may copy up while this handle reads it (a lazy handle's first write, an open that truncates):
+    //read-only handles follow the copy too — one left on the lower file read what the file was before.
+    const bool Followed = !S.readOnly && !S.writelayer.empty() && !rr.rwPassthrough
+                       && (rr.kind == HitKind::DirLayer || rr.kind == HitKind::FileLayer || (rr.kind == HitKind::ZipEntry && rr.zipEntry));
+
     // Read-only zip entry: serve from a materialized reader.
     if (!wantWrite && rr.kind == HitKind::ZipEntry && rr.zipEntry)
     {
@@ -239,6 +270,29 @@ int VfsOpen(VfsState &S, const std::string &v, int flags, OpenFile *&out)
         int e = OpenZipEntry(*const_cast<ZipIndex *>(rr.layer->zip.get()), *rr.zipEntry, *zr);
         if (e != 0) { delete zr; return e; }
         auto *of = new OpenFile; of->zip = zr; out = of;
+        if (Followed) TakeMarker(S, v, of, Seen, rr);
+        return 0;
+    }
+
+    //Opened to read and write a lower file, nothing truncated or appended: it is served from below until it changes,
+    //copied up at its first write or truncate. Old games open their data and archive files read-write and never
+    //write them: each such open copied the whole file into the writelayer (gigabytes, every launch).
+    const bool Lazy = Followed && wantWrite && (flags & O_ACCMODE) == O_RDWR && !(flags & (O_TRUNC | O_APPEND));
+    if (Lazy)
+    {
+        auto *of = new OpenFile;
+        if (rr.kind == HitKind::ZipEntry)
+        {
+            auto *zr = new ZipReader;
+            if (int e = OpenZipEntry(*const_cast<ZipIndex *>(rr.layer->zip.get()), *rr.zipEntry, *zr); e != 0)
+            { delete zr; delete of; return e; }
+            of->zip = zr;
+        }
+        else if ((of->fd = HostIO::Open(rr.hostPath, O_RDONLY)) < 0) { const int e = (int)of->fd; delete of; return e; }
+        TakeMarker(S, v, of, Seen, rr);
+        of->flags = flags & ~(O_CREAT | O_EXCL | O_TRUNC);
+        ++g_LazyOpens;
+        out = of;
         return 0;
     }
 
@@ -261,6 +315,7 @@ int VfsOpen(VfsState &S, const std::string &v, int flags, OpenFile *&out)
     HostIO::Fd fd = HostIO::Open(host, flags);
     if (fd < 0) return (int)fd;
     auto *of = new OpenFile; of->fd = fd; out = of;
+    if (!wantWrite && Followed) TakeMarker(S, v, of, Seen, rr);
     return 0;
 }
 
@@ -274,8 +329,10 @@ int VfsCreate(VfsState &S, const std::string &v, uint32_t mode, int flags, OpenF
     if (kept) { if (MarkerName(v)) return -EINVAL; EnsureHostParent(host); }   // straight to the durable source
     else { RemoveWhiteout(S, v); if (int e = EnsureWriteParent(S, v); e != 0) return e; host = WLPath(S, v); }
 
-    HostIO::Fd fd = HostIO::Open(host, (flags | O_CREAT) & ~O_NOFOLLOW, mode);
-    if (fd < 0) return (int)fd;
+    S.BeginNameChange();   // a file made at the name is another file than the one its open handles were opened on
+    const HostIO::Fd fd = HostIO::Open(host, (flags | O_CREAT) & ~O_NOFOLLOW, mode);
+    if (fd < 0) { S.EndNameChange({}); return (int)fd; }
+    S.EndNameChange({ { v, false } });
     // Only now: the deleted name is made again. Were the marker to stay (an unlink failure), the new file still
     // shows — the folder's own names are never masked by its markers — and the marker keeps hiding the package copy.
     if (kept) UnhideLower(S, v);
@@ -283,9 +340,94 @@ int VfsCreate(VfsState &S, const std::string &v, uint32_t mode, int flags, OpenF
     return 0;
 }
 
+//A handle whose name was unlinked, renamed or made again before any copy-up (detached): its file has no name here any
+//more, and a write makes it a copy of its own — of what it reads, in the writelayer under a name no listing shows,
+//unlinked at once — shared by the handles opened on the same file.
+static int PrivateCopy(OpenFile *of)
+{
+    VfsState::PendingCopy &P = *of->pending;
+    std::lock_guard<std::mutex> g(P.mu);
+    if (P.upper.load(std::memory_order_acquire) >= 0) return 0;
+    static std::atomic<unsigned long long> Seq{ 0 };
+    const std::string tmp = WLPath(*of->state, "") + "/" + kCopyTmpPrefix + "own." + std::to_string(++Seq);
+    const HostIO::Fd out = HostIO::Open(tmp, O_CREAT | O_EXCL | O_RDWR, 0644);
+    if (out < 0) return (int)out;
+    char buf[256 * 1024];
+    int rc = 0;
+    for (uint64_t off = 0;;)
+    {
+        const ssize_t got = of->zip ? (ssize_t)ReadZipEntry(*of->zip, buf, sizeof buf, (off_t)off)
+                                    : HostIO::Pread(of->fd, buf, sizeof buf, off);
+        if (got < 0) { rc = (int)got; break; }
+        if (got == 0) break;
+        if (int we = HostIO::FullWrite(out, buf, (size_t)got); we != 0) { rc = we; break; }
+        off += (uint64_t)got;
+    }
+    HostIO::Unlink(tmp);
+    if (rc != 0) { HostIO::Close(out); return rc; }
+    P.upper.store(out, std::memory_order_release);
+    return 0;
+}
+
+//A lazy handle about to change its file: the copy made now (once, whichever handle comes first), then used. A copy
+//found at its name is taken only when no name changed between looking and taking (else it is looked at again).
+static int CopyUpForChange(OpenFile *of)
+{
+    VfsState::PendingCopy &P = *of->pending;
+    for (int Tries = 0; Tries < 8; ++Tries)
+    {
+        if (P.upper.load(std::memory_order_acquire) >= 0) return 0;
+        if (P.detached.load(std::memory_order_acquire)) return PrivateCopy(of);
+        VfsState &S = *of->state;
+        const unsigned long long Seen = S.detaches.load();
+        ResolveResult rr = Resolve(S, of->vrel);
+        if (rr.kind == HitKind::WriteLayer || rr.rwPassthrough)
+            S.AdoptCopy(of->vrel, rr.hostPath);                        // copied before this handle took its marker
+        else if (rr.kind == HitKind::None)
+        {
+            if (S.detaches.load() == Seen) return -ENOENT;
+            continue;
+        }
+        else
+        {
+            if (int e = CopyUp(S, of->vrel, rr); e != 0) return e;
+            ++g_LazyCopies;
+        }
+        if (P.upper.load(std::memory_order_acquire) >= 0) return 0;
+        if (!P.detached.load(std::memory_order_acquire) && S.detaches.load() == Seen) return -EIO;   // logged at the open
+    }
+    return P.upper.load(std::memory_order_acquire) >= 0 ? 0 : P.detached.load() ? PrivateCopy(of) : -EIO;
+}
+
+//What a read of this handle reads: the copy once there is one, else what it was opened on (-1).
+static int UpperOf(const OpenFile *of)
+{
+    return of->pending ? of->pending->upper.load(std::memory_order_acquire) : -1;
+}
+
+bool VfsReadFrom(OpenFile *of, size_t size, uint64_t off, int &fd, uint64_t &pos, size_t &len)
+{
+    if (!of) return false;
+    if (const int Up = UpperOf(of); Up >= 0) { fd = Up; pos = off; len = size; return true; }
+    if (of->zip)
+    {
+        const ZipReader &R = *of->zip;
+        auto *F = dynamic_cast<FdByteSource *>(R.src);
+        if (!R.stored || !F || F->fd < 0) return false;
+        fd = F->fd;
+        pos = R.dataOffset + off;
+        len = off >= R.size ? 0 : (size_t)std::min<uint64_t>(size, R.size - off);
+        return true;
+    }
+    if (of->fd < 0) return false;
+    fd = (int)of->fd; pos = off; len = size;
+    return true;
+}
+
 ssize_t VfsRead(OpenFile *of, void *buf, size_t size, uint64_t off)
 {
     if (!of) return -EBADF;
+    if (const int Up = UpperOf(of); Up >= 0) return HostIO::Pread(Up, buf, size, off);
     if (of->zip) return ReadZipEntry(*of->zip, static_cast<char *>(buf), size, (off_t)off);
     if (of->fd >= 0) return HostIO::Pread(of->fd, buf, size, off);
     return -EBADF;
@@ -294,13 +436,22 @@ ssize_t VfsRead(OpenFile *of, void *buf, size_t size, uint64_t off)
 ssize_t VfsWrite(VfsState &S, OpenFile *of, const void *buf, size_t size, uint64_t off)
 {
     if (S.readOnly) return -EROFS;
+    if (of && of->pending)
+    {
+        if (!(of->flags & (O_WRONLY | O_RDWR))) return -EBADF;   // opened to read
+        if (int e = CopyUpForChange(of); e != 0) return e;
+        return HostIO::Pwrite(UpperOf(of), buf, size, off);
+    }
     if (!of || of->fd < 0) return -EBADF;
     return HostIO::Pwrite(of->fd, buf, size, off);
 }
 
 void VfsRelease(OpenFile *of)
 {
-    if (of) { if (of->fd >= 0) HostIO::Close(of->fd); delete of->zip; delete of; }
+    if (!of) return;
+    if (of->fd >= 0) HostIO::Close(of->fd);
+    delete of->zip;                                   // the copy (pending->upper) goes with the path's last handle
+    delete of;
 }
 
 int VfsMkdir(VfsState &S, const std::string &v, uint32_t mode)
@@ -331,9 +482,22 @@ int VfsMkdir(VfsState &S, const std::string &v, uint32_t mode)
     return 0;
 }
 
+static int UnlinkImpl(VfsState &S, const std::string &v);
+
+//The handles open on the file keep it (POSIX): its name's markers come off with it. The change is announced first
+//(BeginNameChange), so an open between the two looks again at what its name names.
 int VfsUnlink(VfsState &S, const std::string &v)
 {
     if (S.readOnly) return -EROFS;
+    S.BeginNameChange();
+    const int e = UnlinkImpl(S, v);
+    if (e == 0) S.EndNameChange({ { v, false } });
+    else S.EndNameChange({});
+    return e;
+}
+
+static int UnlinkImpl(VfsState &S, const std::string &v)
+{
     std::string host;
     if (PassthroughHost(S, v, host))
     {
@@ -428,7 +592,12 @@ int VfsRename(VfsState &S, const std::string &vf, const std::string &vt)
     const bool dstOverDeleted = dstKept && KeptHidden(S, vt);   // a dir moved onto a deleted one must not show its old contents
     if (dstKept) { EnsureHostParent(dst); }
     else { if (int e = EnsureWriteParent(S, vt); e != 0) return e; RemoveWhiteout(S, vt); dst = WLPath(S, vt); }
-    if (int e = HostIO::Rename(src, dst); e != 0) return e;
+    //Every handle on the moved file holds its copy now (the copy-up above); one on the file it replaces keeps that.
+    //Both names, and all under them, name other files from here on.
+    S.BeginNameChange();
+    if (int e = HostIO::Rename(src, dst); e != 0) { S.EndNameChange({}); return e; }
+    if (S.debugHook) S.debugHook("rename-before-detach");
+    S.EndNameChange({ { vf, isDir }, { vt, isDir } });
     if (isDir) KeptRenamePrefix(S, vf, vt);   // the kept markers inside it moved along
     if (dstKept && isDir && dstOverDeleted)
         if (int e = KeptMarkOpaque(S, vt); e != 0) return e;
@@ -444,6 +613,12 @@ int VfsRename(VfsState &S, const std::string &vf, const std::string &vt)
 int VfsTruncate(VfsState &S, const std::string &v, OpenFile *of, uint64_t size)
 {
     if (S.readOnly) return -EROFS;
+    if (of && of->pending)
+    {
+        if (!(of->flags & (O_WRONLY | O_RDWR))) return -EBADF;   // opened to read
+        if (int e = CopyUpForChange(of); e != 0) return e;
+        return HostIO::Ftruncate(UpperOf(of), size);
+    }
     if (of && of->fd >= 0) return HostIO::Ftruncate(of->fd, size);
     ResolveResult rr = Resolve(S, v);
     if (rr.kind == HitKind::None) return -ENOENT;
@@ -549,6 +724,7 @@ int VfsLink(VfsState &S, const std::string &vf, const std::string &vt)
 
 int VfsFsync(OpenFile *of)
 {
+    if (of && of->pending) { const int Up = UpperOf(of); return Up >= 0 ? HostIO::Fsync(Up) : 0; }   // unchanged: nothing to sync
     if (of && of->fd >= 0) return HostIO::Fsync(of->fd);
     return 0;
 }

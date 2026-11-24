@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -224,6 +225,97 @@ TEST(a_file_held_open_does_not_keep_the_mount_up_and_still_reads) {
     char Buf[8] = {};
     CHECK(pread(Fd, Buf, sizeof Buf, 0) == 2 && std::string(Buf, 2) == "hi");
     if (Fd >= 0) close(Fd);
+    CHECK(F.TornDown(std::chrono::seconds(10)));
+}
+
+// What reached the server, from its op log (VGFS_OPLOG): the getattr lines for `path`.
+static int GetattrsOf(const fs::path &log, const std::string &path)
+{
+    std::ifstream In(log);
+    int N = 0;
+    for (std::string L; std::getline(In, L); ) if (L == "getattr " + path) ++N;
+    return N;
+}
+
+// A file looked at again a moment later is answered by the kernel's cache, not the server (a game re-stats the same
+// files all the time: each a round trip and a resolve over every layer, every second). Teeth: the 1 s timeouts
+// (asked again 1.5 s later).
+TEST(a_file_looked_at_again_is_answered_by_the_kernel) {
+    Fixture F; pid_t S = 0;
+    const fs::path Log = F.root / "ops.log";
+    ::setenv("VGFS_OPLOG", Log.c_str(), 1);
+    CHECK(MountedBySpawner(F, S, false));
+    ::unsetenv("VGFS_OPLOG");
+    struct stat St {};
+    CHECK(::stat((F.mp / "a.txt").c_str(), &St) == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    CHECK(::stat((F.mp / "a.txt").c_str(), &St) == 0);
+    CHECK(GetattrsOf(Log, "/a.txt") == 1);
+    CHECK(::kill(-S, SIGKILL) == 0);
+    waitpid(S, nullptr, 0);
+    CHECK(F.TornDown(std::chrono::seconds(10)));
+}
+
+// A folder listed hands the kernel every entry's attributes (readdirplus): looking at each entry after the listing
+// asks the server nothing more. Teeth: list with types only (each entry looked up again).
+TEST(a_listed_folder_answers_its_entries_from_the_listing) {
+    Fixture F; pid_t S = 0;
+    for (int I = 0; I < 5; ++I) std::ofstream(F.root / "layer" / ("f" + std::to_string(I) + ".txt")) << I;
+    const fs::path Log = F.root / "ops.log";
+    ::setenv("VGFS_OPLOG", Log.c_str(), 1);
+    CHECK(MountedBySpawner(F, S, false));
+    ::unsetenv("VGFS_OPLOG");
+    int Seen = 0;
+    for (const auto &E : fs::directory_iterator(F.mp)) { struct stat St {}; if (::stat(E.path().c_str(), &St) == 0) ++Seen; }
+    CHECK(Seen == 6);
+    int Asked = 0;
+    for (int I = 0; I < 5; ++I) Asked += GetattrsOf(Log, "/f" + std::to_string(I) + ".txt");
+    CHECK(Asked == 0);
+    CHECK(::kill(-S, SIGKILL) == 0);
+    waitpid(S, nullptr, 0);
+    CHECK(F.TornDown(std::chrono::seconds(10)));
+}
+
+// A file changed outside the mount (a kept folder, by the user) reads as it is now at its next open a second or two
+// later — not after the attribute cache's ten seconds. Teeth: check the cached pages against the attribute cache.
+TEST(a_file_changed_outside_reads_new_at_its_next_open) {
+    Fixture F; pid_t S = 0;
+    CHECK(MountedBySpawner(F, S, false));
+    auto ReadAll = [&] { std::ifstream In(F.mp / "a.txt"); std::string Got; In >> Got; return Got; };
+    CHECK(ReadAll() == "hi");
+    { std::ofstream(F.root / "layer" / "a.txt", std::ios::trunc) << "yo"; }   // same size, a later time
+    fs::last_write_time(F.root / "layer" / "a.txt", fs::file_time_type::clock::now() + std::chrono::seconds(3));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    CHECK(ReadAll() == "yo");
+    CHECK(::kill(-S, SIGKILL) == 0);
+    waitpid(S, nullptr, 0);
+    CHECK(F.TornDown(std::chrono::seconds(10)));
+}
+
+// A file read through the mount comes back byte for byte, answered with the host file itself (the kernel splices it to
+// the reader) rather than copied through a buffer. Teeth: answer with a buffer (no "read_buf fd" in the log); hand
+// over the wrong offset (the bytes differ).
+TEST(a_file_read_through_the_mount_is_handed_over_from_its_file) {
+    Fixture F; pid_t S = 0;
+    std::string Big(3 << 20, '\0');
+    for (size_t I = 0; I < Big.size(); ++I) Big[I] = (char)(I * 31 + I / 4096);
+    std::ofstream(F.root / "layer" / "big.bin", std::ios::binary) << Big;
+    const fs::path Log = F.root / "ops.log";
+    ::setenv("VGFS_OPLOG", Log.c_str(), 1);
+    CHECK(MountedBySpawner(F, S, false));
+    ::unsetenv("VGFS_OPLOG");
+    std::string Got;
+    {
+        std::ifstream In(F.mp / "big.bin", std::ios::binary);
+        Got.assign((std::istreambuf_iterator<char>(In)), std::istreambuf_iterator<char>());
+    }                                                                   // closed: an open file keeps the server up
+    CHECK(Got == Big);
+    std::ifstream L(Log);
+    int Handed = 0;
+    for (std::string Line; std::getline(L, Line); ) Handed += Line == "read_buf fd";
+    CHECK(Handed > 0);
+    CHECK(::kill(-S, SIGKILL) == 0);
+    waitpid(S, nullptr, 0);
     CHECK(F.TornDown(std::chrono::seconds(10)));
 }
 

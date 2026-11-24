@@ -8,13 +8,15 @@
 #include <fstream>
 #include <cstring>
 #include <cerrno>
+#include <cstdio>
 #include <unordered_map>
 #include <unordered_set>
 #include <fcntl.h>      // O_RDONLY / O_CREAT / O_WRONLY / O_TRUNC flag constants (passed to HostIO::Open)
 #include <iostream>
 
 namespace fs = std::filesystem;
-static constexpr uint64_t kIndexPrefetch = 1ull << 20;   // what a mount reads first of each archive, asked for at once
+static constexpr uint64_t kIndexPrefetch = 1ull << 20;
+static std::atomic<long long> g_CaseWalks{ 0 };   // archive members submounts' case names were walked over   // what a mount reads first of each archive, asked for at once
 
 // ---- small path helpers --------------------------------------------------
 
@@ -22,19 +24,56 @@ static constexpr uint64_t kIndexPrefetch = 1ull << 20;   // what a mount reads f
 // INSIDE the layer's source root. A zip layer already rejects absolute targets; a dir layer's host symlink
 // could point at an absolute path (`-> /etc/passwd`) or `../..`-escape the source, which would make the FS
 // serve an arbitrary host file. Returns true iff the followed `host` path is contained in `layerSource`.
-static bool SymlinkContained(const std::string &host, const std::string &layerSource)
+//layerCanon is the layer's source resolved once at Init (Layer::sourceCanon): resolving it again at every link met —
+//a lookup per path component, through FUSE when the source is another mount — always gave the same answer.
+static bool SymlinkContained(const std::string &host, const std::string &layerCanon)
 {
     std::error_code ec;
     std::filesystem::path resolved = std::filesystem::weakly_canonical(host, ec);
-    if (ec) return false;
-    std::filesystem::path rootc = std::filesystem::weakly_canonical(layerSource, ec);
-    if (ec) return false;
+    if (ec || layerCanon.empty()) return false;
+    const std::filesystem::path rootc(layerCanon);
     // Lexical prefix check on canonical paths (both absolute, no symlinks remaining).
     auto rit = rootc.begin(), rend = rootc.end();
     auto pit = resolved.begin(), pend = resolved.end();
     for (; rit != rend; ++rit, ++pit)
         if (pit == pend || *pit != *rit) return false;
     return true;   // resolved == rootc or a descendant
+}
+
+//Every path under source/sub (relative to source, folded when case-insensitive), when there are at most kListMax and
+//none is a link; else null (Layer::listed).
+static constexpr size_t kListMax = 20000;
+static std::shared_ptr<const std::unordered_set<std::string>> ListSmallDirLayer(const std::string &source, const std::string &sub, bool fold)
+{
+    auto Out = std::make_shared<std::unordered_set<std::string>>();
+    bool Ok = true;
+    //Not listed: a folder it cannot read (taken for empty, its files were never found), a link (what it names may
+    //change), and — folded — a name past ASCII (FoldCase folds ASCII alone; the host's own lookup matched the rest).
+    std::function<void(const std::string &)> Walk = [&](const std::string &rel) {
+        if (!Ok) return;
+        const int e = HostIO::ReadDirTyped(rel.empty() ? source : source + "/" + rel, [&](const std::string &n, int isDir) {
+            if (!Ok) return;
+            const std::string Child = rel.empty() ? n : rel + "/" + n;
+            if (isDir == 2) { Ok = false; return; }
+            if (isDir < 0)
+            {
+                HostIO::Stat st;   // only what the listing leaves untyped
+                if (HostIO::Lstat(source + "/" + Child, st) != 0 || st.isSymlink) { Ok = false; return; }
+                isDir = st.isDir ? 1 : 0;
+            }
+            if (fold && std::any_of(n.begin(), n.end(), [](char c) { return (unsigned char)c >= 0x80; })) { Ok = false; return; }
+            if (Out->size() >= kListMax) { Ok = false; return; }
+            Out->insert(fold ? FoldCase(Child) : Child);
+            if (isDir == 1) Walk(Child);
+        });
+        if (e != 0) Ok = false;
+    };
+    HostIO::Stat st;
+    if (!sub.empty() && (HostIO::Lstat(source + "/" + sub, st) != 0 || !st.isDir || st.isSymlink)) return nullptr;
+    if (!sub.empty()) Out->insert(fold ? FoldCase(sub) : sub);
+    Walk(sub);
+    if (!Ok) return nullptr;
+    return Out;
 }
 
 static std::string ParentVRel(const std::string &vrel)
@@ -153,6 +192,15 @@ bool VfsState::Init(const Spec &S, std::string &Err)
             L.zip = Archive ? Index[gi] : nullptr;
             L.priority = prio++;
             L.maskedUnder = P.maskedUnder[gi];
+            if (LS.type == LayerType::Dir)
+            {
+                std::error_code Ec;
+                const std::filesystem::path C = std::filesystem::weakly_canonical(LS.source, Ec);
+                if (!Ec) L.sourceCanon = C.string();
+                //Only a layer whose source cannot change while mounted is answered from a listing taken now (a
+                //runtime-sourced folder is filled by another mount after this one starts).
+                if (!LS.rw && LS.fixed) L.listed = ListSmallDirLayer(LS.source, sub, S.caseInsensitive);
+            }
             if (LS.type == LayerType::File)
             {
                 L.fileBase  = BaseName(LS.source);
@@ -195,8 +243,21 @@ bool VfsState::Init(const Spec &S, std::string &Err)
                 }
                 Add(L.target.empty() ? Under : (Under.empty() ? L.target : L.target + "/" + Under));
             };
-            for (const auto &[Name, E] : L.zip->byName) AddZip(Name);
-            for (const auto &[Dir, Kids] : L.zip->dirChildren) AddZip(Dir);
+            if (L.subpath.empty())
+            {
+                for (const auto &[Name, E] : L.zip->byName) AddZip(Name);
+                for (const auto &[Dir, Kids] : L.zip->dirChildren) AddZip(Dir);
+                continue;
+            }
+            //A submount spells only what lies under its subpath: walked from there down the archive's own tree, not
+            //found by a look at every member of the archive — once per submount of it.
+            AddZip(L.subpath);
+            std::function<void(const std::string &)> Walk = [&](const std::string &D) {
+                const auto It = L.zip->dirChildren.find(D);
+                if (It == L.zip->dirChildren.end()) return;
+                for (const std::string &K : It->second) { const std::string C = D + "/" + K; ++g_CaseWalks; AddZip(C); Walk(C); }
+            };
+            Walk(L.subpath);
         }
         for (const std::string &D : implicitDirs) canonCase.try_emplace(FoldCase(D), D);
     }
@@ -250,21 +311,60 @@ std::string SourceRel(const Layer &L, const std::string &vrel)
 // swaps the set, so a reader that observes the new set finds the marker already durable.
 
 using MaskSet = std::set<std::string>;
-using MaskPtr = std::shared_ptr<const MaskSet>;
+using MaskPtr = std::shared_ptr<const MaskSnap>;
 
 static MaskPtr LoadMask(const std::atomic<MaskPtr> &a)
 {
     return a.load(std::memory_order_acquire);
 }
 
-//Clone-modify-swap under maskWriteMtx. `mut` edits the writable clone.
+//A mask of a whole set (Init's seeding).
+static MaskPtr WholeMask(std::shared_ptr<MaskSet> Set)
+{
+    auto M = std::make_shared<MaskSnap>();
+    M->base = std::move(Set);
+    return M;
+}
+
+std::atomic<long long> g_MaskFolds{ 0 };
+long long DebugCaseWalks() { return g_CaseWalks.load(); }
+long long DebugMaskFolds() { return g_MaskFolds.load(); }
+
+//One name in (In) or out of the mask: a copy of the changes since the last fold only, the shared set as it is. Under
+//maskWriteMtx; readers keep the version they loaded.
+static void EditMask(VfsState &S, std::atomic<MaskPtr> &a, const std::string &K, bool In)
+{
+    std::lock_guard<std::mutex> g(S.maskWriteMtx);
+    MaskPtr cur = a.load(std::memory_order_acquire);
+    auto next = cur ? std::make_shared<MaskSnap>(*cur) : std::make_shared<MaskSnap>();
+    if (In) { if (!next->removed.erase(K) && !next->base->count(K)) next->added.insert(K); }
+    else    { if (!next->added.erase(K) && next->base->count(K)) next->removed.insert(K); }
+    if (next->added.size() + next->removed.size() > std::max<size_t>(256, next->base->size() / 8))
+    {   // folded in: the whole set copied once per an eighth of its size in changes
+        auto Whole = std::make_shared<MaskSet>(*next->base);
+        for (const auto &R : next->removed) Whole->erase(R);
+        Whole->insert(next->added.begin(), next->added.end());
+        next = std::make_shared<MaskSnap>();
+        next->base = std::move(Whole);
+        ++g_MaskFolds;
+    }
+    a.store(std::move(next), std::memory_order_release);
+}
+
+//Clone-modify-swap of the whole set under maskWriteMtx (a rename's rewrite of every name under a folder). `mut`
+//edits the writable clone, which becomes the new base.
 static void MutateMask(VfsState &S, std::atomic<MaskPtr> &a, const std::function<void(MaskSet &)> &mut)
 {
     std::lock_guard<std::mutex> g(S.maskWriteMtx);
     MaskPtr cur = a.load(std::memory_order_acquire);
-    auto next = std::make_shared<MaskSet>(cur ? *cur : MaskSet{});
-    mut(*next);
-    a.store(std::move(next), std::memory_order_release);
+    auto Whole = std::make_shared<MaskSet>(cur ? *cur->base : MaskSet{});
+    if (cur)
+    {
+        for (const auto &R : cur->removed) Whole->erase(R);
+        Whole->insert(cur->added.begin(), cur->added.end());
+    }
+    mut(*Whole);
+    a.store(WholeMask(std::move(Whole)), std::memory_order_release);
 }
 
 std::string WhiteoutPath(const VfsState &S, const std::string &vrel)
@@ -286,14 +386,14 @@ void CreateWhiteout(VfsState &S, const std::string &vrel)
     fs::create_directories(WLPath(S, ParentVRel(vrel)), ec);
     HostIO::Fd fd = HostIO::Open(WhiteoutPath(S, vrel), O_CREAT | O_WRONLY, 0644);
     if (fd >= 0) HostIO::Close(fd);
-    MutateMask(S, S.whiteoutSet, [&](MaskSet &m) { m.insert(vrel); });
+    EditMask(S, S.whiteoutSet, vrel, true);
 }
 
 void RemoveWhiteout(VfsState &S, const std::string &vrel)
 {
     if (S.writelayer.empty()) return;
     HostIO::Unlink(WhiteoutPath(S, vrel));
-    MutateMask(S, S.whiteoutSet, [&](MaskSet &m) { m.erase(vrel); });
+    EditMask(S, S.whiteoutSet, vrel, false);
 }
 
 static std::string OpaqueMarker(const VfsState &S, const std::string &vrel)
@@ -306,14 +406,14 @@ void MarkOpaque(VfsState &S, const std::string &vrel)
     if (S.writelayer.empty()) return;
     HostIO::Fd fd = HostIO::Open(OpaqueMarker(S, vrel), O_CREAT | O_WRONLY, 0644);
     if (fd >= 0) HostIO::Close(fd);
-    MutateMask(S, S.opaqueSet, [&](MaskSet &m) { m.insert(vrel); });
+    EditMask(S, S.opaqueSet, vrel, true);
 }
 
 void UnmarkOpaque(VfsState &S, const std::string &vrel)
 {
     if (S.writelayer.empty()) return;
     // Disk marker removal is the caller's business (the rmdir sweep already unlinks it); just drop the mask.
-    MutateMask(S, S.opaqueSet, [&](MaskSet &m) { m.erase(vrel); });
+    EditMask(S, S.opaqueSet, vrel, false);
 }
 
 void RenameMaskPrefix(VfsState &S, const std::string &oldv, const std::string &newv)
@@ -370,17 +470,18 @@ static void SeedMasksFromWritelayer(VfsState &S)
     auto opq = std::make_shared<MaskSet>();
     std::function<void(const std::string &)> walk = [&](const std::string &vdir) {
         std::string host = WLPath(S, vdir);
-        HostIO::ReadDir(host, [&](const std::string &n) {
+        HostIO::ReadDirTyped(host, [&](const std::string &n, int isDir) {
             std::string childV = vdir.empty() ? n : vdir + "/" + n;
             if (n == ".wh..wh..opq") { opq->insert(vdir); return; }
+            if (n.rfind(kCopyTmpPrefix, 0) == 0) { HostIO::Unlink(host + "/" + n); return; }   // a copy cut short
             if (n.rfind(".wh.", 0) == 0) { wh->insert(vdir.empty() ? n.substr(4) : vdir + "/" + n.substr(4)); return; }
-            HostIO::Stat st;
-            if (HostIO::Lstat(host + "/" + n, st) == 0 && st.isDir) walk(childV);
+            HostIO::Stat st;   // the listing's own type: a stat per entry only where it does not say
+            if (isDir == 1 || (isDir < 0 && HostIO::Lstat(host + "/" + n, st) == 0 && st.isDir)) walk(childV);
         });
     };
     walk("");
-    S.whiteoutSet.store(std::move(wh), std::memory_order_release);
-    S.opaqueSet.store(std::move(opq), std::memory_order_release);
+    S.whiteoutSet.store(WholeMask(std::move(wh)), std::memory_order_release);
+    S.opaqueSet.store(WholeMask(std::move(opq)), std::memory_order_release);
 }
 
 // ---- case ----------------------------------------------------------------
@@ -432,6 +533,7 @@ ResolveResult Resolve(VfsState &S, const std::string &vrel)
         if (L.type == LayerType::Dir)
         {
             std::string rel = SourceRel(L, vrel);
+            if (L.listed && !rel.empty() && !L.listed->count(S.caseInsensitive ? FoldCase(rel) : rel)) continue;   // not in it: no stat
             std::string host = rel.empty() ? L.source : (L.source + "/" + rel);
             HostIO::Stat st;
             if (HostIO::Lstat(host, st) == 0)
@@ -442,7 +544,7 @@ ResolveResult Resolve(VfsState &S, const std::string &vrel)
                 // writelayer: they hold live guest-written state (persisted user dirs where proton keeps
                 // its own user-path links), which must round-trip as authored.
                 if (S.flattenSymlinks && !L.rw && st.isSymlink &&
-                    (HostIO::StatFollow(host, st) != 0 || !SymlinkContained(host, L.source)))
+                    (HostIO::StatFollow(host, st) != 0 || !SymlinkContained(host, L.sourceCanon)))
                     continue;   // dangling OR escapes the layer source → not served by this layer
                 R.kind = HitKind::DirLayer; R.hostPath = host; R.layer = &L; R.rwPassthrough = L.rw;
                 return R;
@@ -550,17 +652,20 @@ static void SeedKeptMasks(Layer &L)
     auto del = std::make_shared<MaskSet>(), opq = std::make_shared<MaskSet>();
     std::function<void(const std::string &)> walk = [&](const std::string &rel) {
         const std::string host = KeptHost(L, rel);
-        HostIO::ReadDir(host, [&](const std::string &n) {
+        //The listing's own type: a stat per entry, to learn it, made a mount of a kept folder of 100,000 saves and mods
+        //100,000 stats (seconds on cold metadata). Only an entry the listing does not type is stat'd.
+        HostIO::ReadDirTyped(host, [&](const std::string &n, int isDir) {
             if (n == ".wh..wh..opq") { opq->insert(rel); return; }
+            if (n.rfind(kCopyTmpPrefix, 0) == 0) { HostIO::Unlink(host + "/" + n); return; }   // a copy cut short
             if (n.rfind(".wh.", 0) == 0) { del->insert(rel.empty() ? n.substr(4) : rel + "/" + n.substr(4)); return; }
             HostIO::Stat st;
-            if (HostIO::Lstat(host + "/" + n, st) == 0 && st.isDir) walk(rel.empty() ? n : rel + "/" + n);
+            if (isDir == 1 || (isDir < 0 && HostIO::Lstat(host + "/" + n, st) == 0 && st.isDir)) walk(rel.empty() ? n : rel + "/" + n);
         });
     };
     walk(L.subpath);
     L.kept = std::make_shared<KeptMasks>();
-    L.kept->deleted.store(std::move(del), std::memory_order_release);
-    L.kept->opaque.store(std::move(opq), std::memory_order_release);
+    L.kept->deleted.store(WholeMask(std::move(del)), std::memory_order_release);
+    L.kept->opaque.store(WholeMask(std::move(opq)), std::memory_order_release);
 }
 
 int HideLower(VfsState &S, const std::string &vrel)
@@ -571,7 +676,7 @@ int HideLower(VfsState &S, const std::string &vrel)
         if (!rel.empty())
         {
             if (int e = TouchMarker(KeptMarker(*L, rel)); e != 0) return e;
-            MutateMask(S, L->kept->deleted, [&](MaskSet &m) { m.insert(rel); });
+            EditMask(S, L->kept->deleted, rel, true);
             return 0;
         }
     }
@@ -585,7 +690,7 @@ int UnhideLower(VfsState &S, const std::string &vrel)
         if (const std::string rel = SourceRel(*L, vrel); !rel.empty() && InMask(L->kept->deleted, rel))
         {
             if (int e = HostIO::Unlink(KeptMarker(*L, rel)); e != 0 && e != -ENOENT) return e;
-            MutateMask(S, L->kept->deleted, [&](MaskSet &m) { m.erase(rel); });
+            EditMask(S, L->kept->deleted, rel, false);
         }
     RemoveWhiteout(S, vrel);
     return 0;
@@ -625,7 +730,7 @@ int KeptMarkOpaque(VfsState &S, const std::string &vrel)
     if (!L) return -EINVAL;
     const std::string rel = SourceRel(*L, vrel);
     if (int e = TouchMarker(KeptHost(*L, rel) + "/.wh..wh..opq"); e != 0) return e;
-    MutateMask(S, L->kept->opaque, [&](MaskSet &m) { m.insert(rel); });
+    EditMask(S, L->kept->opaque, rel, true);
     return 0;
 }
 
@@ -659,7 +764,7 @@ void KeptDropMarkersUnder(VfsState &S, const std::string &vrel)
     auto under = [&](const std::string &x) { return rel.empty() ? !x.empty() && x.find('/') == std::string::npos
                                                                 : x.rfind(rel + "/", 0) == 0 && x.find('/', rel.size() + 1) == std::string::npos; };
     MutateMask(S, L->kept->deleted, [&](MaskSet &m) { for (auto it = m.begin(); it != m.end();) it = under(*it) ? m.erase(it) : std::next(it); });
-    MutateMask(S, L->kept->opaque, [&](MaskSet &m) { m.erase(rel); });
+    EditMask(S, L->kept->opaque, rel, false);
 }
 
 int EnsureWriteParent(VfsState &S, const std::string &vrel)
@@ -670,7 +775,119 @@ int EnsureWriteParent(VfsState &S, const std::string &vrel)
     return ec ? -EIO : 0;
 }
 
+VfsState::PendingCopy::~PendingCopy()
+{
+    if (const int Fd = upper.load(); Fd >= 0) HostIO::Close(Fd);
+}
+
+std::string VfsState::PendingKey(const std::string &vrel) const
+{
+    return caseInsensitive ? FoldCase(vrel) : vrel;
+}
+
+std::shared_ptr<VfsState::PendingCopy> VfsState::PendingFor(const std::string &vrel, unsigned long long SeenDetaches,
+                                                            const std::function<bool()> &StillOpened)
+{
+    std::lock_guard<std::mutex> g(pendingMu);
+    //A name changed (unlinked, renamed over, made again) since the open resolved it, and what it names now is not the
+    //file the open has: a marker of its own, off every name.
+    if (detaches.load() != SeenDetaches && !StillOpened())
+    {
+        auto Own = std::make_shared<PendingCopy>();
+        Own->detached.store(true);
+        return Own;
+    }
+    const std::string K = PendingKey(vrel);
+    auto &W = pendingCopies[K];
+    if (auto P = W.lock()) return P;
+    auto P = std::make_shared<PendingCopy>();
+    W = P;
+    //Markers no handle holds any more go now and then — every open of a lower file makes one, so a sweep at each was
+    //the square of the open handles.
+    if (pendingCopies.size() >= pendingPruneAt)
+    {
+        for (auto It = pendingCopies.begin(); It != pendingCopies.end();)
+            It = It->second.expired() && It->first != K ? pendingCopies.erase(It) : std::next(It);
+        pendingPruneAt = std::max<size_t>(64, pendingCopies.size() * 2);
+    }
+    return P;
+}
+
+void VfsState::MarkCopied(const std::string &vrel, HostIO::Fd Fd)
+{
+    std::lock_guard<std::mutex> g(pendingMu);
+    const auto It = pendingCopies.find(PendingKey(vrel));
+    const auto P = It == pendingCopies.end() ? nullptr : It->second.lock();
+    int Expected = -1;
+    if (!P || !P->upper.compare_exchange_strong(Expected, Fd, std::memory_order_acq_rel)) HostIO::Close(Fd);
+}
+
+void VfsState::BeginNameChange()
+{
+    std::lock_guard<std::mutex> g(pendingMu);
+    ++nameChanges;
+    ++detaches;
+}
+
+void VfsState::EndNameChange(const std::vector<std::pair<std::string, bool>> &Detach)
+{
+    {
+        std::lock_guard<std::mutex> g(pendingMu);
+        for (const auto &[V, Subtree] : Detach) DetachPendingLocked(V, Subtree);
+        --nameChanges;
+    }
+    nameChangeCv.notify_all();
+}
+
+void VfsState::AdoptCopy(const std::string &vrel, const std::string &host)
+{
+    std::unique_lock<std::mutex> g(pendingMu);
+    //A change half done: what host is, is not known yet. Once it is done, a marker its name no longer names is out of
+    //the map (DetachPendingLocked): nothing is adopted for it.
+    nameChangeCv.wait(g, [&] { return nameChanges == 0; });
+    const auto It = pendingCopies.find(PendingKey(vrel));
+    const auto P = It == pendingCopies.end() ? nullptr : It->second.lock();
+    if (!P || P->upper.load(std::memory_order_acquire) >= 0) return;
+    const HostIO::Fd Fd = HostIO::Open(host, O_RDWR);
+    if (Fd < 0)
+    {
+        std::fprintf(stderr, "vidyagodfs: the copy of %s cannot be opened (%d): its handles keep reading below and "
+                             "fail to write\n", vrel.c_str(), Fd);
+        return;
+    }
+    P->upper.store(Fd, std::memory_order_release);
+}
+
+void VfsState::DetachPendingLocked(const std::string &vrel, bool subtree)
+{
+    ++detaches;
+    const std::string K = PendingKey(vrel);
+    const auto Detach = [](std::unordered_map<std::string, std::weak_ptr<PendingCopy>>::iterator It) {
+        if (auto P = It->second.lock()) P->detached.store(true, std::memory_order_release);
+    };
+    if (const auto It = pendingCopies.find(K); It != pendingCopies.end()) { Detach(It); pendingCopies.erase(It); }
+    if (!subtree) return;
+    const std::string Under = K.empty() ? std::string() : K + "/";
+    for (auto It = pendingCopies.begin(); It != pendingCopies.end();)
+        if (It->first.compare(0, Under.size(), Under) == 0) { Detach(It); It = pendingCopies.erase(It); }
+        else ++It;
+}
+
+static int CopyUpImpl(VfsState &S, const std::string &vrel, const ResolveResult &rr, HostIO::Fd &copyFd);
+
+//Every copy-up opens the copy for the handles still reading the path from below (VfsOpen), once.
 int CopyUp(VfsState &S, const std::string &vrel, const ResolveResult &rr)
+{
+    HostIO::Fd copyFd = -1;
+    const int rc = CopyUpImpl(S, vrel, rr, copyFd);
+    if (rc != 0) return rc;
+    if (rr.kind == HitKind::WriteLayer || rr.rwPassthrough) return 0;   // nothing below: nothing was copied
+    ++S.copyUps;
+    if (copyFd >= 0) S.MarkCopied(vrel, copyFd);   // the copy itself, whatever its name meets from here on
+    return 0;
+}
+
+static int CopyUpImpl(VfsState &S, const std::string &vrel, const ResolveResult &rr, HostIO::Fd &copyFd)
 {
     if (S.writelayer.empty()) return -EROFS;
     if (rr.kind == HitKind::WriteLayer) return 0;       // already writable
@@ -741,8 +958,11 @@ int CopyUp(VfsState &S, const std::string &vrel, const ResolveResult &rr)
         }
     }
 
-    // File copy-up: materialize full content into the writelayer.
-    HostIO::Fd out = HostIO::Open(dst, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    // File copy-up: materialize full content into the writelayer — under a name no listing shows, renamed to its own
+    // when whole: a copy cut short (a full disk, a crash, a kill) is never taken for the file ("already copied" above).
+    static std::atomic<unsigned long long> CopySeq{ 0 };
+    const std::string tmp = fs::path(dst).parent_path().string() + "/" + kCopyTmpPrefix + std::to_string(++CopySeq);
+    HostIO::Fd out = HostIO::Open(tmp, O_CREAT | O_EXCL | O_RDWR | O_TRUNC, 0644);   // kept open: the handles' copy
     if (out < 0) return out;
 
     int rc = 0;
@@ -786,7 +1006,12 @@ int CopyUp(VfsState &S, const std::string &vrel, const ResolveResult &rr)
             if (HostIO::Lstat(rr.hostPath, st) == 0) HostIO::Fchmod(out, (st.mode & 0777) | 0200);
         }
     }
-    HostIO::Close(out);
-    if (rc != 0) HostIO::Unlink(dst);
-    return rc;
+    if (S.debugHook) S.debugHook("copy-before-rename");
+    //Never over a file made at the name while this was copied (a game's save renamed into place): that one is newer.
+    //The handles waiting on this copy were taken off the name by that change; they make copies of their own.
+    if (rc == 0) rc = HostIO::RenameNoReplace(tmp, dst);
+    if (rc == -EEXIST) { HostIO::Unlink(tmp); HostIO::Close(out); return 0; }
+    if (rc != 0) { HostIO::Unlink(tmp); HostIO::Close(out); return rc; }
+    copyFd = out;
+    return 0;
 }

@@ -1,6 +1,7 @@
 #ifndef VIDYAGODFS_VGDELTA_H
 #define VIDYAGODFS_VGDELTA_H
 
+#include <array>
 #include "bytesource.h"
 
 #include <cstdint>
@@ -92,6 +93,18 @@ public:
     void     prefetch(uint64_t off, uint64_t n) override;
     bool     scattered() const override { return true; }
     uint64_t size() const override { return TargetSize; }
+    size_t   runs() const { return Segs.size(); }   // the flat map's runs (tests)
+    const std::vector<FlatSeg> &flatRuns() const { return Segs; }   // (tests)
+    //Whether a run continues the one before it (the same kind, from where it ended, of the same file): never, once
+    //Create has joined them (tests).
+    bool     runsLeftUnjoined() const {
+        for (size_t I = 1; I < Segs.size(); ++I)
+        {
+            const FlatSeg &p = Segs[I - 1], &s = Segs[I];
+            if (p.kind == s.kind && p.srcOff + p.len == s.srcOff && (s.kind == KIND_COPY || p.addSrc == s.addSrc)) return true;
+        }
+        return false;
+    }
 
 private:
     int readAdd(uint32_t addSrc, const AddSource &A, uint8_t *buf, size_t n, uint64_t addOff);
@@ -104,12 +117,23 @@ private:
     std::vector<std::shared_ptr<AddSource>>  AddSources; // one per delta file surviving in the flattened chain
     std::vector<FlatSeg>                     Segs;       // flat, sorted by targetOff, gap-free over [0,TargetSize)
     uint64_t                                 TargetSize = 0;
+    std::mutex                               PrefMu;     // the last ranges prefetched: one inside them is not again
+    std::array<std::pair<uint64_t, uint64_t>, 16> Prefetched{};
+    size_t                                   PrefNext = 0;
 
 };
 
 // The bytes of decompressed ADD blocks the process holds now (all delta views together), and the most it keeps.
 size_t CachedBlockBytes();
 size_t CachedBlockBudget();
+size_t DefaultCachedBlockBudget();      // what the budget is unless set: a 32nd of memory, 128 MiB to 1 GiB
+void   SetCachedBlockBudget(size_t Bytes);   // tests, and a mount told how much to keep (0: the default again)
+//This mount's share of its launch's budget: the default split between the launch's mounts, never under 64 MiB
+//(VGFS_BLOCK_CACHE_MB, when set, is this mount's own and is kept whole).
+void   ShareCachedBlockBudget(int Mounts);
+long long DebugDecompressions();        // TEST ONLY: ADD blocks decompressed
+long long DebugPrefetchScans();         // TEST ONLY: prefetches that went over their runs
+void   DebugSlowDecompress(int Ms);     // TEST ONLY: each decompression takes this much longer
 
 // Generates a .vgdelta reconstructing `target` from `base` (both addressable as flat memory — mmap them; the target is
 // read once, sequentially). Uses a rolling-hash + greedy-extend matcher; literal runs are stored as per-block zstd.

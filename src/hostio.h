@@ -99,6 +99,8 @@ int     Mkdir   (const std::string &path, uint32_t mode);
 int     Unlink  (const std::string &path);
 int     Rmdir   (const std::string &path);
 int     Rename  (const std::string &from, const std::string &to);
+// Rename that never replaces: -EEXIST when `to` is there (a file made there meanwhile wins).
+int     RenameNoReplace(const std::string &from, const std::string &to);
 int     Link    (const std::string &existing, const std::string &newpath);   // a hard link
 int     Truncate(const std::string &path, uint64_t size);
 int     Chmod   (const std::string &path, uint32_t mode);
@@ -111,6 +113,12 @@ int     Statvfs (const std::string &path, StatvfsInfo &out);
 // 0 on success (a missing/unreadable dir yields no entries and 0 — matching the core's
 // existing "opendir may fail, just skip" behavior), or -errno on a hard error.
 int     ReadDir (const std::string &path, const std::function<void(const std::string &)> &cb);
+// ReadDir with each entry's kind as the listing gives it, without a stat: 1 a directory (not a link to one), 2 a symbolic
+// link, 0 anything else, -1 not said (a filesystem that leaves d_type unknown, a Windows reparse point) — then Lstat it.
+// Unlike ReadDir, a folder that cannot be read is -errno (a caller indexing a tree must not take it for an empty one).
+int     ReadDirTyped(const std::string &path, const std::function<void(const std::string &, int isDir)> &cb);
+// TEST ONLY: Lstat calls since start.
+long long DebugLstats();
 
 } // namespace HostIO
 

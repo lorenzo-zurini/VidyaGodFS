@@ -10,6 +10,8 @@
 #include <string>
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cerrno>
 #include <fcntl.h>
@@ -35,10 +37,19 @@ static void ToStat(const VfsAttr &a, struct stat *st)
 
 static OpenFile *OF(struct fuse_file_info *fi) { return fi ? (OpenFile *)(uintptr_t)fi->fh : nullptr; }
 
+//VGFS_OPLOG=<file>: every getattr this server answers, one line each (tests count what reached the server: the kernel
+//answers from its cache what it may).
+static FILE *OpLog()
+{
+    static FILE *F = [] { const char *P = std::getenv("VGFS_OPLOG"); return P && *P ? std::fopen(P, "a") : nullptr; }();
+    return F;
+}
+
 // ---- ops (thin marshalling) ----------------------------------------------
 
 static int op_getattr(const char *path, struct stat *st, struct fuse_file_info *)
 {
+    if (FILE *L = OpLog()) { std::fprintf(L, "getattr %s\n", path ? path : ""); std::fflush(L); }
     VfsAttr a;
     if (int e = VfsGetattr(*St(), V(path), a); e != 0) return e;
     ToStat(a, st);
@@ -46,14 +57,17 @@ static int op_getattr(const char *path, struct stat *st, struct fuse_file_info *
 }
 
 static int op_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t,
-                      struct fuse_file_info *, enum fuse_readdir_flags)
+                      struct fuse_file_info *, enum fuse_readdir_flags flags)
 {
     filler(buf, ".",  nullptr, 0, (fuse_fill_dir_flags)0);
     filler(buf, "..", nullptr, 0, (fuse_fill_dir_flags)0);
-    //With a stat, the entry carries its type (d_type); only st_mode's type bits are used without FUSE_FILL_DIR_PLUS.
+    //Each entry's attributes are worked out for the listing anyway (its type is in them): asked for a readdirplus,
+    //they are handed over whole, and the kernel keeps them — a lookup per entry after a listing (a game's, Wine's
+    //case-insensitive search) asked them all again, one by one.
+    const auto Plus = (flags & FUSE_READDIR_PLUS) ? FUSE_FILL_DIR_PLUS : (fuse_fill_dir_flags)0;
     return VfsReaddirTyped(*St(), V(path), [&](const std::string &n, const VfsAttr &a) {
         struct stat st; ToStat(a, &st);
-        filler(buf, n.c_str(), &st, 0, (fuse_fill_dir_flags)0);
+        filler(buf, n.c_str(), &st, 0, Plus);
     });
 }
 
@@ -64,19 +78,32 @@ static int op_opendir(const char *, struct fuse_file_info *fi)
     // opendir calls (wine re-opens the directory on every case-insensitive lookup miss, so
     // without it the cache would be dropped before it's ever reused). The kernel invalidates the
     // cache itself on create/unlink/rename through this mount; external writes into passthrough
-    // sources can go stale for a bit — same trade-off auto_cache already makes for file data.
+    // sources can go stale for a bit (a listing, until the kernel drops it; a file's pages: at most a second past its
+    // next open, op_init).
     fi->cache_readdir = 1;
     fi->keep_cache    = 1;
     return 0;
 }
 
-static void *op_init(struct fuse_conn_info *, struct fuse_config *cfg)
+static void *op_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
 {
-    // Cache exact-name misses for a second (default 0 re-asks userspace on every negative
-    // lookup); attr/entry keep libfuse's 1s defaults, stated here so the choice is explicit.
-    cfg->negative_timeout = 1.0;
-    cfg->attr_timeout     = 1.0;
-    cfg->entry_timeout    = 1.0;
+    //Reads answered with a file (op_read_buf) go to the kernel by splice — when it can (a kernel without it: copied).
+    fuse_set_feature_flag(conn, FUSE_CAP_SPLICE_WRITE);
+    fuse_set_feature_flag(conn, FUSE_CAP_SPLICE_MOVE);
+    // How long the kernel answers lookups, attributes and misses itself. A mount's layers never change under it (an
+    // archive, a delta, a package's folder), and a change made through a name the kernel sees and invalidates at that
+    // name: a 1 s cache made every path a game touches again a second later a round trip and a resolve over every
+    // layer. What the longer cache leaves stale for up to its length: a size or a time looked at through ANOTHER name
+    // of a hard-linked file after a write through one (each name is its own node here), and one changed OUTSIDE the
+    // mount (a kept folder, by the user).
+    cfg->negative_timeout = kNegativeTimeout;
+    cfg->attr_timeout     = kAttrTimeout;
+    cfg->entry_timeout    = kEntryTimeout;
+    // A file's cached pages are checked at each open (auto_cache) against attributes at most a second old — not the
+    // attribute cache's ten: a file changed outside the mount, or through another name of it, reads as it is now at
+    // its next open, as it did with the one-second cache.
+    cfg->ac_attr_timeout_set = 1;
+    cfg->ac_attr_timeout     = 1.0;
     return fuse_get_context()->private_data;
 }
 
@@ -99,6 +126,35 @@ static int op_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 static int op_read(const char *, char *buf, size_t size, off_t off, struct fuse_file_info *fi)
 {
     return (int)VfsRead(OF(fi), buf, size, (uint64_t)off);
+}
+
+//A read whose bytes lie in a host file as stored (a plain file; a STORED archive member read straight from its file)
+//is answered with that file and offset: the kernel splices them to the reader, where a read into a buffer copied every
+//byte twice (into the buffer, then out to the kernel) — a tenth or more of a CPU streaming gigabytes off an SSD.
+static int op_read_buf(const char *, struct fuse_bufvec **bufp, size_t size, off_t off, struct fuse_file_info *fi)
+{
+    int Fd = -1; uint64_t Pos = 0; size_t Len = 0;
+    if (off >= 0 && VfsReadFrom(OF(fi), size, (uint64_t)off, Fd, Pos, Len))
+    {
+        auto *B = static_cast<fuse_bufvec *>(std::malloc(sizeof(fuse_bufvec)));
+        if (!B) return -ENOMEM;
+        *B = FUSE_BUFVEC_INIT(Len);
+        B->buf[0].flags = static_cast<fuse_buf_flags>(FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
+        B->buf[0].fd = Fd;
+        B->buf[0].pos = (off_t)Pos;
+        *bufp = B;
+        if (FILE *L = OpLog()) { std::fprintf(L, "read_buf fd\n"); std::fflush(L); }
+        return 0;
+    }
+    auto *B = static_cast<fuse_bufvec *>(std::malloc(sizeof(fuse_bufvec)));
+    void *Mem = std::malloc(size ? size : 1);
+    if (!B || !Mem) { std::free(B); std::free(Mem); return -ENOMEM; }
+    const ssize_t Got = VfsRead(OF(fi), Mem, size, (uint64_t)off);
+    if (Got < 0) { std::free(B); std::free(Mem); return (int)Got; }
+    *B = FUSE_BUFVEC_INIT((size_t)Got);
+    B->buf[0].mem = Mem;
+    *bufp = B;
+    return 0;
 }
 
 static int op_write(const char *, const char *buf, size_t size, off_t off, struct fuse_file_info *fi)
@@ -188,6 +244,7 @@ const struct fuse_operations *VidyagodfsOps()
     ops.truncate = op_truncate;
     ops.open     = op_open;
     ops.read     = op_read;
+    ops.read_buf = op_read_buf;
     ops.write    = op_write;
     ops.statfs   = op_statfs;
     ops.flush    = op_flush;

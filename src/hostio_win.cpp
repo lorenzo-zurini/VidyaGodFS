@@ -4,6 +4,7 @@
 // HostIO::Fd stays a plain `int` (>=0 valid, <0 == -errno) exactly like POSIX. Windows file
 // objects are HANDLEs (pointers), so an internal table maps small int fds -> HANDLE. This keeps
 // the shim's contract identical across platforms with zero changes to the callers.
+#include <atomic>
 #include "hostio.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -208,8 +209,12 @@ int Fstat(Fd fd, Stat &out)
 
 // ---- path-based ------------------------------------------------------------
 
+static std::atomic<long long> g_Lstats{0};
+long long DebugLstats() { return g_Lstats.load(); }
+
 int Lstat(const std::string &path, Stat &out)
 {
+    ++g_Lstats;
     WIN32_FILE_ATTRIBUTE_DATA d;
     if (!::GetFileAttributesExW(Wide(path).c_str(), GetFileExInfoStandard, &d)) return Err();
     uint64_t size = ((uint64_t)d.nFileSizeHigh << 32) | d.nFileSizeLow;
@@ -240,6 +245,11 @@ int Rename(const std::string &from, const std::string &to)
 {
     return ::MoveFileExW(Wide(from).c_str(), Wide(to).c_str(),
                          MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED) ? 0 : Err();
+}
+
+int RenameNoReplace(const std::string &from, const std::string &to)
+{
+    return ::MoveFileExW(Wide(from).c_str(), Wide(to).c_str(), MOVEFILE_COPY_ALLOWED) ? 0 : Err();   // ERROR_ALREADY_EXISTS → -EEXIST
 }
 
 int Link(const std::string &existing, const std::string &newpath)
@@ -346,6 +356,30 @@ int ReadDir(const std::string &path, const std::function<void(const std::string 
         const wchar_t *n = fd.cFileName;
         if (n[0] == L'.' && (n[1] == 0 || (n[1] == L'.' && n[2] == 0))) continue;   // skip "." / ".."
         cb(Narrow(n, (int)wcslen(n)));
+    } while (::FindNextFileW(h, &fd));
+    ::FindClose(h);
+    return 0;
+}
+
+int ReadDirTyped(const std::string &path, const std::function<void(const std::string &, int)> &cb)
+{
+    std::wstring pat = Wide(path);
+    if (!pat.empty() && pat.back() != L'\\') pat += L'\\';
+    pat += L'*';
+    WIN32_FIND_DATAW fd;
+    HANDLE h = ::FindFirstFileW(pat.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        const DWORD E = ::GetLastError();
+        return E == ERROR_FILE_NOT_FOUND || E == ERROR_PATH_NOT_FOUND ? -ENOENT : E == ERROR_ACCESS_DENIED ? -EACCES : -EIO;
+    }
+    do {
+        const wchar_t *n = fd.cFileName;
+        if (n[0] == L'.' && (n[1] == 0 || (n[1] == L'.' && n[2] == 0))) continue;   // skip "." / ".."
+        //A reparse point (a link, a junction) is what Lstat says it is, not what it points at: not said here.
+        const int Kind = (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ? -1
+                       : ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0);
+        cb(Narrow(n, (int)wcslen(n)), Kind);
     } while (::FindNextFileW(h, &fd));
     ::FindClose(h);
     return 0;
