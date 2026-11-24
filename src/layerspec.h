@@ -16,11 +16,13 @@ struct LayerSpec {
     LayerType   type = LayerType::Dir;
     std::string source;      // absolute host path (dir / archive / single file)
     std::string target;      // normalized virtual subtree root: no leading/trailing '/', "" == mount root
-    std::string cid;         // zip/delta: the CID of `source`'s bytes — what a delta names it by ("" = none)
+    std::string cid;         // zip/delta/file: the CID of `source`'s bytes — what a delta names it by ("" = none)
     std::vector<std::string> bases;   // DELTA only, REQUIRED: the CIDs of the files whose bytes, joined in this order,
-                             // are the delta's base (a zip's file; a delta's rebuilt archive). Where those files are
+                             // are the delta's base (a zip's file; a single file's own bytes — a disc image; a delta's
+                             // rebuilt archive). Where those files are
                              // placed never matters to the bytes; it only decides what the delta hides (treeplan.h).
-    // SUBMOUNTS (dir/zip/DELTA): Docker-style "src:dst" mounts of paths WITHIN source. Each (source,target)
+    // SUBMOUNTS (dir/zip/DELTA): Docker-style "src:dst" mounts of paths WITHIN source. A FILE's ("its name:a path")
+    // places the file itself at that path, renamed (a TAKE of one file). Each (source,target)
     // pair is normalized and fanned out into its own single-subpath internal layer at Init. Empty → mount the
     // whole source at `target`. A pair's `first` is the in-source path ("" == whole source), `second` the dest.
     // A Delta layer reconstructs to a flat archive first (see overlay.cpp), then submounts fan out over that
@@ -32,7 +34,7 @@ struct LayerSpec {
     //answered from one listing taken at the mount (a small enough one). A folder another mount fills, or the user's,
     //is not: each lookup asks the host.
     bool        fixed = false;
-    bool        bytesOnly = false;   // zip/delta: read as a later delta's base, surfacing nowhere (a TAKE shows none of it)
+    bool        bytesOnly = false;   // zip/delta/file: read as a later delta's base, surfacing nowhere (a TAKE shows none of it)
 };
 
 struct Spec {

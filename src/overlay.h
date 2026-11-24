@@ -53,8 +53,8 @@ struct Layer {
     std::vector<std::string> maskedUnder;
     int         priority = 0;
     std::shared_ptr<ZipIndex> zip;  // Zip layers only
-    std::string fileVPath;   // File layers only: target [+ "/"] + basename(source)
-    std::string fileBase;    // File layers only: basename(source)
+    std::string fileVPath;   // File layers only: where it appears — target [+ "/"] + basename(source), or its submount's path
+    std::string fileBase;    // File layers only: the name it appears by — basename(fileVPath)
     std::shared_ptr<KeptMasks> kept;   // rw Dir layers (kept folders) only
     std::string sourceCanon;  // Dir layers: source with every link resolved, worked out once (SymlinkContained)
     //Read-only Dir layers small enough to list at Init (DefaultData, a package's small folders): every path it holds,

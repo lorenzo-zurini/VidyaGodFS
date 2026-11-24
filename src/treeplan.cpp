@@ -15,7 +15,9 @@ bool Within(const std::string &vrel, const std::string &root)
     return root.empty() || vrel == root || vrel.rfind(root + "/", 0) == 0;
 }
 
-static bool Archive(const LayerSpec &L) { return L.type == LayerType::Zip || L.type == LayerType::Delta; }
+//A layer whose bytes a delta can be built over (named by its CID): a zip's file, a delta's rebuilt archive, a single
+//file's own bytes (a disc image).
+static bool CarriesBytes(const LayerSpec &L) { return L.type == LayerType::Zip || L.type == LayerType::Delta || L.type == LayerType::File; }
 static std::string Name(const LayerSpec &L)
 {
     const size_t S = L.source.find_last_of("/\\");
@@ -33,12 +35,13 @@ TreePlan PlanTree(const Spec &S, const std::vector<bool> &Failed)
         const LayerSpec &L = S.layers[I];
         if (!L.bytesOnly)
         {
-            if (L.type != LayerType::File) for (const auto &M : L.submounts) P.mounts[I].push_back(M);
+            //A file's submount ("its name:a path") places it at that path, renamed (a TAKE of a single file).
+            for (const auto &M : L.submounts) P.mounts[I].push_back(M);
             if (P.mounts[I].empty()) P.mounts[I].push_back({ std::string(), L.target });
         }
-        if (Archive(L) && !L.cid.empty()) Carrier.try_emplace(L.cid, I);
+        if (CarriesBytes(L) && !L.cid.empty()) Carrier.try_emplace(L.cid, I);
     }
-    //Which deltas can rebuild: every CID on a zip or a delta that can, no ring.
+    //Which deltas can rebuild: every CID on a zip, a file, or a delta that can; no ring.
     enum Mark : unsigned char { Unseen, Visiting, Done };
     std::vector<Mark> Seen(N, Unseen);
     std::function<bool(size_t)> Rebuilds = [&](size_t D) -> bool {
@@ -51,7 +54,7 @@ TreePlan PlanTree(const Spec &S, const std::vector<bool> &Failed)
         for (const std::string &C : S.layers[D].bases)
         {
             const auto It = Carrier.find(C);
-            if (It == Carrier.end()) { if (Why.empty()) Why = "it names " + C + ", which no zip or delta here carries"; continue; }
+            if (It == Carrier.end()) { if (Why.empty()) Why = "it names " + C + ", which no zip, delta or file here carries"; continue; }
             P.bases[D].push_back(It->second);
             if (S.layers[It->second].type == LayerType::Delta)
             {
@@ -91,7 +94,7 @@ TreePlan PlanTree(const Spec &S, const std::vector<bool> &Failed)
     };
     for (size_t L = 0; L < N; ++L)
     {
-        if (!Archive(S.layers[L]) || S.layers[L].cid.empty()) continue;
+        if (!CarriesBytes(S.layers[L]) || S.layers[L].cid.empty()) continue;
         for (const auto &[Place, Upto] : DownOf(S.layers[L].cid))
             if (L < Upto) P.maskedUnder[L].push_back(Place);
     }
@@ -118,7 +121,7 @@ std::shared_ptr<ByteSource> LayerBytes::Get(size_t I, std::string *Err)
         if (S.layers[I].type == LayerType::Delta) State[I] = St::Failed; else State[I] = St::None;
         return nullptr;
     };
-    if (I >= S.layers.size() || !Archive(S.layers[I])) return nullptr;
+    if (I >= S.layers.size() || !CarriesBytes(S.layers[I])) return nullptr;
     if (State[I] == St::Built) return Memo[I];
     if (State[I] == St::Failed) return Fail("it did not rebuild");
     if (State[I] == St::Building) return Fail("its bases name each other in a ring");
@@ -184,8 +187,11 @@ void Visible(const Spec &S, const TreePlan &P, size_t I, const EntriesFn &Entrie
     {
         const size_t Sl = L.source.find_last_of("/\\");
         const std::string Base = Sl == std::string::npos ? L.source : L.source.substr(Sl + 1);
-        const std::string V = L.target.empty() ? Base : L.target + "/" + Base;
-        if (!Masked(V)) Out(Base, V, Lower(V), P.mounts[I].front());
+        for (const auto &M : P.mounts[I])
+        {
+            const std::string V = !M.first.empty() ? M.second : M.second.empty() ? Base : M.second + "/" + Base;
+            if (!Masked(V)) Out(Base, V, Lower(V), M);
+        }
         return;
     }
     const std::vector<std::string> *E = Entries(I);

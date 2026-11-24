@@ -62,10 +62,11 @@ bool ParseSpecText(const std::string &Text, Spec &Out, std::string &Err)
             //report (PlanTree), and costs only that delta.
             const size_t Self = Out.layers.size();
             const auto Bad = [&](const std::string &Why) { Err = "layer " + std::to_string(Self) + ": " + Why; return false; };
-            const bool Archive = LS.type == LayerType::Zip || LS.type == LayerType::Delta;
+            //A layer of bytes — a zip, a delta, a single file (a disc image a delta is built over): what a delta names by CID.
+            const bool Bytes = LS.type == LayerType::Zip || LS.type == LayerType::Delta || LS.type == LayerType::File;
             if (L.contains("cid"))
             {
-                if (!Archive) return Bad("only a zip or a delta has a cid");
+                if (!Bytes) return Bad("only a zip, a delta or a file has a cid");
                 if (!L["cid"].is_string() || L["cid"].get<std::string>().empty()) return Bad("cid must be a non-empty string");
                 LS.cid = L["cid"].get<std::string>();
             }
@@ -85,8 +86,8 @@ bool ParseSpecText(const std::string &Text, Spec &Out, std::string &Err)
             LS.rw      = L.value("rw", false);
             LS.bytesOnly = L.value("bytesOnly", false);
             LS.fixed   = L.value("fixed", false);
-            if (LS.bytesOnly && !Archive)
-                return Bad("only a zip or a delta can be bytes-only");
+            if (LS.bytesOnly && !Bytes)
+                return Bad("only a zip, a delta or a file can be bytes-only");
             // SUBMOUNTS: array of Docker-style "src:dst" strings → (source,target) pairs (split on first ':').
             if (L.contains("submounts") && L["submounts"].is_array())
                 for (const auto &E : L["submounts"])

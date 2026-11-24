@@ -203,8 +203,10 @@ bool VfsState::Init(const Spec &S, std::string &Err)
             }
             if (LS.type == LayerType::File)
             {
-                L.fileBase  = BaseName(LS.source);
-                L.fileVPath = L.target.empty() ? L.fileBase : (L.target + "/" + L.fileBase);
+                //Placed whole: in its target folder, by its own name; through a submount: at the submount's path, by
+                //that path's name (a TAKE renaming it).
+                L.fileVPath = !sub.empty() ? tgt : L.target.empty() ? BaseName(LS.source) : (L.target + "/" + BaseName(LS.source));
+                L.fileBase  = BaseName(L.fileVPath);
             }
             layers.push_back(std::move(L));
         }

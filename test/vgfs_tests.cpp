@@ -1228,6 +1228,71 @@ static LayerSpec deltaLayer(const std::string &src, const std::string &target, s
     return L;
 }
 
+// A delta built over a single file — a disc image, the extracted files rebuilt from it — reads that file's own bytes as
+// its base (the image is stored as it was dumped, no zip around it). Where the delta is mounted it hides the image (the
+// files replace it there); at another place the image stays; read only for its bytes, it shows nowhere. A spec may name
+// a file's CID and mark it bytes-only. Teeth: only a zip or a delta carries a CID (the delta cannot rebuild); a file
+// named as a base left showing where the delta mounts.
+TEST(a_delta_over_a_disc_image_file_rebuilds_from_its_bytes) {
+    TmpDir t;
+    std::string iso(300000, '\0');
+    std::mt19937 rng(7);
+    for (char &c : iso) c = char(rng());
+    fs::create_directories(t / "disc");
+    { std::ofstream(t / "disc/game.iso", std::ios::binary) << iso; }
+    writeStoreZip(t / "files.zip", { { "default.xbe", "XBE-HEADER", false }, { "data/a.bin", iso.substr(4096, 100000), false } });
+    writeDelta(t / "files.vgdelta", iso, t / "files.zip");
+    auto File = [&](const std::string &target, bool bytesOnly) {
+        LayerSpec L; L.type = LayerType::File; L.source = t.str("disc/game.iso"); L.cid = L.source; L.target = target; L.bytesOnly = bytesOnly;
+        return L;
+    };
+    auto Read = [](VfsState &S, const std::string &P) {
+        OpenFile *H = nullptr; if (VfsOpen(S, P, O_RDONLY, H) != 0 || !H) return std::string("(none)");
+        std::string Out(200000, '\0'); const ssize_t n = VfsRead(H, Out.data(), Out.size(), 0); VfsRelease(H);
+        Out.resize(n > 0 ? (size_t)n : 0); return Out;
+    };
+    VfsAttr a;
+    {   // at the same place: the files, not the image
+        Spec sp; sp.readOnly = true; sp.layers = { File("game", false), deltaLayer(t.str("files.vgdelta"), "game", { t.str("disc/game.iso") }) };
+        VfsState S; std::string err; CHECK(S.Init(sp, err));
+        CHECK_EQ(Read(S, "game/default.xbe"), std::string("XBE-HEADER"));
+        CHECK(Read(S, "game/data/a.bin") == iso.substr(4096, 100000));
+        CHECK_EQ(VfsGetattr(S, "game/game.iso", a), -ENOENT);
+        CHECK(PlanTree(sp).problems.empty());
+    }
+    {   // elsewhere: the image stays where it is
+        Spec sp; sp.readOnly = true; sp.layers = { File("disc", false), deltaLayer(t.str("files.vgdelta"), "game", { t.str("disc/game.iso") }) };
+        VfsState S; std::string err; CHECK(S.Init(sp, err));
+        CHECK_EQ(Read(S, "game/default.xbe"), std::string("XBE-HEADER"));
+        CHECK_EQ(VfsGetattr(S, "disc/game.iso", a), 0);
+        CHECK_EQ(a.size, (uint64_t)iso.size());
+    }
+    {   // placed by a submount (a TAKE renaming it): hidden inside the delta's place, shown by its new name outside
+        LayerSpec In = File("", false); In.submounts = { { "game.iso", "game/renamed.iso" } };
+        LayerSpec Out = File("", false); Out.submounts = { { "game.iso", "other/renamed.iso" } };
+        Spec sp; sp.readOnly = true; sp.layers = { In, Out, deltaLayer(t.str("files.vgdelta"), "game", { t.str("disc/game.iso") }) };
+        VfsState S; std::string err; CHECK(S.Init(sp, err));
+        CHECK_EQ(Read(S, "game/default.xbe"), std::string("XBE-HEADER"));
+        CHECK_EQ(VfsGetattr(S, "game/renamed.iso", a), -ENOENT);
+        CHECK_EQ(VfsGetattr(S, "other/renamed.iso", a), 0);
+        CHECK_EQ(a.size, (uint64_t)iso.size());
+        CHECK(Read(S, "other/renamed.iso").substr(0, 1000) == iso.substr(0, 1000));
+        CHECK(readdirNames(S, "other").count("renamed.iso"));
+        CHECK_EQ(VfsGetattr(S, "game.iso", a), -ENOENT);            // only where its submounts place it
+    }
+    {   // only its bytes: nowhere in the tree
+        Spec sp; sp.readOnly = true; sp.layers = { File("game", true), deltaLayer(t.str("files.vgdelta"), "game", { t.str("disc/game.iso") }) };
+        VfsState S; std::string err; CHECK(S.Init(sp, err));
+        CHECK_EQ(Read(S, "game/default.xbe"), std::string("XBE-HEADER"));
+        CHECK_EQ(VfsGetattr(S, "game/game.iso", a), -ENOENT);
+    }
+    // The spec says it: a file's cid, bytes-only.
+    Spec parsed; std::string err;
+    CHECK(ParseSpecText(R"({"mountpoint":"/m","readonly":true,"layers":[{"type":"file","source":"/x.iso","target":"g","cid":"Qmx","bytesOnly":true},)"
+                        R"({"type":"delta","source":"/d.vgdelta","target":"g","bases":["Qmx"]}]})", parsed, err));
+    CHECK(err.empty());
+}
+
 TEST(a_delta_hides_its_base_and_not_another_depot_beneath_it) {
     TmpDir t;
     std::string pak(5000, 'p'); for (size_t i = 0; i < pak.size(); ++i) pak[i] = char('a' + (i * 3) % 26);
@@ -1535,6 +1600,24 @@ TEST(case_conflicts_and_renames_follow_the_tree) {
         CHECK(CaseConflicts(Root, PlanTree(Root), Fa, &Cache).empty());                  // elsewhere/x.dat: nothing
         CHECK_EQ(CaseConflicts(At, PlanTree(At), Fa, &Cache).size(), size_t(1));       // and again, from the cache
         (void)Ea;
+    }
+    {   // a single file placed by a submount (a TAKE renaming it) collides by case where it lands, by its new name — not
+        // at its target by the name its source has — at each place a submount puts it. Teeth: name the file at
+        // target/its source's name; use only its first mount.
+        const std::vector<std::string> Za = { "DATA/GAME.ISO", "Other/Game.iso" };
+        const EntriesFn Ff = [&](size_t I) -> const std::vector<std::string> * { return I == 0 ? &Za : nullptr; };
+        auto KeysOf = [&](std::vector<std::pair<std::string, std::string>> Subs) {
+            LayerSpec F; F.type = LayerType::File; F.source = "/disc/game [1234].iso"; F.target = "x"; F.submounts = std::move(Subs);
+            Spec Fs; Fs.readOnly = true;
+            Fs.layers = { zipLayer("/a.zip"), F };
+            std::set<std::string> Keys;
+            for (const auto &Cc : CaseConflicts(Fs, PlanTree(Fs), Ff)) Keys.insert(Cc.key);
+            return Keys;
+        };
+        CHECK(KeysOf({ { "game [1234].iso", "Data/Game.iso" } }).count("data"));                 // DATA against Data
+        CHECK(KeysOf({ { "game [1234].iso", "DATA/Game.iso" } }).count("data/game.iso"));         // GAME.ISO against Game.iso
+        CHECK(KeysOf({ { "game [1234].iso", "elsewhere/a.iso" }, { "game [1234].iso", "other/game.iso" } }).count("other"));
+        CHECK(KeysOf({}).empty());                                                                  // whole, at x/: nothing
     }
     const auto R = CaseRenames(sp, P, Fn);
     CHECK(R.count(1) && R.at(1).at("DATA/x.dat") == "Data/x.dat");

@@ -36,9 +36,10 @@ the one VidyaGod's validator/publisher enforce.)
 ## Delta layers
 
 A `delta` layer is a random-access binary diff over a **base** it names: **`bases`** lists the CIDs of the files it was
-built over, and their bytes, **concatenated in that order**, are the base. Each zip or delta layer carries its own
-**`cid`**; a base is any layer carrying that CID, wherever it is placed (one CID is one file: a zip's file, or a
-delta's rebuilt archive). There is no implicit base. Entries are reconstructed on demand, and a chain of deltas
+built over, and their bytes, **concatenated in that order**, are the base. Each zip, delta or file layer carries its own
+**`cid`**; a base is any layer carrying that CID, wherever it is placed (one CID is one file: a zip's file, a single
+file's own bytes — a disc image the extracted files are rebuilt from — or a delta's rebuilt archive). There is no
+implicit base. Entries are reconstructed on demand, and a chain of deltas
 **flattens**, so reads stay `O(log n)` however deep the history goes: 900 versions of one game mount as a single chain
 rather than 900 archives, holding one rebuilt map at a time while they are built.
 

@@ -18,8 +18,9 @@
 //before it mounts and its validator all ask this one plan, so none of them holds a rule of its own. (The validator asks
 //of the plan in the package's coordinates, before the runner's layout is applied; the mount, of the mapped one.)
 //
-//A delta's base is BYTES: the files its CIDs name, joined in order (a zip's file, a delta's rebuilt archive). One CID is
-//one file, so any layer carrying it will do, wherever it is placed. Placement decides only what a delta hides: every
+//A delta's base is BYTES: the files its CIDs name, joined in order (a zip's file, a delta's rebuilt archive, a single
+//file's own bytes — a disc image the extracted files are built over). One CID is one file, so any layer carrying it will
+//do, wherever it is placed. Placement decides only what a delta hides: every
 //placement of a file it replaces (its bases, and what they were rebuilt from) that lies beneath it, inside the places
 //the delta itself appears. Elsewhere a base is only a source of bytes.
 struct TreePlan
@@ -33,7 +34,7 @@ struct TreePlan
     //so it never surfaces.
     std::vector<std::vector<std::string>> maskedUnder;
     std::vector<bool> whole;
-    //Per delta: it cannot rebuild — a CID it names is on no zip or delta here, its bases name each other in a ring, or
+    //Per delta: it cannot rebuild — a CID it names is on no zip, delta or file here, its bases name each other in a ring, or
     //its bytes did not rebuild (Failed). It mounts nothing and hides nothing. One line per broken delta in problems.
     std::vector<bool> broken;
     std::vector<std::string> problems;
@@ -45,7 +46,7 @@ TreePlan PlanTree(const Spec &S, const std::vector<bool> &Failed = {});
 //vrel lies at root or inside it ("" is the whole tree).
 bool Within(const std::string &vrel, const std::string &root);
 
-//The bytes of a spec's zip and delta layers, built on demand and kept while something still needs them: a delta over
+//The bytes of a spec's zip, delta and file layers, built on demand and kept while something still needs them: a delta over
 //the layers the plan names, joined in order (a chain flattens, so a thousand versions read like one archive). A base
 //no surfacing layer is and no unbuilt delta still needs is released once the last delta over it is built, so a long
 //chain holds one rebuilt map at a time, not one per version.
@@ -54,7 +55,7 @@ class LayerBytes
 public:
     //Keep[i]: layer i's bytes are wanted after it is built (it surfaces) — never released.
     LayerBytes(const Spec &S, const TreePlan &P, std::vector<bool> Keep);
-    //Null when the layer is not a zip or delta, cannot be read, or (a delta) did not rebuild — then Err says why.
+    //Null when the layer is not a zip, delta or file, cannot be read, or (a delta) did not rebuild — then Err says why.
     std::shared_ptr<ByteSource> Get(size_t I, std::string *Err = nullptr);
     //Whether a delta was tried and did not rebuild.
     bool Failed(size_t I) const { return I < State.size() && State[I] == St::Failed; }
