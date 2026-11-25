@@ -135,7 +135,8 @@ static int op_chown(const char *, fuse_uid_t, fuse_gid_t, struct fuse3_file_info
 
 static int op_utimens(const char *path, const struct fuse_timespec tv[2], struct fuse3_file_info *)
 {
-    return VfsUtimens(*St(), V(path), (int64_t)tv[0].tv_sec, (int64_t)tv[1].tv_sec);
+    if (!tv) return VfsUtimens(*St(), V(path), { 0, HostIO::TimeNow }, { 0, HostIO::TimeNow });
+    return VfsUtimens(*St(), V(path), { (int64_t)tv[0].tv_sec, (int64_t)tv[0].tv_nsec }, { (int64_t)tv[1].tv_sec, (int64_t)tv[1].tv_nsec });
 }
 
 static int op_readlink(const char *path, char *buf, size_t size)

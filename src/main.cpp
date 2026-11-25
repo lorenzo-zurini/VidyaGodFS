@@ -5,6 +5,7 @@
 
 #include <iostream>
 #include <vector>
+#include <cstdlib>
 #include <string>
 
 // vidyagodfs <spec.json> <mountpoint> [--watch-pid <pid>] [extra backend opts...]
@@ -35,7 +36,15 @@ int main(int argc, char **argv)
     for (int i = 3; i < argc; ++i)
     {
         std::string a = argv[i];
-        if (a == "--watch-pid" && i + 1 < argc) { watchPid = std::stoll(argv[++i]); continue; }
+        if (a == "--watch-pid" && i + 1 < argc)
+        {
+            //A pid, whole and positive — else no mount (one whose spawner is unknown would never be taken down).
+            const std::string P = argv[++i];
+            char *End = nullptr;
+            watchPid = std::strtoll(P.c_str(), &End, 10);
+            if (P.empty() || *End != '\0' || watchPid <= 0) { std::cerr << "[vidyagodfs] --watch-pid wants a process id, not '" << P << "'\n"; return 2; }
+            continue;
+        }
         if (a == "-o" && i + 1 < argc && std::string(argv[i + 1]) == "keep-symlinks") { keepSymlinks = true; ++i; continue; }
         if (a == "keep-symlinks") { keepSymlinks = true; continue; }
         backendArgs.push_back(a);

@@ -268,14 +268,23 @@ int Truncate(const std::string &path, uint64_t size)
 
 int Chmod(const std::string &, uint32_t) { return 0; }   // cosmetic on Windows
 
-int Utimens(const std::string &path, int64_t /*atimeSec*/, int64_t mtimeSec, bool /*followSymlink*/)
+int Utimens(const std::string &path, TimeSpec atime, TimeSpec mtime, bool /*followSymlink*/)
 {
     HANDLE h = ::CreateFileW(Wide(path).c_str(), FILE_WRITE_ATTRIBUTES,
                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                              OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (h == INVALID_HANDLE_VALUE) return Err();
-    FILETIME ft = UnixToFt(mtimeSec);
-    BOOL ok = ::SetFileTime(h, nullptr, nullptr, &ft);   // set mtime only (atime often relatime/ignored)
+    //A time left alone is a null pointer to SetFileTime; "now" is the system clock; else seconds + 100 ns ticks.
+    const auto Ft = [](TimeSpec V, FILETIME &Out) -> const FILETIME * {
+        if (V.nsec == TimeOmit) return nullptr;
+        if (V.nsec == TimeNow) { ::GetSystemTimeAsFileTime(&Out); return &Out; }
+        ULARGE_INTEGER u; u.QuadPart = (uint64_t)V.sec * 10000000ULL + kEpochDelta + (uint64_t)V.nsec / 100;
+        Out.dwLowDateTime = u.LowPart; Out.dwHighDateTime = u.HighPart;
+        return &Out;
+    };
+    FILETIME A, M;
+    const FILETIME *Pa = Ft(atime, A), *Pm = Ft(mtime, M);
+    BOOL ok = ::SetFileTime(h, nullptr, Pa, Pm);
     ::CloseHandle(h);
     return ok ? 0 : Err();
 }
