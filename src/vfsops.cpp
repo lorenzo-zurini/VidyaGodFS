@@ -330,11 +330,12 @@ int VfsCreate(VfsState &S, const std::string &v, uint32_t mode, int flags, OpenF
     std::string host;
     const bool kept = PassthroughHost(S, v, host);
     if (kept) { if (MarkerName(v)) return -EINVAL; EnsureHostParent(host); }   // straight to the durable source
-    else { RemoveWhiteout(S, v); if (int e = EnsureWriteParent(S, v); e != 0) return e; host = WLPath(S, v); }
+    else { if (int e = EnsureWriteParent(S, v); e != 0) return e; host = WLPath(S, v); }
 
     S.BeginNameChange();   // a file made at the name is another file than the one its open handles were opened on
     const HostIO::Fd fd = HostIO::Open(host, (flags | O_CREAT) & ~O_NOFOLLOW, mode);
     if (fd < 0) { S.EndNameChange({}); return (int)fd; }
+    if (!kept) RemoveWhiteout(S, v);   // only once it is made: a refused create leaves the deleted file deleted
     S.EndNameChange({ { v, false } });
     // Only now: the deleted name is made again. Were the marker to stay (an unlink failure), the new file still
     // shows — the folder's own names are never masked by its markers — and the marker keeps hiding the package copy.
@@ -482,10 +483,11 @@ int VfsMkdir(VfsState &S, const std::string &v, uint32_t mode)
     // A whiteout here means this dir existed below and was deleted; recreating it must yield an
     // EMPTY dir, so mark it opaque to mask the lower layer's old contents.
     bool recreateOverLower = IsWhiteouted(S, v);
-    RemoveWhiteout(S, v);
     if (int e = EnsureWriteParent(S, v); e != 0) return e;
     if (int e = HostIO::Mkdir(WLPath(S, v), mode); e != 0) return e;
-    if (recreateOverLower) MarkOpaque(S, v);
+    if (recreateOverLower)
+        if (int e = MarkOpaque(S, v); e != 0) { HostIO::Rmdir(WLPath(S, v)); return e; }
+    RemoveWhiteout(S, v);   // only once it is made (and opaque): a refused mkdir leaves the deleted folder deleted
     return 0;
 }
 
@@ -579,6 +581,32 @@ int VfsRename(VfsState &S, const std::string &vf, const std::string &vt)
         HostIO::Stat st;
         if (HostIO::Lstat(rr.hostPath, st) == 0 && st.isDir) isDir = true;
     }
+    if (vf == vt) return 0;   // onto itself: nothing to do (POSIX)
+    //A case-insensitive mount: a rename that changes only case names the same entry (the host renames it in place).
+    const bool sameEntry = S.caseInsensitive && FoldCase(vf) == FoldCase(vt);
+
+    // What the new name holds now, as POSIX has it: a file is replaced by a file; a directory only by a directory,
+    // and only when it is EMPTY (as merged — its lower children count). The lower layers' contents of a directory
+    // replaced (or deleted before) must never show through the one moved there.
+    bool dstDir = false;
+    if (const ResolveResult dr = sameEntry ? ResolveResult{} : Resolve(S, vt); dr.kind != HitKind::None)
+    {
+        dstDir = (dr.kind == HitKind::ImplicitDir) ||
+                 (dr.kind == HitKind::ZipEntry && (dr.zipEntry == nullptr || dr.zipEntry->isDir));
+        if (!dstDir && (dr.kind == HitKind::DirLayer || dr.kind == HitKind::WriteLayer))
+        {
+            HostIO::Stat st;
+            if (HostIO::Lstat(dr.hostPath, st) == 0 && st.isDir) dstDir = true;
+        }
+        if (dstDir && !isDir) return -EISDIR;
+        if (!dstDir && isDir) return -ENOTDIR;
+        if (dstDir)
+        {
+            std::set<std::string> kids;
+            CollectChildren(S, vt, kids);
+            if (!kids.empty()) return -ENOTEMPTY;
+        }
+    }
 
     // Bring the source fully into the writelayer first, so it can then be moved with one Rename.
     // A DIRECTORY is a MERGED entity: even when a writelayer copy already exists (it may hold only a
@@ -596,25 +624,62 @@ int VfsRename(VfsState &S, const std::string &vf, const std::string &vt)
     std::string dst;
     const bool dstKept = PassthroughHost(S, vt, dst);
     if (dstKept && MarkerName(vt)) return -EINVAL;
-    const bool dstOverDeleted = dstKept && KeptHidden(S, vt);   // a dir moved onto a deleted one must not show its old contents
     if (dstKept) { EnsureHostParent(dst); }
-    else { if (int e = EnsureWriteParent(S, vt); e != 0) return e; RemoveWhiteout(S, vt); dst = WLPath(S, vt); }
+    else { if (int e = EnsureWriteParent(S, vt); e != 0) return e; dst = WLPath(S, vt); }
+
+    // An empty directory replaced may still hold its own markers on disk (names deleted from below, an opaque mark):
+    // empty as merged, not to the host, which would refuse the rename. They go — and what they hid below stays
+    // hidden: the folder moved there is opaque. Put back if the host refuses anyway.
+    bool hidesBelow = false;
+    std::vector<std::string> sweptWhiteouts;
+    bool sweptOpaque = false;
+    if (dstDir && !dstKept)
+    {
+        const std::string wl = WLPath(S, vt);
+        HostIO::ReadDir(wl, [&](const std::string &n) {
+            if (n.rfind(".wh.", 0) != 0) return;
+            if (n == ".wh..wh..opq") { HostIO::Unlink(wl + "/" + n); UnmarkOpaque(S, vt); sweptOpaque = true; }
+            else { const std::string c = vt.empty() ? n.substr(4) : vt + "/" + n.substr(4); RemoveWhiteout(S, c); sweptWhiteouts.push_back(c); }
+        });
+        hidesBelow = sweptOpaque || !sweptWhiteouts.empty();
+    }
+    else if (dstDir && dstKept)
+    {
+        bool had = false;
+        HostIO::ReadDir(dst, [&](const std::string &n) { if (n.rfind(".wh.", 0) == 0) had = true; });
+        if (had) { KeptDropMarkersUnder(S, vt); hidesBelow = true; }
+    }
+    const auto putBack = [&] {
+        for (const std::string &c : sweptWhiteouts) CreateWhiteout(S, c);
+        if (sweptOpaque) (void)MarkOpaque(S, vt);
+    };
+    const bool overDeleted = dstKept ? KeptHidden(S, vt) : IsWhiteouted(S, vt);   // a name deleted from below
+    const bool needOpaque = isDir && (overDeleted || hidesBelow);
+    // The opaque mark goes on the folder BEFORE it moves (a writelayer one: its marker moves with it), so no look in
+    // between sees the old contents through it. Its contents are all its own (copied up above): it hides nothing at
+    // the old name should the move fail.
+    const bool markBefore = needOpaque && !dstKept && !rr.rwPassthrough && src == WLPath(S, vf);
+    if (markBefore)
+        if (int e = MarkOpaque(S, vf); e != 0) { putBack(); return e; }
     //Every handle on the moved file holds its copy now (the copy-up above); one on the file it replaces keeps that.
     //Both names, and all under them, name other files from here on.
     S.BeginNameChange();
-    if (int e = HostIO::Rename(src, dst); e != 0) { S.EndNameChange({}); return e; }
+    if (int e = HostIO::Rename(src, dst); e != 0) { S.EndNameChange({}); putBack(); return e; }
+    if (!dstKept) RemoveWhiteout(S, vt);   // only once it moved there: a refused rename leaves the deleted name deleted
     if (S.debugHook) S.debugHook("rename-before-detach");
     S.EndNameChange({ { vf, isDir }, { vt, isDir } });
     if (isDir) KeptRenamePrefix(S, vf, vt);   // the kept markers inside it moved along
-    if (dstKept && isDir && dstOverDeleted)
-        if (int e = KeptMarkOpaque(S, vt); e != 0) return e;
     if (dstKept) UnhideLower(S, vt);
 
     // A moved DIRECTORY takes its writelayer `.wh.*` markers with it — rewrite the in-memory masks to the
-    // new prefix so they keep matching the relocated disk markers.
+    // new prefix so they keep matching the relocated disk markers (its opaque mark among them).
     if (isDir) RenameMaskPrefix(S, vf, vt);
-    if (Resolve(S, vf).kind != HitKind::None) return HideLower(S, vf); // old name still below → hide it
-    return 0;
+    // The bookkeeping is done whatever follows: a mark that cannot be written after the move is reported, with the
+    // masks matching the disk.
+    int late = 0;
+    if (needOpaque && !markBefore) late = dstKept ? KeptMarkOpaque(S, vt) : MarkOpaque(S, vt);
+    if (Resolve(S, vf).kind != HitKind::None) { if (int e = HideLower(S, vf); e != 0) return e; }   // old name still below → hide it
+    return late;
 }
 
 int VfsTruncate(VfsState &S, const std::string &v, OpenFile *of, uint64_t size)
@@ -650,7 +715,7 @@ int VfsChmod(VfsState &S, const std::string &v, uint32_t mode)
     return HostIO::Chmod(host, mode);
 }
 
-int VfsUtimens(VfsState &S, const std::string &v, int64_t atimeSec, int64_t mtimeSec)
+int VfsUtimens(VfsState &S, const std::string &v, HostIO::TimeSpec atime, HostIO::TimeSpec mtime)
 {
     if (S.readOnly) return -EROFS;
     ResolveResult rr = Resolve(S, v);
@@ -658,7 +723,7 @@ int VfsUtimens(VfsState &S, const std::string &v, int64_t atimeSec, int64_t mtim
     // Only touch timestamps on already-writable targets (don't force a copy-up just for mtime).
     if (rr.kind != HitKind::WriteLayer && !rr.rwPassthrough) return 0;
     std::string host = rr.rwPassthrough ? rr.hostPath : WLPath(S, v);
-    return HostIO::Utimens(host, atimeSec, mtimeSec, /*followSymlink=*/false);
+    return HostIO::Utimens(host, atime, mtime, /*followSymlink=*/false);
 }
 
 int VfsReadlink(VfsState &S, const std::string &v, std::string &target)
@@ -698,9 +763,10 @@ int VfsSymlink(VfsState &S, const std::string &target, const std::string &v)
         UnhideLower(S, v);   // as in VfsCreate
         return 0;
     }
-    RemoveWhiteout(S, v);
     if (int e = EnsureWriteParent(S, v); e != 0) return e;
-    return HostIO::Symlink(target, WLPath(S, v));
+    if (int e = HostIO::Symlink(target, WLPath(S, v)); e != 0) return e;
+    RemoveWhiteout(S, v);   // only once it is made
+    return 0;
 }
 
 // A hard link, as rename does it: the existing file is made writable first (a copy-up, unless it lives in a kept

@@ -268,14 +268,27 @@ int Truncate(const std::string &path, uint64_t size)
 
 int Chmod(const std::string &, uint32_t) { return 0; }   // cosmetic on Windows
 
-int Utimens(const std::string &path, int64_t /*atimeSec*/, int64_t mtimeSec, bool /*followSymlink*/)
+int Utimens(const std::string &path, TimeSpec atime, TimeSpec mtime, bool /*followSymlink*/)
 {
     HANDLE h = ::CreateFileW(Wide(path).c_str(), FILE_WRITE_ATTRIBUTES,
                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                              OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (h == INVALID_HANDLE_VALUE) return Err();
-    FILETIME ft = UnixToFt(mtimeSec);
-    BOOL ok = ::SetFileTime(h, nullptr, nullptr, &ft);   // set mtime only (atime often relatime/ignored)
+    //A time left alone is a null pointer to SetFileTime; "now" is the system clock; else seconds + 100 ns ticks
+    //(none before 1601, FILETIME's epoch). The access time is not set: WinFsp hands an unset one as the getattr value,
+    //which is the modification time here — it would be written as the file's access time.
+    (void)atime;
+    const auto Ft = [](TimeSpec V, FILETIME &Out) -> const FILETIME * {
+        if (V.nsec == TimeOmit) return nullptr;
+        if (V.nsec == TimeNow) { ::GetSystemTimeAsFileTime(&Out); return &Out; }
+        if (V.sec < -11644473600LL || V.nsec < 0 || V.nsec >= 1000000000LL) return nullptr;
+        ULARGE_INTEGER u; u.QuadPart = (uint64_t)(V.sec + 11644473600LL) * 10000000ULL + (uint64_t)V.nsec / 100;
+        Out.dwLowDateTime = u.LowPart; Out.dwHighDateTime = u.HighPart;
+        return &Out;
+    };
+    FILETIME M;
+    const FILETIME *Pm = Ft(mtime, M);
+    BOOL ok = Pm ? ::SetFileTime(h, nullptr, nullptr, Pm) : TRUE;
     ::CloseHandle(h);
     return ok ? 0 : Err();
 }
