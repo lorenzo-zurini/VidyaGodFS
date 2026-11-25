@@ -356,6 +356,42 @@ TEST(a_patched_file_reads_patched_through_the_mount) {
     CHECK(F.TornDown(std::chrono::seconds(10)));
 }
 
+// A --watch-pid that is not a process id is refused with a message, no mount and no crash. Teeth: std::stoll (an
+// uncaught exception: the helper aborts with SIGABRT).
+TEST(a_watch_pid_that_is_no_pid_is_refused_not_a_crash) {
+    Fixture F;
+    for (const char *Bad : { "abc", "12x", "-5", " 7", "4294967297", "99999999999999999999" })
+    {
+        const int St = Fixture::RunWait({ g_helper, F.spec.string(), F.mp.string(), "--watch-pid", Bad });
+        CHECK(WIFEXITED(St) && WEXITSTATUS(St) == 2);
+        CHECK(!Mounted(F.mp));
+    }
+}
+
+// `touch` through the mount sets the time to now (the kernel sends UTIME_NOW), and a time it leaves alone stays: the
+// FUSE op hands both through whole. Teeth: seconds only (the file's mtime becomes 1970).
+TEST(touch_through_the_mount_sets_now_not_1970) {
+    Fixture F; pid_t S = 0;
+    fs::create_directories(F.root / "wl");
+    std::ofstream(F.spec) << "{\"mountpoint\":\"" << F.mp.string() << "\",\"readonly\":false,\"writelayer\":\""
+                          << (F.root / "wl").string() << "\",\"layers\":[{\"type\":\"dir\",\"source\":\""
+                          << (F.root / "layer").string() << "\",\"target\":\"\"}]}";
+    CHECK(MountedBySpawner(F, S, false));
+    const fs::path File = F.mp / "t.txt";
+    { std::ofstream(File) << "x"; }
+    const struct timespec Set[2] = { { 1600000000, 0 }, { 1600000000, 0 } };
+    CHECK(::utimensat(AT_FDCWD, File.c_str(), Set, 0) == 0);
+    const struct timespec Touch[2] = { { 0, UTIME_OMIT }, { 0, UTIME_NOW } };   // touch -m
+    CHECK(::utimensat(AT_FDCWD, File.c_str(), Touch, 0) == 0);
+    struct stat St {};
+    CHECK(::stat((F.root / "wl" / "t.txt").c_str(), &St) == 0);
+    CHECK((long long)St.st_mtim.tv_sec > 1700000000LL);
+    CHECK((long long)St.st_atim.tv_sec == 1600000000LL);
+    CHECK(::kill(-S, SIGKILL) == 0);
+    waitpid(S, nullptr, 0);
+    CHECK(F.TornDown(std::chrono::seconds(10)));
+}
+
 // A spawner that is already gone when the helper starts gets no mount at all: nothing would ever take it down.
 TEST(a_spawner_already_gone_gets_no_mount) {
     Fixture F;

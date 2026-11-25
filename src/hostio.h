@@ -104,7 +104,12 @@ int     RenameNoReplace(const std::string &from, const std::string &to);
 int     Link    (const std::string &existing, const std::string &newpath);   // a hard link
 int     Truncate(const std::string &path, uint64_t size);
 int     Chmod   (const std::string &path, uint32_t mode);
-int     Utimens (const std::string &path, int64_t atimeSec, int64_t mtimeSec, bool followSymlink);
+// A time to set: seconds and nanoseconds, or a nanosecond field of TimeNow ("now") or TimeOmit ("leave it as it is")
+// — utimensat's UTIME_NOW / UTIME_OMIT, with their Linux values, so a FUSE timespec passes through as it is.
+struct TimeSpec { int64_t sec = 0; int64_t nsec = 0; };
+constexpr int64_t TimeNow  = (int64_t(1) << 30) - 1;
+constexpr int64_t TimeOmit = (int64_t(1) << 30) - 2;
+int     Utimens (const std::string &path, TimeSpec atime, TimeSpec mtime, bool followSymlink);
 int     Readlink(const std::string &path, std::string &target);  // reads a symlink's target
 int     Symlink (const std::string &target, const std::string &linkpath);
 int     Statvfs (const std::string &path, StatvfsInfo &out);

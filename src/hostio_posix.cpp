@@ -118,11 +118,15 @@ int Link(const std::string &existing, const std::string &newpath) { return ::lin
 int Truncate(const std::string &path, uint64_t size)       { return ::truncate(path.c_str(), static_cast<off_t>(size)) == 0 ? 0 : -errno; }
 int Chmod(const std::string &path, uint32_t mode)          { return ::chmod(path.c_str(), static_cast<mode_t>(mode)) == 0 ? 0 : -errno; }
 
-int Utimens(const std::string &path, int64_t atimeSec, int64_t mtimeSec, bool followSymlink)
+int Utimens(const std::string &path, TimeSpec atime, TimeSpec mtime, bool followSymlink)
 {
     struct timespec tv[2];
-    tv[0].tv_sec = static_cast<time_t>(atimeSec); tv[0].tv_nsec = 0;
-    tv[1].tv_sec = static_cast<time_t>(mtimeSec); tv[1].tv_nsec = 0;
+    const auto Put = [](struct timespec &T, TimeSpec V) {
+        T.tv_sec = static_cast<time_t>(V.sec);
+        T.tv_nsec = V.nsec == TimeNow ? UTIME_NOW : V.nsec == TimeOmit ? UTIME_OMIT : static_cast<long>(V.nsec);
+    };
+    Put(tv[0], atime);
+    Put(tv[1], mtime);
     int flags = followSymlink ? 0 : AT_SYMLINK_NOFOLLOW;
     return ::utimensat(AT_FDCWD, path.c_str(), tv, flags) == 0 ? 0 : -errno;
 }

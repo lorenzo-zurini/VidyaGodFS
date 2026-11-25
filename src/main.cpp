@@ -5,6 +5,9 @@
 
 #include <iostream>
 #include <vector>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
 #include <string>
 
 // vidyagodfs <spec.json> <mountpoint> [--watch-pid <pid>] [extra backend opts...]
@@ -35,7 +38,18 @@ int main(int argc, char **argv)
     for (int i = 3; i < argc; ++i)
     {
         std::string a = argv[i];
-        if (a == "--watch-pid" && i + 1 < argc) { watchPid = std::stoll(argv[++i]); continue; }
+        if (a == "--watch-pid" && i + 1 < argc)
+        {
+            //A pid, whole and positive — else no mount (one whose spawner is unknown would never be taken down).
+            const std::string P = argv[++i];
+            char *End = nullptr;
+            errno = 0;
+            watchPid = std::strtoll(P.c_str(), &End, 10);
+            //Digits only, and a pid_t: a value cut down to one would watch another process (1: init, never gone).
+            if (P.empty() || P[0] < '0' || P[0] > '9' || *End != '\0' || errno == ERANGE || watchPid <= 0 || watchPid > INT_MAX)
+            { std::cerr << "[vidyagodfs] --watch-pid wants a process id, not '" << P << "'\n"; return 2; }
+            continue;
+        }
         if (a == "-o" && i + 1 < argc && std::string(argv[i + 1]) == "keep-symlinks") { keepSymlinks = true; ++i; continue; }
         if (a == "keep-symlinks") { keepSymlinks = true; continue; }
         backendArgs.push_back(a);

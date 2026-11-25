@@ -83,7 +83,7 @@ int     VfsRmdir   (VfsState &S, const std::string &vrel);
 int     VfsRename  (VfsState &S, const std::string &vfrom, const std::string &vto);
 int     VfsTruncate(VfsState &S, const std::string &vrel, OpenFile *of, uint64_t size);         // of may be null (path form)
 int     VfsChmod   (VfsState &S, const std::string &vrel, uint32_t mode);
-int     VfsUtimens (VfsState &S, const std::string &vrel, int64_t atimeSec, int64_t mtimeSec);
+int     VfsUtimens (VfsState &S, const std::string &vrel, HostIO::TimeSpec atime, HostIO::TimeSpec mtime);   // nsec may be TimeNow / TimeOmit
 int     VfsReadlink(VfsState &S, const std::string &vrel, std::string &target);
 int     VfsSymlink (VfsState &S, const std::string &target, const std::string &vrel);
 int     VfsLink    (VfsState &S, const std::string &vexisting, const std::string &vnew);   // a hard link

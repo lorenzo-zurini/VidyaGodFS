@@ -190,7 +190,7 @@ void        RenameMaskPrefix(VfsState &S, const std::string &oldv, const std::st
 long long   DebugMaskFolds();
 long long   DebugCaseWalks();   // TEST ONLY: archive members a submount's case names were walked over   // TEST ONLY: times a mask's changes were folded into its whole set
 
-void        MarkOpaque(VfsState &S, const std::string &vrel);
+int         MarkOpaque(VfsState &S, const std::string &vrel);     // 0, or why its marker could not be written (then not marked)
 void        UnmarkOpaque(VfsState &S, const std::string &vrel);   // mask erase only (caller owns the disk marker)
 bool        IsUnderOpaque(const VfsState &S, const std::string &vrel);
 

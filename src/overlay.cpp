@@ -470,12 +470,14 @@ static std::string OpaqueMarker(const VfsState &S, const std::string &vrel)
     return WLPath(S, vrel) + "/.wh..wh..opq";
 }
 
-void MarkOpaque(VfsState &S, const std::string &vrel)
+int MarkOpaque(VfsState &S, const std::string &vrel)
 {
-    if (S.writelayer.empty()) return;
+    if (S.writelayer.empty()) return 0;
     HostIO::Fd fd = HostIO::Open(OpaqueMarker(S, vrel), O_CREAT | O_WRONLY, 0644);
-    if (fd >= 0) HostIO::Close(fd);
+    if (fd < 0) return (int)fd;   // not recorded on disk: not in memory either (a remount would disagree)
+    HostIO::Close(fd);
     EditMask(S, S.opaqueSet, vrel, true);
+    return 0;
 }
 
 void UnmarkOpaque(VfsState &S, const std::string &vrel)

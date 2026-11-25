@@ -24,6 +24,7 @@
 #include <cstring>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -925,6 +926,121 @@ TEST(a_first_write_during_a_rename_over_its_name_writes_its_own_copy) {
     CHECK_EQ(VfsRead(A, b, 7, 0), (ssize_t)7);
     CHECK_EQ(std::string(b, 7), std::string("ZLDSAVE"));
     VfsRelease(A);
+}
+
+// "Delete the old folder, move the staged one into place" (every patcher and installer): the folder there is the new
+// one alone — the package's old files below it never show through. A folder moved over a non-empty one is refused
+// (ENOTEMPTY), a folder over a file and a file over a folder too. Teeth: no opaque mark after the move (old.txt back);
+// no emptiness check (the two merge).
+TEST(a_folder_moved_over_a_deleted_or_full_one_never_merges_with_it) {
+    TmpDir t;
+    writeFile(t / "host/data/old.txt", "old");
+    writeFile(t / "host/full/keep.txt", "keep");
+    writeFile(t / "host/afile", "f");
+    std::filesystem::create_directories(t / "host/emptydir");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { dirLayer(t.str("host")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK_EQ(VfsUnlink(S, "data/old.txt"), 0);
+    CHECK_EQ(VfsRmdir(S, "data"), 0);
+    CHECK_EQ(VfsMkdir(S, "data.new", 0755), 0);
+    OpenFile *N = nullptr;
+    CHECK_EQ(VfsCreate(S, "data.new/new.txt", 0644, O_WRONLY | O_TRUNC, N), 0);
+    if (N) VfsRelease(N);
+    CHECK_EQ(VfsRename(S, "data.new", "data"), 0);
+    CHECK(readdirNames(S, "data") == (std::set<std::string>{"new.txt"}));
+    CHECK_EQ(VfsMkdir(S, "other", 0755), 0);
+    CHECK_EQ(VfsRename(S, "other", "full"), -ENOTEMPTY);
+    CHECK(readdirNames(S, "full") == (std::set<std::string>{"keep.txt"}));
+    CHECK_EQ(VfsRename(S, "other", "afile"), -ENOTDIR);
+    CHECK_EQ(VfsRename(S, "afile", "other"), -EISDIR);
+    CHECK_EQ(VfsRename(S, "afile", "emptydir"), -EISDIR);   // a folder only below: nothing on the host to refuse it
+    // Remounted: the same.
+    VfsState R; CHECK(R.Init(sp, err));
+    CHECK(readdirNames(R, "data") == (std::set<std::string>{"new.txt"}));
+}
+
+// A folder renamed over the same empty folder again and again (a cache rebuilt by "write aside, move into place"):
+// each one works — the package's empty folder below and the markers a replaced folder held never make the host
+// refuse. And a folder that hid deleted children below replaces them for good. Teeth: marking opaque over an empty
+// lower folder (the second rename: ENOTEMPTY); no sweep of the replaced folder's markers (ENOTEMPTY); no opaque mark
+// after the sweep (the deleted child back).
+TEST(a_folder_replaced_again_and_again_moves_into_place_each_time) {
+    TmpDir t;
+    std::filesystem::create_directories(t / "host/cache");
+    writeFile(t / "host/saves/old.sav", "old");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { dirLayer(t.str("host")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    for (int I = 0; I < 3; ++I)
+    {
+        CHECK_EQ(VfsMkdir(S, "cache.tmp", 0755), 0);
+        OpenFile *N = nullptr;
+        CHECK_EQ(VfsCreate(S, "cache.tmp/c.bin", 0644, O_WRONLY | O_TRUNC, N), 0);
+        if (N) VfsRelease(N);
+        CHECK_EQ(VfsRename(S, "cache.tmp", "cache"), 0);
+        CHECK(readdirNames(S, "cache") == (std::set<std::string>{"c.bin"}));
+        CHECK_EQ(VfsUnlink(S, "cache/c.bin"), 0);
+    }
+    CHECK_EQ(VfsUnlink(S, "saves/old.sav"), 0);                    // saves/ is now empty as merged, a marker inside
+    CHECK_EQ(VfsMkdir(S, "saves.new", 0755), 0);
+    CHECK_EQ(VfsRename(S, "saves.new", "saves"), 0);
+    CHECK(readdirNames(S, "saves").empty());
+    VfsState R; CHECK(R.Init(sp, err));
+    CHECK(readdirNames(R, "saves").empty());                       // old.sav stays deleted, remounted too
+}
+
+// Inside a folder made opaque (moved over a deleted one), an emptied subfolder is empty: the package's old files
+// below it are no children of it, and a folder moves into its place. Teeth: CollectChildren blind to an opaque
+// parent (ENOTEMPTY).
+TEST(an_emptied_folder_under_an_opaque_one_takes_a_folder_moved_over_it) {
+    TmpDir t;
+    writeFile(t / "host/Data/maps/m1.map", "old map");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { dirLayer(t.str("host")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK_EQ(VfsUnlink(S, "Data/maps/m1.map"), 0);
+    CHECK_EQ(VfsRmdir(S, "Data/maps"), 0);
+    CHECK_EQ(VfsRmdir(S, "Data"), 0);
+    CHECK_EQ(VfsMkdir(S, "Data.new", 0755), 0);
+    CHECK_EQ(VfsMkdir(S, "Data.new/maps", 0755), 0);
+    CHECK_EQ(VfsRename(S, "Data.new", "Data"), 0);               // Data: opaque over the deleted one
+    CHECK(readdirNames(S, "Data/maps").empty());
+    CHECK_EQ(VfsMkdir(S, "maps.new", 0755), 0);
+    CHECK_EQ(VfsRename(S, "maps.new", "Data/maps"), 0);
+    CHECK(readdirNames(S, "Data/maps").empty());
+}
+
+// On a case-insensitive mount a rename that changes only a folder's case renames it (an installer normalising
+// names); it is not "a non-empty folder in the way". Teeth: the destination checked against the folder itself.
+TEST(a_case_only_rename_on_a_case_insensitive_mount_renames) {
+    TmpDir t;
+    writeFile(t / "host/keep.txt", "k");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { dirLayer(t.str("host")) }; sp.caseInsensitive = true;
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK_EQ(VfsMkdir(S, "data", 0755), 0);
+    OpenFile *N = nullptr;
+    CHECK_EQ(VfsCreate(S, "data/x.txt", 0644, O_WRONLY | O_TRUNC, N), 0);
+    if (N) VfsRelease(N);
+    CHECK_EQ(VfsRename(S, "data", "Data"), 0);
+}
+
+// `touch` sets now (UTIME_NOW), a time left alone stays (UTIME_OMIT), and nanoseconds are kept. Teeth: seconds only
+// with nsec 0 (touch → 1970, the omitted time reset to 1970).
+TEST(utimens_keeps_now_omit_and_nanoseconds) {
+    TmpDir t;
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = {};
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    OpenFile *N = nullptr;
+    CHECK_EQ(VfsCreate(S, "f.dat", 0644, O_WRONLY | O_TRUNC, N), 0);
+    if (N) VfsRelease(N);
+    const std::string Host = t.str("wl") + "/f.dat";
+    struct stat St{};
+    CHECK_EQ(VfsUtimens(S, "f.dat", { 1600000000, 123456789 }, { 1650000000, 987654321 }), 0);
+    CHECK_EQ(::stat(Host.c_str(), &St), 0);
+    CHECK_EQ((long long)St.st_mtim.tv_sec, 1650000000LL);
+    CHECK_EQ((long long)St.st_mtim.tv_nsec, 987654321LL);
+    CHECK_EQ(VfsUtimens(S, "f.dat", { 0, HostIO::TimeOmit }, { 0, HostIO::TimeNow }), 0);   // touch -m
+    CHECK_EQ(::stat(Host.c_str(), &St), 0);
+    CHECK((long long)St.st_mtim.tv_sec > 1700000000LL);                                    // now, not 1970
+    CHECK_EQ((long long)St.st_atim.tv_sec, 1600000000LL);                                   // left alone
 }
 
 // A folder renamed while a lazy handle under it has not written yet: its first write lands in the moved file, a file
@@ -2679,6 +2795,55 @@ TEST(a_create_that_fails_does_not_bring_a_deleted_file_back) {
     CHECK(VfsCreate(S, "cfg/default.sav", 0644, 0x41, of) < 0);
     fs::permissions(t / "durable", fs::perms::owner_all);
     VfsAttr a; CHECK_EQ(VfsGetattr(S, "cfg/default.sav", a), -ENOENT);
+}
+
+// The same in the writelayer: a create, mkdir, symlink or rename the host refuses leaves a deleted lower name deleted.
+// Teeth: the deletion marker dropped before the host op (the package's old file shows again).
+TEST(a_refused_make_in_the_writelayer_leaves_the_deleted_name_deleted) {
+    if (::geteuid() == 0) return;
+    TmpDir t;
+    writeFile(t / "host/old.txt", "old");
+    writeFile(t / "host/olddir/x.txt", "x");
+    writeFile(t / "host/src.txt", "s");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { dirLayer(t.str("host")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK_EQ(VfsUnlink(S, "old.txt"), 0);
+    CHECK_EQ(VfsUnlink(S, "olddir/x.txt"), 0);
+    CHECK_EQ(VfsRmdir(S, "olddir"), 0);
+    OpenFile *Cp = nullptr;
+    CHECK_EQ(VfsOpen(S, "src.txt", O_RDWR, Cp), 0);   // copied up before the folder is locked
+    if (Cp) { CHECK_EQ(VfsWrite(S, Cp, "S", 1, 0), (ssize_t)1); VfsRelease(Cp); }
+    fs::permissions(t / "wl", fs::perms::owner_read | fs::perms::owner_exec);
+    OpenFile *of = nullptr;
+    CHECK(VfsCreate(S, "old.txt", 0644, O_WRONLY | O_TRUNC, of) < 0);
+    CHECK(VfsMkdir(S, "olddir", 0755) < 0);
+    CHECK(VfsSymlink(S, "x", "old.txt") < 0);
+    CHECK(VfsRename(S, "src.txt", "old.txt") < 0);
+    fs::permissions(t / "wl", fs::perms::owner_all);
+    VfsAttr a;
+    CHECK_EQ(VfsGetattr(S, "old.txt", a), -ENOENT);
+    CHECK_EQ(VfsGetattr(S, "olddir", a), -ENOENT);
+}
+
+// A rename into a kept folder the host refuses leaves the user's deletions there as they were: the markers the move
+// would have replaced are put back, on disk too (the next launch sees them). Teeth: no put-back of kept markers (the
+// package's deleted file shows again, for good).
+TEST(a_refused_rename_into_a_kept_folder_keeps_what_the_user_deleted) {
+    if (::geteuid() == 0) return;
+    TmpDir t; Spec sp = keptOverLower(t, "cfg");
+    {
+        VfsState S; std::string err; CHECK(S.Init(sp, err));
+        CHECK_EQ(VfsUnlink(S, "cfg/sub/x.txt"), 0);                 // cfg/sub: empty now, a marker inside it
+        CHECK_EQ(VfsMkdir(S, "cfg/new", 0755), 0);
+        fs::permissions(t / "durable", fs::perms::owner_read | fs::perms::owner_exec);   // no rename in the kept root
+        CHECK(VfsRename(S, "cfg/new", "cfg/sub") < 0);
+        fs::permissions(t / "durable", fs::perms::owner_all);
+        VfsAttr a;
+        CHECK_EQ(VfsGetattr(S, "cfg/sub/x.txt", a), -ENOENT);
+    }
+    VfsState R; std::string err; CHECK(R.Init(sp, err));
+    VfsAttr a;
+    CHECK_EQ(VfsGetattr(R, "cfg/sub/x.txt", a), -ENOENT);
 }
 
 // The kept folder's own root is a mount point: removing it empties it for good; it can be made again.
