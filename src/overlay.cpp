@@ -274,18 +274,18 @@ bool VfsState::Init(const Spec &S, std::string &Err)
         //Runs by offset, none touching another: a patch goes into the run that reaches it (grown in place) and takes in
         //every later run it reaches, keeping their bytes past its own.
         std::unordered_map<std::string, std::map<uint64_t, std::vector<uint8_t>>> Runs;
-        for (const BytePatch &P : S.patches)
+        for (const BytePatch &Patch : S.patches)
         {
-            if (P.bytes.empty()) continue;
-            auto &M = Runs[PatchKey(*this, NormalizeVPath(P.path))];
-            const uint64_t End = P.at + P.bytes.size();
-            auto Run = M.upper_bound(P.at);
-            if (Run != M.begin() && std::prev(Run)->first + std::prev(Run)->second.size() >= P.at) --Run;
-            else Run = M.emplace(P.at, std::vector<uint8_t>()).first;
+            if (Patch.bytes.empty()) continue;
+            auto &M = Runs[PatchKey(*this, NormalizeVPath(Patch.path))];
+            const uint64_t End = Patch.at + Patch.bytes.size();
+            auto Run = M.upper_bound(Patch.at);
+            if (Run != M.begin() && std::prev(Run)->first + std::prev(Run)->second.size() >= Patch.at) --Run;
+            else Run = M.emplace(Patch.at, std::vector<uint8_t>()).first;
             std::vector<uint8_t> &V = Run->second;
             const uint64_t Base = Run->first;
             if (V.size() < End - Base) V.resize((size_t)(End - Base));
-            std::copy(P.bytes.begin(), P.bytes.end(), V.begin() + (std::ptrdiff_t)(P.at - Base));
+            std::copy(Patch.bytes.begin(), Patch.bytes.end(), V.begin() + (std::ptrdiff_t)(Patch.at - Base));
             for (auto Next = std::next(Run); Next != M.end() && Next->first <= Base + V.size();)
             {
                 if (Next->first + Next->second.size() > Base + V.size())

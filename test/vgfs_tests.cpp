@@ -14,6 +14,8 @@
 #include "zipscan.h"
 #include "vgdelta.h"
 #include "bytesource.h"
+#include "deflatelayer.h"
+#include <zlib.h>
 
 #include <cerrno>
 #include <zip.h>
@@ -3168,4 +3170,198 @@ TEST(a_refused_create_leaves_the_deleted_file_deleted) {
     CHECK(VfsCreate(S, "cfg/default.sav", 0644, O_WRONLY | O_CREAT | O_DIRECTORY, of) < 0);
     VfsAttr a; CHECK_EQ(VfsGetattr(S, "cfg/default.sav", a), -ENOENT);
     CHECK(fs::exists(t / "durable/.wh.default.sav"));
+}
+
+// ================================================================ the deflate layer: shipped bytes from content + decisions
+// A raw deflate stream as zlib makes it, with every knob the developer's tool might have turned.
+static std::vector<uint8_t> rawDeflate(const std::vector<uint8_t> &in, int level, int wbits, int mem, int strategy) {
+    z_stream z{}; if (deflateInit2(&z, level, Z_DEFLATED, -wbits, mem, strategy) != Z_OK) return {};
+    std::vector<uint8_t> out(deflateBound(&z, (uLong)in.size()) + 64);
+    z.next_in = const_cast<Bytef *>(in.data()); z.avail_in = (uInt)in.size(); z.next_out = out.data(); z.avail_out = (uInt)out.size();
+    deflate(&z, Z_FINISH); out.resize(z.total_out); deflateEnd(&z); return out;
+}
+// Content of several kinds: game text (repetitive words), noise, runs of one byte, and the three mixed.
+static std::vector<uint8_t> sampleContent(int kind, size_t n, uint32_t seed) {
+    std::mt19937 r(seed); std::vector<uint8_t> v; v.reserve(n);
+    static const char *words[] = {"Unit", "Hero", "Footman", "Damage", "Armor", "=", "\r\n", "Speed", "Range", "Cooldown", "0.75", "Human", "[", "]"};
+    while (v.size() < n) {
+        const int k = kind == 3 ? (int)(r() % 3) : kind;
+        if (k == 0) { const char *w = words[r() % 14]; while (*w && v.size() < n) v.push_back((uint8_t)*w++); }
+        else if (k == 1) v.push_back((uint8_t)r());
+        else { const uint8_t c = (uint8_t)r(); for (int i = 0, m = (int)(r() % 300); i < m && v.size() < n; ++i) v.push_back(c); }
+    }
+    return v;
+}
+// Every byte, read in uneven pieces, then random ranges of every size — against the stream itself.
+static bool readsBack(ByteSource &s, const std::vector<uint8_t> &want, uint32_t seed, int randomReads = 200) {
+    if (s.size() != want.size()) return false;
+    std::vector<uint8_t> got(want.size());
+    for (size_t o = 0, step = 1; o < want.size(); o += step, step = step * 3 % 9973 + 1)
+        if (!s.preadAll(got.data() + o, std::min(step, want.size() - o), o)) return false;
+    if (got != want) return false;
+    std::mt19937 r(seed);
+    for (int i = 0; i < randomReads && !want.empty(); ++i) {
+        const size_t a = r() % want.size(), n = 1 + r() % std::min<size_t>(want.size() - a, i % 3 ? 70000 : 9);
+        std::vector<uint8_t> b(n);
+        if (!s.preadAll(b.data(), n, a) || std::memcmp(b.data(), want.data() + a, n)) return false;
+    }
+    return true;
+}
+static std::shared_ptr<deflatelayer::DeflateByteSource> deflateSource(const std::vector<uint8_t> &stream, std::vector<uint8_t> *contentOut = nullptr) {
+    std::vector<uint8_t> dec, content; std::string err;
+    if (!deflatelayer::DeflateDecisions(stream.data(), stream.size(), dec, content, err)) { std::cerr << "  decisions: " << err << "\n"; return nullptr; }
+    if (contentOut) *contentOut = content;
+    return deflatelayer::DeflateByteSource::Create(std::make_shared<MemByteSource>(dec), std::make_shared<MemByteSource>(content), stream.size(), err);
+}
+
+// Whatever the encoder's settings (stored, fixed and dynamic blocks, every level, strategy and window), the stream reads
+// back from its content and decisions, every byte, at any offset — and the content is what the stream decodes to.
+TEST(a_deflate_stream_rebuilds_from_its_content_at_every_setting) {
+    const int strategies[] = {Z_DEFAULT_STRATEGY, Z_FILTERED, Z_HUFFMAN_ONLY, Z_RLE, Z_FIXED};
+    int cases = 0;
+    for (int kind = 0; kind < 4; ++kind) {
+        const auto in = sampleContent(kind, kind == 1 ? 70000 : 150000, (uint32_t)kind + 7);
+        for (int level = 0; level <= 9; ++level)
+            for (int st : strategies)
+                for (int wbits : {9, 12, 15}) {
+                    if ((level + wbits + st) % 3 && level != 0 && level != 9) continue;   // a spread, not the full product
+                    const auto stream = rawDeflate(in, level, wbits, (level % 9) + 1, st);
+                    std::vector<uint8_t> content; auto s = deflateSource(stream, &content);
+                    CHECK(s != nullptr);
+                    if (!s) continue;
+                    CHECK(content == in);
+                    CHECK(readsBack(*s, stream, (uint32_t)(level * 31 + wbits), 60));
+                    ++cases;
+                }
+    }
+    CHECK(cases > 100);
+}
+
+// The smallest streams: nothing, one byte, two — each a block or two of a few bits.
+TEST(an_empty_or_tiny_deflate_stream_rebuilds) {
+    for (size_t n : {0, 1, 2, 3}) for (int level : {0, 1, 9}) {
+        const auto in = sampleContent(0, n, 1); const auto stream = rawDeflate(in, level, 15, 8, Z_DEFAULT_STRATEGY);
+        std::vector<uint8_t> content; auto s = deflateSource(stream, &content);
+        CHECK(s != nullptr); CHECK(content == in); if (s) CHECK(readsBack(*s, stream, 3));
+    }
+}
+
+// Megabytes over many blocks: reads that start anywhere, cross block boundaries, and read one byte at a time near them.
+TEST(a_multi_block_deflate_stream_reads_anywhere) {
+    // memLevel 1: a small symbol buffer, so the encoder ends a block every few hundred symbols — hundreds of blocks
+    const auto in = sampleContent(3, 3 << 20, 11); const auto stream = rawDeflate(in, 6, 15, 1, Z_DEFAULT_STRATEGY);
+    auto s = deflateSource(stream);
+    CHECK(s != nullptr); if (!s) return;
+    CHECK(s->blocks() > 100);
+    CHECK(readsBack(*s, stream, 99, 2000));
+    std::mt19937 r(5);
+    for (int i = 0; i < 300; ++i) {                          // single bytes, all over
+        const size_t a = r() % stream.size(); uint8_t b = 0;
+        CHECK(s->pread(&b, 1, a) == 1); CHECK(b == stream[a]);
+    }
+    uint8_t b = 0; CHECK(s->pread(&b, 1, stream.size()) == 0);   // at the end: nothing, not an error
+    std::vector<uint8_t> tail(100);                          // a read running past the end gets what is there
+    CHECK(s->pread(tail.data(), tail.size(), stream.size() - 10) == 10);
+    CHECK(std::memcmp(tail.data(), stream.data() + stream.size() - 10, 10) == 0);
+}
+
+// One byte read at every offset of a stream of many small blocks: a read's first bit lands, somewhere, on every kind of
+// item boundary there is — inside a literal run, on a match, on an end-of-block code, on a block's first bit.
+TEST(a_deflate_stream_reads_one_byte_at_every_offset) {
+    for (int strategy : {Z_DEFAULT_STRATEGY, Z_FIXED}) {
+        const auto in = sampleContent(3, 120000, 21); const auto stream = rawDeflate(in, 6, 15, 1, strategy);
+        auto s = deflateSource(stream); CHECK(s != nullptr); if (!s) continue;
+        CHECK(s->blocks() > 20);
+        size_t wrong = 0;
+        for (size_t a = 0; a < stream.size(); ++a) { uint8_t b = 0; if (s->pread(&b, 1, a) != 1 || b != stream[a]) ++wrong; }
+        CHECK_EQ(wrong, (size_t)0);
+    }
+}
+
+// Deflate's bits as a hand-written stream: values LSB first, Huffman codes most significant bit first.
+struct DeflateBits {
+    std::vector<uint8_t> out; int n = 0;
+    void put(uint32_t v, int bits) { for (int i = 0; i < bits; ++i, ++n) { if (!(n & 7)) out.push_back(0); out.back() |= (uint8_t)(((v >> i) & 1) << (n & 7)); } }
+    void code(uint32_t c, int bits) { for (int i = bits - 1; i >= 0; --i) put((c >> i) & 1, 1); }
+};
+
+// Code tables deflate cannot have and symbols it does not define are refused with what is wrong with them, never decoded
+// into something: a literal/length table that over-subscribes its code space, the fixed table's length codes 286 and 287.
+TEST(a_deflate_stream_with_an_impossible_code_is_refused) {
+    std::vector<uint8_t> dec, content; std::string err;
+    {   // a dynamic block whose literal/length lengths give three codes of one bit
+        DeflateBits w; w.put(1, 1); w.put(2, 2); w.put(0, 5); w.put(0, 5); w.put(14, 4);  // final, dynamic, 257 + 1 codes, 18 cl lengths
+        // code-length code: symbol 0 one bit ("0"), symbols 1 and 2 two bits ("10", "11") — complete
+        const int clorder[18] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1};
+        for (int sym : clorder) w.put(sym == 0 ? 1 : sym == 1 || sym == 2 ? 2 : 0, 3);
+        auto len1 = [&] { w.code(2, 2); }; auto len0 = [&] { w.code(0, 1); };
+        len1(); len1(); for (int k = 2; k < 256; ++k) len0(); len1();                  // literals 0, 1 and end of block: 1 bit each
+        len1();                                                                          // the one distance code
+        w.put(0, 16);
+        CHECK(!deflatelayer::DeflateDecisions(w.out.data(), w.out.size(), dec, content, err));
+        CHECK(err == "a block whose code lengths over-subscribe");
+    }
+    for (uint32_t sym : {286u, 287u}) {   // a fixed block whose first symbol is a length code deflate leaves undefined
+        DeflateBits w; w.put(1, 1); w.put(1, 2); w.code(0xC0 + (sym - 280), 8); w.put(0, 16);
+        CHECK(!deflatelayer::DeflateDecisions(w.out.data(), w.out.size(), dec, content, err));
+        CHECK(err == "a length symbol deflate does not define");
+    }
+}
+
+// The decisions never carry the content: a stream of nothing but literals (noise, Huffman only) records only how many
+// there are, never the bytes themselves.
+TEST(deflate_decisions_carry_no_content) {
+    const auto in = sampleContent(1, 400000, 2); const auto stream = rawDeflate(in, 6, 15, 8, Z_HUFFMAN_ONLY);
+    std::vector<uint8_t> dec, content; std::string err;
+    CHECK(deflatelayer::DeflateDecisions(stream.data(), stream.size(), dec, content, err));
+    CHECK(content == in);
+    CHECK(dec.size() < content.size() / 100);
+}
+
+// Many threads reading one source at once all get the stream's bytes.
+TEST(a_deflate_source_reads_from_many_threads_at_once) {
+    const auto in = sampleContent(3, 1 << 20, 4); const auto stream = rawDeflate(in, 6, 15, 8, Z_DEFAULT_STRATEGY);
+    auto s = deflateSource(stream); CHECK(s != nullptr); if (!s) return;
+    std::atomic<int> bad{0}; std::vector<std::thread> th;
+    for (int t = 0; t < 8; ++t) th.emplace_back([&, t] {
+        std::mt19937 r((uint32_t)t); std::vector<uint8_t> b(65536);
+        for (int i = 0; i < 150; ++i) { const size_t a = r() % stream.size(), n = 1 + r() % std::min<size_t>(65536, stream.size() - a);
+            if (!s->preadAll(b.data(), n, a) || std::memcmp(b.data(), stream.data() + a, n)) ++bad; }
+    });
+    for (auto &x : th) x.join();
+    CHECK_EQ(bad.load(), 0);
+}
+
+// What is not exactly one whole raw deflate stream is refused, never split wrong: cut short, followed by more bytes,
+// a reserved block type, a stored block whose lengths disagree.
+TEST(a_broken_deflate_stream_is_refused) {
+    const auto in = sampleContent(0, 50000, 8); const auto stream = rawDeflate(in, 6, 15, 8, Z_DEFAULT_STRATEGY);
+    std::vector<uint8_t> dec, content; std::string err;
+    auto cut = stream; cut.resize(cut.size() - 3);
+    CHECK(!deflatelayer::DeflateDecisions(cut.data(), cut.size(), dec, content, err));
+    auto more = stream; more.push_back(0);
+    CHECK(!deflatelayer::DeflateDecisions(more.data(), more.size(), dec, content, err));
+    CHECK(err == "bytes after the final block");
+    auto reserved = stream; reserved[0] = (uint8_t)((reserved[0] & ~6) | 6);
+    CHECK(!deflatelayer::DeflateDecisions(reserved.data(), reserved.size(), dec, content, err));
+    auto stored = rawDeflate(in, 0, 15, 8, Z_DEFAULT_STRATEGY); stored[3] ^= 1;   // LEN's complement no longer matches
+    CHECK(!deflatelayer::DeflateDecisions(stored.data(), stored.size(), dec, content, err));
+}
+
+// A record and content that do not belong together are refused at creation: content of the wrong size, a record cut
+// short, a stream size the record cannot fill.
+TEST(a_deflate_source_refuses_a_record_that_does_not_fit) {
+    const auto in = sampleContent(0, 60000, 9); const auto stream = rawDeflate(in, 6, 15, 8, Z_DEFAULT_STRATEGY);
+    std::vector<uint8_t> dec, content; std::string err;
+    CHECK(deflatelayer::DeflateDecisions(stream.data(), stream.size(), dec, content, err));
+    auto shortContent = content; shortContent.pop_back();
+    CHECK(!deflatelayer::DeflateByteSource::Create(std::make_shared<MemByteSource>(dec), std::make_shared<MemByteSource>(shortContent), stream.size(), err));
+    auto cutRecord = dec; cutRecord.resize(cutRecord.size() / 2);
+    CHECK(!deflatelayer::DeflateByteSource::Create(std::make_shared<MemByteSource>(cutRecord), std::make_shared<MemByteSource>(content), stream.size(), err));
+    CHECK(!deflatelayer::DeflateByteSource::Create(std::make_shared<MemByteSource>(dec), std::make_shared<MemByteSource>(content), 1, err));
+    for (uint8_t type : {3, 0xFF}) {                         // a block type deflate does not have
+        auto badType = dec; badType[0] = type;
+        CHECK(!deflatelayer::DeflateByteSource::Create(std::make_shared<MemByteSource>(badType), std::make_shared<MemByteSource>(content), stream.size(), err));
+    }
+    CHECK(deflatelayer::DeflateByteSource::Create(std::make_shared<MemByteSource>(dec), std::make_shared<MemByteSource>(content), stream.size(), err) != nullptr);
 }
