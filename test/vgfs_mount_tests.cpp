@@ -59,6 +59,7 @@ static bool Mounted(const fs::path &mp)
 
 struct Fixture {
     fs::path root, mp, spec;
+    std::vector<std::string> helperArgs;   // more of the helper's own arguments (--uncached)
     Fixture() {
         root = fs::temp_directory_path() / ("vgfs_mount_" + std::to_string(::getpid()) + "_" + std::to_string(++n));
         mp = root / "mnt"; spec = root / "spec.json";
@@ -130,8 +131,10 @@ static pid_t StartSpawner(const Fixture &F, bool exitAfter, int ready, int goRea
     setpgid(0, 0);
     pid_t H = fork();
     if (H == 0) {
-        execl(g_helper.c_str(), "vidyagodfs", F.spec.c_str(), F.mp.c_str(),
-              "--watch-pid", std::to_string(getppid()).c_str(), "-o", "auto_cache", (char *)nullptr);
+        std::vector<std::string> Argv = { "vidyagodfs", F.spec.string(), F.mp.string(), "--watch-pid", std::to_string(getppid()), "-o", "auto_cache" };
+        Argv.insert(Argv.end(), F.helperArgs.begin(), F.helperArgs.end());
+        std::vector<char *> A; for (auto &Arg : Argv) A.push_back(Arg.data()); A.push_back(nullptr);
+        execv(g_helper.c_str(), A.data());
         _exit(127);
     }
     int St = 0; waitpid(H, &St, 0);
@@ -358,6 +361,64 @@ TEST(a_patched_file_reads_patched_through_the_mount) {
 
 // A --watch-pid that is not a process id is refused with a message, no mount and no crash. Teeth: std::stoll (an
 // uncaught exception: the helper aborts with SIGABRT).
+// Rewrites F's spec as VidyaGod's launch writes one: writable, over `layer`, with `wl` as its writelayer.
+static void WritableSpec(const Fixture &F, const fs::path &layer, const fs::path &wl)
+{
+    std::ofstream(F.spec, std::ios::trunc) << "{\"mountpoint\":\"" << F.mp.string() << "\",\"readonly\":false,\"writelayer\":\""
+        << wl.string() << "\",\"layers\":[{\"type\":\"dir\",\"source\":\"" << layer.string() << "\",\"target\":\"\"}]}";
+}
+
+static std::string ReadFile(const fs::path &p) { std::ifstream In(p); std::string Got; std::getline(In, Got); return Got; }
+
+static bool Lists(const fs::path &dir, const std::string &name)
+{
+    std::error_code Ec;
+    for (fs::directory_iterator E(dir, Ec), End; !Ec && E != End; E.increment(Ec))
+        if (E->path().filename() == name) return true;
+    return false;
+}
+
+// A launch mounts its spec twice over ONE writelayer: on the host (the build's edits, teardown's captures; --uncached)
+// and again in the sandbox (the game). What the game writes through the sandbox's mount, teardown reads through the
+// host's at once: a save it made is there, a folder lists it, a file it rewrote reads new, one it deleted is gone. The
+// host mount looked at each of them before the game ran (an absent save, a listed folder, a file read), which is what
+// its caches would answer from: cached, the new save was missing for the miss's 5 s, and from the listing for good.
+// Teeth: the host mount's misses or attributes kept by the kernel (a size read before any open is the attribute
+// cache's). Its listing and lookups are not cached either, which this kernel makes moot once attributes are not (a
+// folder's new mtime drops its cached listing): kept for a file system whose times are coarser (FAT, exFAT).
+TEST(what_one_mount_writes_another_of_its_writelayer_reads_at_once) {
+    Fixture Host, Game;
+    const fs::path Wl = Host.root / "wl";
+    WritableSpec(Host, Host.root / "layer", Wl);
+    WritableSpec(Game, Host.root / "layer", Wl);
+    Host.helperArgs = { "--uncached" };
+    pid_t SH = 0, SG = 0;
+    CHECK(MountedBySpawner(Host, SH, false));
+    CHECK(MountedBySpawner(Game, SG, false));
+    struct stat St {};
+    fs::create_directories(Host.mp / "Saves");
+    CHECK(::stat((Host.mp / "Saves" / "slot1.sav").c_str(), &St) != 0);
+    CHECK(!Lists(Host.mp / "Saves", "slot1.sav"));
+    CHECK(!Lists(Host.mp / "Saves", "slot1.sav"));     // the second listing: the one a cached directory answers
+    CHECK(ReadFile(Host.mp / "a.txt") == "hi");
+    { std::ofstream(Host.mp / "Saves" / "old.sav") << "gone"; }
+    CHECK(::stat((Host.mp / "Saves" / "old.sav").c_str(), &St) == 0);
+    { std::ofstream(Game.mp / "Saves" / "slot1.sav") << "progress"; }
+    { std::ofstream(Game.mp / "a.txt", std::ios::trunc) << "changed by the game"; }
+    CHECK(::unlink((Game.mp / "Saves" / "old.sav").c_str()) == 0);
+    CHECK(::stat((Host.mp / "Saves" / "slot1.sav").c_str(), &St) == 0 && S_ISREG(St.st_mode));
+    CHECK(ReadFile(Host.mp / "Saves" / "slot1.sav") == "progress");
+    CHECK(Lists(Host.mp / "Saves", "slot1.sav"));
+    CHECK(::stat((Host.mp / "a.txt").c_str(), &St) == 0 && St.st_size == (off_t)std::strlen("changed by the game"));   // before any open
+    CHECK(ReadFile(Host.mp / "a.txt") == "changed by the game");
+    CHECK(::stat((Host.mp / "Saves" / "old.sav").c_str(), &St) != 0 && errno == ENOENT);
+    CHECK(!Lists(Host.mp / "Saves", "old.sav"));
+    CHECK(::kill(-SG, SIGKILL) == 0); waitpid(SG, nullptr, 0);
+    CHECK(::kill(-SH, SIGKILL) == 0); waitpid(SH, nullptr, 0);
+    CHECK(Game.TornDown(std::chrono::seconds(10)));
+    CHECK(Host.TornDown(std::chrono::seconds(10)));
+}
+
 TEST(a_watch_pid_that_is_no_pid_is_refused_not_a_crash) {
     Fixture F;
     for (const char *Bad : { "abc", "12x", "-5", " 7", "4294967297", "99999999999999999999" })

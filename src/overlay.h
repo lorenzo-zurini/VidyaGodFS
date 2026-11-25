@@ -83,6 +83,9 @@ struct VfsState {
     // would be. A host-layer (dir/file) link is followed on the host or hidden. The WRITELAYER and rw passthrough
     // layers present links as they are: live runtime state written by the guest itself.
     bool                  flattenSymlinks = true;
+    //No kernel cache of lookups, attributes, misses or listings (--uncached): a view of a writelayer that another mount
+    //of it writes (the sandbox's), read as it is now. Pays a round trip per look; for a mount that serves no game.
+    bool                  uncached = false;
     uint32_t              uid = 1000;    // forced ownership presented by getattr (POSIX; the WinFsp mount overrides it with the mounting user)
     uint32_t              gid = 1000;
     std::vector<Layer>    layers;        // ascending priority (index 0 lowest)

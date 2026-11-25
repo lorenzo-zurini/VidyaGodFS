@@ -73,6 +73,7 @@ static int op_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t
 
 static int op_opendir(const char *, struct fuse_file_info *fi)
 {
+    if (St()->uncached) return 0;   // every listing asked again (VfsState::uncached)
     // Kernel-side directory caching. Without FOPEN_CACHE_DIR every getdents round-trips to
     // userspace and re-merges the whole overlay; keep_cache preserves the cached listing across
     // opendir calls (wine re-opens the directory on every case-insensitive lookup miss, so
@@ -104,6 +105,9 @@ static void *op_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
     // its next open, as it did with the one-second cache.
     cfg->ac_attr_timeout_set = 1;
     cfg->ac_attr_timeout     = 1.0;
+    //A view of a writelayer another mount writes (VfsState::uncached): nothing kept, a file's pages checked at each open.
+    if (static_cast<const VfsState *>(fuse_get_context()->private_data)->uncached)
+        cfg->negative_timeout = cfg->attr_timeout = cfg->entry_timeout = cfg->ac_attr_timeout = 0.0;
     return fuse_get_context()->private_data;
 }
 

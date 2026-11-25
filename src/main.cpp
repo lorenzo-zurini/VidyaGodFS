@@ -10,11 +10,14 @@
 #include <cstdlib>
 #include <string>
 
-// vidyagodfs <spec.json> <mountpoint> [--watch-pid <pid>] [extra backend opts...]
+// vidyagodfs <spec.json> <mountpoint> [--watch-pid <pid>] [--uncached] [extra backend opts...]
 //
 // Backend-neutral entry point: parse the layer-spec, build the merged-filesystem state, and hand
 // off to the platform mount backend (MountSession::Run — FUSE on Linux, WinFsp on Windows). All
 // mount/serve/watchdog/unmount mechanics live in the backend; this file knows nothing about them.
+//
+// --uncached: the kernel keeps nothing it was told (lookups, attributes, misses, listings) — a view of a writelayer
+// another mount of the same spec writes, read as it is now (VfsState::uncached).
 //
 // --watch-pid <pid>: auto-unmount the moment that pid dies, so a crash/kill of the VidyaGod app
 // can't leave the mount dangling (the backend implements the watch).
@@ -22,7 +25,7 @@ int main(int argc, char **argv)
 {
     if (argc < 3)
     {
-        std::cerr << "usage: vidyagodfs <spec.json> <mountpoint> [--watch-pid <pid>] [backend opts...]\n";
+        std::cerr << "usage: vidyagodfs <spec.json> <mountpoint> [--watch-pid <pid>] [--uncached] [backend opts...]\n";
         return 2;
     }
 
@@ -33,7 +36,7 @@ int main(int argc, char **argv)
     // passes through to the backend. keep-symlinks restores pre-abolition behavior: data layers serve
     // symlink entries as symlinks instead of flattening them to their targets (default: flatten).
     long long watchPid = 0;
-    bool keepSymlinks = false;
+    bool keepSymlinks = false, uncached = false;
     std::vector<std::string> backendArgs;
     for (int i = 3; i < argc; ++i)
     {
@@ -50,6 +53,7 @@ int main(int argc, char **argv)
             { std::cerr << "[vidyagodfs] --watch-pid wants a process id, not '" << P << "'\n"; return 2; }
             continue;
         }
+        if (a == "--uncached") { uncached = true; continue; }
         if (a == "-o" && i + 1 < argc && std::string(argv[i + 1]) == "keep-symlinks") { keepSymlinks = true; ++i; continue; }
         if (a == "keep-symlinks") { keepSymlinks = true; continue; }
         backendArgs.push_back(a);
@@ -63,6 +67,7 @@ int main(int argc, char **argv)
 
     static VfsState state;
     state.flattenSymlinks = !keepSymlinks;
+    state.uncached = uncached;
     //A layer that cannot be read (a corrupt archive or delta) is said, not an abort: nothing it throws escapes.
     bool Inited = false;
     try { Inited = state.Init(spec, err); }
