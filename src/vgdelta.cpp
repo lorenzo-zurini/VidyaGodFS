@@ -139,6 +139,15 @@ struct Parsed {
     std::shared_ptr<AddSource> add;        // this file's ADD-block store
 };
 
+// A compressed table's sizes from the file, against the file: its frame inside it, and no more than 64× its frame
+// (a table of offsets compresses a few times, never like a run of zeros) nor 2 GiB. A corrupt or hostile delta named
+// sizes that allocated tens of GB, and the mount helper aborted.
+static bool TableFits(uint64_t clen, uint64_t ulen, uint64_t at, uint64_t fileSize)
+{
+    if (at > fileSize || clen > fileSize - at) return false;
+    return ulen <= clen * 64 + (1u << 20) && ulen <= (2ull << 30);
+}
+
 // Parse one .vgdelta file (header + segment table + block index). ADD blocks stay on disk (read on demand).
 bool ParseDelta(const std::shared_ptr<ByteSource> &delta, Parsed &P, std::string &err) {
     uint8_t hdr[HEADER_SIZE];
@@ -158,6 +167,7 @@ bool ParseDelta(const std::shared_ptr<ByteSource> &delta, Parsed &P, std::string
         if (!delta->preadAll(lens, 16, off)) { err = "vgdelta: short seg lens"; return false; }
         uint64_t clen = rd64(lens), ulen = rd64(lens + 8);
         if (ulen != (uint64_t)numSeg * 17) { err = "vgdelta: seg table size mismatch"; return false; }
+        if (!TableFits(clen, ulen, off + 16, delta->size())) { err = "vgdelta: seg table larger than the file can hold"; return false; }
         std::vector<uint8_t> comp(clen);
         if (clen && !delta->preadAll(comp.data(), clen, off + 16)) { err = "vgdelta: short seg table"; return false; }
         std::vector<uint8_t> raw = ZDecompress(comp.data(), clen, ulen);
@@ -178,6 +188,7 @@ bool ParseDelta(const std::shared_ptr<ByteSource> &delta, Parsed &P, std::string
         if (!delta->preadAll(lens, 16, off)) { err = "vgdelta: short blk lens"; return false; }
         uint64_t clen = rd64(lens), ulen = rd64(lens + 8);
         if (ulen != (uint64_t)numBlk * 16) { err = "vgdelta: blk index size mismatch"; return false; }
+        if (!TableFits(clen, ulen, off + 16, delta->size())) { err = "vgdelta: blk index larger than the file can hold"; return false; }
         std::vector<uint8_t> comp(clen);
         if (clen && !delta->preadAll(comp.data(), clen, off + 16)) { err = "vgdelta: short blk index"; return false; }
         std::vector<uint8_t> raw = ZDecompress(comp.data(), clen, ulen);
@@ -185,7 +196,12 @@ bool ParseDelta(const std::shared_ptr<ByteSource> &delta, Parsed &P, std::string
         P.add->blocks.reserve(numBlk);
         for (uint32_t i = 0; i < numBlk; ++i) {
             const uint8_t *r = raw.data() + (size_t)i * 16;
-            P.add->blocks.push_back({ rd64(r), rd32(r + 8), rd32(r + 12) });
+            const BlockRec B{ rd64(r), rd32(r + 8), rd32(r + 12) };
+            //A block holds at most a block, and its frame lies in the file: read on demand, a lie here allocated up
+            //to 4 GiB per read.
+            if (B.uncompLen > blockSize || B.compLen > (uint64_t)blockSize + blockSize / 8 + 1024)
+            { err = "vgdelta: a block larger than the block size"; return false; }
+            P.add->blocks.push_back(B);
         }
         off += 16 + clen;
     }

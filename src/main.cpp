@@ -63,7 +63,11 @@ int main(int argc, char **argv)
 
     static VfsState state;
     state.flattenSymlinks = !keepSymlinks;
-    if (!state.Init(spec, err)) { std::cerr << "[vidyagodfs] init: " << err << "\n"; return 1; }
+    //A layer that cannot be read (a corrupt archive or delta) is said, not an abort: nothing it throws escapes.
+    bool Inited = false;
+    try { Inited = state.Init(spec, err); }
+    catch (const std::exception &E) { err = std::string("a layer could not be read: ") + E.what(); }
+    if (!Inited) { std::cerr << "[vidyagodfs] init: " << err << "\n"; return 1; }
 
     return MountSession::Run(state, mountpoint, watchPid, backendArgs);
 }

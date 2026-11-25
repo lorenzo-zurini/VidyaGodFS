@@ -15,6 +15,20 @@ std::string NormalizeVPath(const std::string &Path)
     return Path.substr(a, b - a);
 }
 
+bool SafeMemberName(const std::string &VRel)
+{
+    if (VRel.empty() || VRel.find('\\') != std::string::npos) return false;
+    size_t From = 0;
+    for (;;)
+    {
+        const size_t To = VRel.find('/', From);
+        const std::string Part = VRel.substr(From, To == std::string::npos ? std::string::npos : To - From);
+        if (Part.empty() || Part == "." || Part == "..") return false;
+        if (To == std::string::npos) return true;
+        From = To + 1;
+    }
+}
+
 bool ParseSpec(const std::string &Path, Spec &Out, std::string &Err)
 {
     std::ifstream In(Path, std::ios::binary);

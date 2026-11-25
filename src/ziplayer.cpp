@@ -1,5 +1,6 @@
 #include "ziplayer.h"
-#include "layerspec.h"   // NormalizeVPath
+#include "layerspec.h"   // NormalizeVPath, SafeMemberName
+#include <cstdio>
 #include "zipscan.h"     // CentralDirOffsets / LocalDataOffset (the shared ZIP64 CD walker)
 
 #include <zip.h>
@@ -91,6 +92,7 @@ static std::shared_ptr<ZipIndex> IndexFromDirectory(std::shared_ptr<ByteSource> 
         const bool isDir = !raw.empty() && raw.back() == '/';
         const std::string vrel = NormalizeVPath(raw);
         if (vrel.empty()) return true;                      // a root entry
+        if (!SafeMemberName(vrel)) { std::fprintf(stderr, "[vidyagodfs] %s: member '%s' left out (a '..', '.' or empty part)\n", Name.c_str(), raw.c_str()); return true; }
         ZipEntry e; e.name = vrel; e.index = C.index; e.isDir = isDir; e.mtime = C.mtime;
         if (isDir)
         {
@@ -160,6 +162,7 @@ std::shared_ptr<ZipIndex> BuildZipIndexLibzip(std::shared_ptr<ByteSource> Src, c
         bool isDir = (!raw.empty() && raw.back() == '/');
         std::string vrel = NormalizeVPath(raw);
         if (vrel.empty()) continue; // skip a root entry
+        if (!SafeMemberName(vrel)) { std::fprintf(stderr, "[vidyagodfs] member '%s' left out (a '..', '.' or empty part)\n", raw.c_str()); continue; }
 
         ZipEntry e; e.name = vrel; e.index = (uint64_t)i; e.isDir = isDir;
         if (st.valid & ZIP_STAT_MTIME) e.mtime = st.mtime;

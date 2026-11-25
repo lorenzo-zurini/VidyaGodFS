@@ -1174,6 +1174,24 @@ TEST(rename_carries_inner_whiteouts) {
     CHECK_EQ(VfsGetattr(S, "d2/del.txt", a), -ENOENT);     // deletion still masks at the NEW path
 }
 
+// A delta whose tables name sizes the file cannot hold (corrupt, or crafted) is refused with a reason — never an
+// allocation of what it says (tens of GB: the mount helper aborted). Teeth: allocate the table as named.
+TEST(a_delta_naming_impossible_sizes_is_refused) {
+    std::string base(4096, 'A');
+    std::string tgt = base; tgt[100] = 'B';
+    auto delta = vgdelta::GenerateDelta((const uint8_t *)base.data(), base.size(), (const uint8_t *)tgt.data(), tgt.size());
+    CHECK(!delta.empty());
+    auto baseSrc = std::make_shared<MemByteSource>(std::vector<uint8_t>(base.begin(), base.end()));
+    //The segment table's compressed length (u64 at 44) said to be 2^40 bytes.
+    std::vector<uint8_t> Bad = delta;
+    const uint64_t Huge = 1ull << 40;
+    std::memcpy(Bad.data() + 44, &Huge, 8);
+    std::string derr;
+    auto ds = vgdelta::DeltaByteSource::Create(std::make_shared<MemByteSource>(Bad), baseSrc, derr, false);
+    CHECK(ds == nullptr);
+    CHECK(derr.find("larger than the file") != std::string::npos);
+}
+
 // ---- delta round-trip (moved here from parent test intent for FS coverage) ----
 TEST(delta_roundtrip_basic) {
     std::string base(4096, 'A'); for (int i = 0; i < 4096; i += 7) base[i] = 'a' + (i % 26);
@@ -2844,6 +2862,20 @@ TEST(a_refused_rename_into_a_kept_folder_keeps_what_the_user_deleted) {
     VfsState R; std::string err; CHECK(R.Init(sp, err));
     VfsAttr a;
     CHECK_EQ(VfsGetattr(R, "cfg/sub/x.txt", a), -ENOENT);
+}
+
+// A crafted zip member named through ".." is left out: it neither lists nor lands outside the writelayer when its
+// folder is copied up (a rename). Teeth: index the name as it is (".." a child of d; the copy-up writes outside).
+TEST(a_zip_member_named_through_dotdot_is_left_out) {
+    TmpDir t;
+    writeStoreZip(t / "pkg.zip", {{"d/ok.txt", "ok", false}, {"d/../../escaped.txt", "out", false}, {"d/./dot.txt", "dot", false}});
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { zipLayer(t.str("pkg.zip")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK(readdirNames(S, "d") == (std::set<std::string>{"ok.txt"}));
+    CHECK_EQ(VfsRename(S, "d", "e"), 0);
+    CHECK(!fs::exists(t / "escaped.txt"));
+    CHECK(!fs::exists(t / "wl" / ".." / "escaped.txt"));
+    CHECK(readdirNames(S, "e") == (std::set<std::string>{"ok.txt"}));
 }
 
 // A deletion the writelayer cannot record fails, and the file stays — this session and the next (the marker was
