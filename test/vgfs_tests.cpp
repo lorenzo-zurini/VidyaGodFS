@@ -2871,11 +2871,13 @@ TEST(a_refused_rename_into_a_kept_folder_keeps_what_the_user_deleted) {
 TEST(a_zip_member_named_through_dotdot_is_left_out) {
     TmpDir t;
     writeStoreZip(t / "pkg.zip", {{"d/ok.txt", "ok", false}, {"d/../../escaped.txt", "out", false}, {"d/./dot.txt", "dot", false},
-                                  {"./Docs/", "", true}, {"Bin\\x.exe", "exe", false}, {"a..b.txt", "dots", false}});
+                                  {"./Docs/", "", true}, {"Bin\\x.exe", "exe", false}, {"a..b.txt", "dots", false},
+                                  {"Saves\\", "", false}});   // a Windows-made folder entry: a folder, not a file
     Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { zipLayer(t.str("pkg.zip")) };
     VfsState S; std::string err; CHECK(S.Init(sp, err));
     CHECK(readdirNames(S, "d") == (std::set<std::string>{"ok.txt", "dot.txt"}));
-    CHECK(readdirNames(S, "") == (std::set<std::string>{"d", "Docs", "Bin", "a..b.txt"}));
+    CHECK(readdirNames(S, "") == (std::set<std::string>{"d", "Docs", "Bin", "a..b.txt", "Saves"}));
+    VfsAttr Sv; CHECK_EQ(VfsGetattr(S, "Saves", Sv), 0); CHECK(Sv.isDir);
     CHECK(readdirNames(S, "Bin") == (std::set<std::string>{"x.exe"}));
     CHECK_EQ(VfsRename(S, "d", "e"), 0);
     CHECK(!fs::exists(t / "escaped.txt"));

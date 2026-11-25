@@ -645,6 +645,8 @@ bool GenerateDeltaToFile(const uint8_t *base, size_t baseLen, const uint8_t *tar
                          const std::string &outPath, std::string &Err, uint32_t blockSize,
                          const std::string &scratchDir, const ProgressFn &progress) {
     if (blockSize == 0) blockSize = DEFAULT_BLOCK;
+    //What the reader refuses is not made: a delta that would not mount is no delta.
+    if (blockSize > (64u << 20)) { Err = "vgdelta: block size past 64 MiB (" + std::to_string(blockSize) + ")"; return false; }
     //outPath is removed on a failure only once this call opened it: a file already there (the delta it would replace,
     //or a base or target named by mistake) is never taken by a generation that failed before writing.
     bool Opened = false;

@@ -89,7 +89,7 @@ static std::shared_ptr<ZipIndex> IndexFromDirectory(std::shared_ptr<ByteSource> 
     Z->src = Src;
     const bool Walked = zipscan::WalkCentralDirFull(*Src, [&](const zipscan::CdEntry &C) {
         const std::string &raw = C.utf8Name;
-        const bool isDir = !raw.empty() && raw.back() == '/';
+        const bool isDir = !raw.empty() && (raw.back() == '/' || raw.back() == '\\');   // a Windows-made folder ends in '\\'
         const std::string vrel = CleanMemberName(raw);
         if (vrel.empty())                                   // a root entry, or one naming outside the archive
         {
@@ -163,7 +163,7 @@ std::shared_ptr<ZipIndex> BuildZipIndexLibzip(std::shared_ptr<ByteSource> Src, c
         if (!(st.valid & ZIP_STAT_NAME) || st.name == nullptr) continue;
 
         std::string raw = st.name;
-        bool isDir = (!raw.empty() && raw.back() == '/');
+        bool isDir = (!raw.empty() && (raw.back() == '/' || raw.back() == '\\'));   // a Windows-made folder ends in '\\'
         std::string vrel = CleanMemberName(raw);
         if (vrel.empty())   // a root entry, or one naming outside the archive
         {

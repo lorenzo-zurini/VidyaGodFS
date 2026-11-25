@@ -17,8 +17,8 @@ std::string NormalizeVPath(const std::string &Path)
 
 std::string CleanMemberName(const std::string &Raw)
 {
-    //As the app reads a member (validate, the launch tree): '\\' is a separator, a "." part and an empty one are
-    //nothing ("./Bin/" is "Bin"); a ".." part names outside the archive's folder — no name at all.
+    //'\\' is a separator (as the app's validator and launch tree read it), a "." part and an empty one are nothing
+    //("./Bin/" is "Bin", as the kernel resolves it); a ".." part names outside the archive's folder — no name at all.
     std::string P = Raw;
     for (char &C : P) if (C == '\\') C = '/';
     std::string Out;
