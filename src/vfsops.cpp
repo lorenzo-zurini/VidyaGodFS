@@ -339,7 +339,10 @@ int VfsCreate(VfsState &S, const std::string &v, uint32_t mode, int flags, OpenF
     S.BeginNameChange();   // a file made at the name is another file than the one its open handles were opened on
     const HostIO::Fd fd = HostIO::Open(host, (flags | O_CREAT) & ~O_NOFOLLOW, mode);
     if (fd < 0) { S.EndNameChange({}); return (int)fd; }
-    if (!kept) RemoveWhiteout(S, v);   // only once it is made: a refused create leaves the deleted file deleted
+    //Only once it is made: a refused create leaves the deleted file deleted. A marker that will not come off hides the
+    //file just made: said (EIO), the file closed.
+    if (!kept)
+        if (int e = RemoveWhiteout(S, v); e != 0) { HostIO::Close(fd); S.EndNameChange({ { v, false } }); return e; }
     S.EndNameChange({ { v, false } });
     // Only now: the deleted name is made again. Were the marker to stay (an unlink failure), the new file still
     // shows — the folder's own names are never masked by its markers — and the marker keeps hiding the package copy.
@@ -491,8 +494,7 @@ int VfsMkdir(VfsState &S, const std::string &v, uint32_t mode)
     if (int e = HostIO::Mkdir(WLPath(S, v), mode); e != 0) return e;
     if (recreateOverLower)
         if (int e = MarkOpaque(S, v); e != 0) { HostIO::Rmdir(WLPath(S, v)); return e; }
-    RemoveWhiteout(S, v);   // only once it is made (and opaque): a refused mkdir leaves the deleted folder deleted
-    return 0;
+    return RemoveWhiteout(S, v);   // only once it is made (and opaque): a refused mkdir leaves the deleted folder deleted
 }
 
 static int UnlinkImpl(VfsState &S, const std::string &v);
@@ -560,12 +562,28 @@ int VfsRmdir(VfsState &S, const std::string &v)
         // which make it non-empty on disk even though the merged view is empty. Clear them so rmdir works —
         // and mirror each removal in the in-memory masks.
         std::string wl = WLPath(S, v);
-        HostIO::ReadDir(wl, [&](const std::string &n) {
-            if (n.rfind(".wh.", 0) != 0) return;
-            if (n == ".wh..wh..opq") { HostIO::Unlink(wl + "/" + n); UnmarkOpaque(S, v); }
-            else RemoveWhiteout(S, v.empty() ? n.substr(4) : v + "/" + n.substr(4)); // unlinks marker + mask erase
-        });
-        if (int e = HostIO::Rmdir(wl); e != 0 && e != -ENOENT) return e;   // still there: not removed, say so
+        std::vector<std::string> names;
+        HostIO::ReadDir(wl, [&](const std::string &n) { if (n.rfind(".wh.", 0) == 0) names.push_back(n); });
+        std::vector<std::string> swept;
+        bool sweptOpaque = false;
+        for (const std::string &n : names)
+        {
+            if (n.rfind(kCopyTmpPrefix, 0) == 0) { HostIO::Unlink(wl + "/" + n); continue; }   // a dead copy: no marker
+            if (n == ".wh..wh..opq")
+            {
+                if (int e = HostIO::Unlink(wl + "/" + n); e == 0 || e == -ENOENT) { UnmarkOpaque(S, v); sweptOpaque = true; }
+                continue;
+            }
+            const std::string c = v.empty() ? n.substr(4) : v + "/" + n.substr(4);
+            if (RemoveWhiteout(S, c) == 0) swept.push_back(c);   // unlinks marker + mask erase
+        }
+        if (int e = HostIO::Rmdir(wl); e != 0 && e != -ENOENT)
+        {
+            //Not removed: what it said was deleted inside it stays deleted (put back), and the call says so.
+            for (const std::string &c : swept) (void)CreateWhiteout(S, c);
+            if (sweptOpaque) (void)MarkOpaque(S, v);
+            return e;
+        }
     }
     if (Resolve(S, v).kind != HitKind::None) return CreateWhiteout(S, v);
     return 0;
@@ -684,7 +702,8 @@ int VfsRename(VfsState &S, const std::string &vf, const std::string &vt)
     //Both names, and all under them, name other files from here on.
     S.BeginNameChange();
     if (int e = HostIO::Rename(src, dst); e != 0) { S.EndNameChange({}); putBack(); return e; }
-    if (!dstKept) RemoveWhiteout(S, vt);   // only once it moved there: a refused rename leaves the deleted name deleted
+    int markErr = 0;   // only once it moved there: a refused rename leaves the deleted name deleted
+    if (!dstKept) markErr = RemoveWhiteout(S, vt);
     if (S.debugHook) S.debugHook("rename-before-detach");
     S.EndNameChange({ { vf, isDir }, { vt, isDir } });
     if (isDir) KeptRenamePrefix(S, vf, vt);   // the kept markers inside it moved along
@@ -700,7 +719,7 @@ int VfsRename(VfsState &S, const std::string &vf, const std::string &vt)
     // The old name still below → hidden. Not a case-only rename on a case-insensitive host: the old spelling IS the
     // moved folder there, and hiding it would hide the folder.
     if (!sameEntry && Resolve(S, vf).kind != HitKind::None) { if (int e = HideLower(S, vf); e != 0) return e; }
-    return late;
+    return markErr ? markErr : late;
 }
 
 int VfsTruncate(VfsState &S, const std::string &v, OpenFile *of, uint64_t size)
@@ -786,8 +805,7 @@ int VfsSymlink(VfsState &S, const std::string &target, const std::string &v)
     }
     if (int e = EnsureWriteParent(S, v); e != 0) return e;
     if (int e = HostIO::Symlink(target, WLPath(S, v)); e != 0) return e;
-    RemoveWhiteout(S, v);   // only once it is made
-    return 0;
+    return RemoveWhiteout(S, v);   // only once it is made
 }
 
 // A hard link, as rename does it: the existing file is made writable first (a copy-up, unless it lives in a kept

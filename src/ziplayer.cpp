@@ -90,9 +90,13 @@ static std::shared_ptr<ZipIndex> IndexFromDirectory(std::shared_ptr<ByteSource> 
     const bool Walked = zipscan::WalkCentralDirFull(*Src, [&](const zipscan::CdEntry &C) {
         const std::string &raw = C.utf8Name;
         const bool isDir = !raw.empty() && raw.back() == '/';
-        const std::string vrel = NormalizeVPath(raw);
-        if (vrel.empty()) return true;                      // a root entry
-        if (!SafeMemberName(vrel)) { std::fprintf(stderr, "[vidyagodfs] %s: member '%s' left out (a '..', '.' or empty part)\n", Name.c_str(), raw.c_str()); return true; }
+        const std::string vrel = CleanMemberName(raw);
+        if (vrel.empty())                                   // a root entry, or one naming outside the archive
+        {
+            if (raw.find("..") != std::string::npos && !NormalizeVPath(raw).empty())
+                std::fprintf(stderr, "[vidyagodfs] %s: member '%s' left out (a '..' part)\n", Name.c_str(), raw.c_str());
+            return true;
+        }
         ZipEntry e; e.name = vrel; e.index = C.index; e.isDir = isDir; e.mtime = C.mtime;
         if (isDir)
         {
@@ -160,9 +164,13 @@ std::shared_ptr<ZipIndex> BuildZipIndexLibzip(std::shared_ptr<ByteSource> Src, c
 
         std::string raw = st.name;
         bool isDir = (!raw.empty() && raw.back() == '/');
-        std::string vrel = NormalizeVPath(raw);
-        if (vrel.empty()) continue; // skip a root entry
-        if (!SafeMemberName(vrel)) { std::fprintf(stderr, "[vidyagodfs] member '%s' left out (a '..', '.' or empty part)\n", raw.c_str()); continue; }
+        std::string vrel = CleanMemberName(raw);
+        if (vrel.empty())   // a root entry, or one naming outside the archive
+        {
+            if (raw.find("..") != std::string::npos && !NormalizeVPath(raw).empty())
+                std::fprintf(stderr, "[vidyagodfs] member '%s' left out (a '..' part)\n", raw.c_str());
+            continue;
+        }
 
         ZipEntry e; e.name = vrel; e.index = (uint64_t)i; e.isDir = isDir;
         if (st.valid & ZIP_STAT_MTIME) e.mtime = st.mtime;

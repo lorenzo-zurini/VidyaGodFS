@@ -68,8 +68,10 @@ bool ParseSpecText(const std::string &Text, Spec &Out, std::string &Err);
 
 //Strips leading/trailing '/' from a virtual path; "/" and "" both normalize to "".
 std::string NormalizeVPath(const std::string &Path);
-// An archive member's name a mount can serve: no empty, "." or ".." part and no backslash. One that is not (a crafted
-// package) would name a path outside its folder — a copy-up of its parent wrote OUTSIDE the writelayer.
+// An archive member's name as the mount serves it: '\\' read as '/', "." and empty parts dropped ("./Bin/" → "Bin");
+// "" for one with a ".." part (a crafted package: its folder's copy-up wrote OUTSIDE the writelayer).
+std::string CleanMemberName(const std::string &Raw);
+// A name that is its own clean form (CleanMemberName).
 bool SafeMemberName(const std::string &VRel);
 
 #endif // VIDYAGODFS_LAYERSPEC_H

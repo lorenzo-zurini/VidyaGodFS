@@ -200,8 +200,8 @@ std::unordered_map<std::string, uint64_t> CentralDirOffsets(ByteSource &src)
 {
     std::unordered_map<std::string, uint64_t> out;
     WalkCentralDir(src, [&](const std::string &raw, uint16_t, uint64_t lhOffset) {
-        std::string vrel = NormalizeVPath(raw);
-        if (!vrel.empty() && SafeMemberName(vrel)) out[vrel] = lhOffset;
+        const std::string vrel = CleanMemberName(raw);   // the name the mount serves it by
+        if (!vrel.empty()) out[vrel] = lhOffset;
         return true;
     });
     return out;

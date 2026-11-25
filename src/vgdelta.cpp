@@ -139,13 +139,14 @@ struct Parsed {
     std::shared_ptr<AddSource> add;        // this file's ADD-block store
 };
 
-// A compressed table's sizes from the file, against the file: its frame inside it, and no more than 64× its frame
-// (a table of offsets compresses a few times, never like a run of zeros) nor 2 GiB. A corrupt or hostile delta named
-// sizes that allocated tens of GB, and the mount helper aborted.
+// A compressed table's sizes from the file, against the file: its frame inside it, and no more than 2 GiB unpacked. A
+// corrupt or hostile delta named sizes that allocated tens of GB, and the mount helper aborted.
 static bool TableFits(uint64_t clen, uint64_t ulen, uint64_t at, uint64_t fileSize)
 {
+    //No ratio bound: the writer can make a table of millions of identical records (a long run of one byte), which
+    //compresses past any ratio a reader could pick — a minted delta would not mount.
     if (at > fileSize || clen > fileSize - at) return false;
-    return ulen <= clen * 64 + (1u << 20) && ulen <= (2ull << 30);
+    return ulen <= (2ull << 30);
 }
 
 // Parse one .vgdelta file (header + segment table + block index). ADD blocks stay on disk (read on demand).
@@ -160,6 +161,9 @@ bool ParseDelta(const std::shared_ptr<ByteSource> &delta, Parsed &P, std::string
     P.baseHash   = rd64(hdr + 28);
     uint32_t numSeg = rd32(hdr + 36), numBlk = rd32(hdr + 40);
     if (blockSize == 0) { err = "vgdelta: zero block size"; return false; }
+    //The writer's blocks are 256 KiB: a header naming more than 64 MiB is no delta of ours (the per-block bounds below
+    //are measured against it).
+    if (blockSize > (64u << 20)) { err = "vgdelta: block size past 64 MiB"; return false; }
     uint64_t off = HEADER_SIZE;
 
     {   // segment table (clen/ulen u64 — a pathologically fragmented delta can't overflow)
@@ -197,8 +201,8 @@ bool ParseDelta(const std::shared_ptr<ByteSource> &delta, Parsed &P, std::string
         for (uint32_t i = 0; i < numBlk; ++i) {
             const uint8_t *r = raw.data() + (size_t)i * 16;
             const BlockRec B{ rd64(r), rd32(r + 8), rd32(r + 12) };
-            //A block holds at most a block, and its frame lies in the file: read on demand, a lie here allocated up
-            //to 4 GiB per read.
+            //A block holds at most a block, and its frame lies in the file (checked with the ADD region's start,
+            //below): read on demand, a lie here allocated up to 4 GiB per read.
             if (B.uncompLen > blockSize || B.compLen > (uint64_t)blockSize + blockSize / 8 + 1024)
             { err = "vgdelta: a block larger than the block size"; return false; }
             P.add->blocks.push_back(B);
@@ -206,6 +210,9 @@ bool ParseDelta(const std::shared_ptr<ByteSource> &delta, Parsed &P, std::string
         off += 16 + clen;
     }
     P.add->regionOff = off;   // ADD block frames follow the block index
+    for (const BlockRec &B : P.add->blocks)
+        if (B.compOff > delta->size() || B.compLen > delta->size() - B.compOff || off > delta->size() - B.compOff - B.compLen)
+        { err = "vgdelta: a block's frame lies past the end of the file"; return false; }
     return true;
 }
 

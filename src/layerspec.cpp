@@ -15,19 +15,26 @@ std::string NormalizeVPath(const std::string &Path)
     return Path.substr(a, b - a);
 }
 
-bool SafeMemberName(const std::string &VRel)
+std::string CleanMemberName(const std::string &Raw)
 {
-    if (VRel.empty() || VRel.find('\\') != std::string::npos) return false;
+    //As the app reads a member (validate, the launch tree): '\\' is a separator, a "." part and an empty one are
+    //nothing ("./Bin/" is "Bin"); a ".." part names outside the archive's folder — no name at all.
+    std::string P = Raw;
+    for (char &C : P) if (C == '\\') C = '/';
+    std::string Out;
     size_t From = 0;
     for (;;)
     {
-        const size_t To = VRel.find('/', From);
-        const std::string Part = VRel.substr(From, To == std::string::npos ? std::string::npos : To - From);
-        if (Part.empty() || Part == "." || Part == "..") return false;
-        if (To == std::string::npos) return true;
+        const size_t To = P.find('/', From);
+        const std::string Part = P.substr(From, To == std::string::npos ? std::string::npos : To - From);
+        if (Part == "..") return {};
+        if (!Part.empty() && Part != ".") Out += (Out.empty() ? "" : "/") + Part;
+        if (To == std::string::npos) return Out;
         From = To + 1;
     }
 }
+
+bool SafeMemberName(const std::string &VRel) { return !VRel.empty() && CleanMemberName(VRel) == VRel; }
 
 bool ParseSpec(const std::string &Path, Spec &Out, std::string &Err)
 {

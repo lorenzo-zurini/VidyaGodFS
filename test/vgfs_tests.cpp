@@ -2865,17 +2865,64 @@ TEST(a_refused_rename_into_a_kept_folder_keeps_what_the_user_deleted) {
 }
 
 // A crafted zip member named through ".." is left out: it neither lists nor lands outside the writelayer when its
-// folder is copied up (a rename). Teeth: index the name as it is (".." a child of d; the copy-up writes outside).
+// folder is copied up (a rename). A "." part is nothing and '\\' a separator, as the app reads names ("./Docs/" is
+// Docs, a Windows-made "Bin\\x.exe" is Bin/x.exe). Teeth: index names as they are (".." a child of d: the copy-up
+// writes outside; "./Docs" and "Bin\\x.exe" served under names nothing looks for).
 TEST(a_zip_member_named_through_dotdot_is_left_out) {
     TmpDir t;
-    writeStoreZip(t / "pkg.zip", {{"d/ok.txt", "ok", false}, {"d/../../escaped.txt", "out", false}, {"d/./dot.txt", "dot", false}});
+    writeStoreZip(t / "pkg.zip", {{"d/ok.txt", "ok", false}, {"d/../../escaped.txt", "out", false}, {"d/./dot.txt", "dot", false},
+                                  {"./Docs/", "", true}, {"Bin\\x.exe", "exe", false}, {"a..b.txt", "dots", false}});
     Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { zipLayer(t.str("pkg.zip")) };
     VfsState S; std::string err; CHECK(S.Init(sp, err));
-    CHECK(readdirNames(S, "d") == (std::set<std::string>{"ok.txt"}));
+    CHECK(readdirNames(S, "d") == (std::set<std::string>{"ok.txt", "dot.txt"}));
+    CHECK(readdirNames(S, "") == (std::set<std::string>{"d", "Docs", "Bin", "a..b.txt"}));
+    CHECK(readdirNames(S, "Bin") == (std::set<std::string>{"x.exe"}));
     CHECK_EQ(VfsRename(S, "d", "e"), 0);
     CHECK(!fs::exists(t / "escaped.txt"));
     CHECK(!fs::exists(t / "wl" / ".." / "escaped.txt"));
-    CHECK(readdirNames(S, "e") == (std::set<std::string>{"ok.txt"}));
+    CHECK(readdirNames(S, "e") == (std::set<std::string>{"ok.txt", "dot.txt"}));
+}
+
+// A delta whose header names a block size past 64 MiB, or a block whose frame lies past the end of the file, is
+// refused: the per-block bound is measured against the header's block size. Teeth: no bound on it (a crafted header
+// lifts the per-block bound; a read allocated up to 4 GiB).
+TEST(a_delta_with_a_crafted_block_size_is_refused) {
+    std::string base(4096, 'A');
+    std::string tgt = base; tgt.insert(100, std::string(3000, 'Q'));
+    auto delta = vgdelta::GenerateDelta((const uint8_t *)base.data(), base.size(), (const uint8_t *)tgt.data(), tgt.size());
+    CHECK(!delta.empty());
+    auto baseSrc = std::make_shared<MemByteSource>(std::vector<uint8_t>(base.begin(), base.end()));
+    std::vector<uint8_t> Bad = delta;
+    const uint32_t Huge = 0xFFFFFFFFu;
+    std::memcpy(Bad.data() + 8, &Huge, 4);   // the header's block size
+    std::string derr;
+    CHECK(vgdelta::DeltaByteSource::Create(std::make_shared<MemByteSource>(Bad), baseSrc, derr, false) == nullptr);
+    CHECK(derr.find("block size") != std::string::npos);
+    std::vector<uint8_t> Cut(delta.begin(), delta.end() - 8);   // the last block's frame cut short
+    derr.clear();
+    CHECK(vgdelta::DeltaByteSource::Create(std::make_shared<MemByteSource>(Cut), baseSrc, derr, false) == nullptr);
+    CHECK(derr.find("past the end") != std::string::npos);
+}
+
+// An rmdir the host refuses leaves what was deleted inside the folder deleted: the markers it swept to remove it are
+// put back (disk and mask). Teeth: no put-back (the deleted file shows again, for good).
+TEST(a_refused_rmdir_keeps_the_deletions_inside_it) {
+    if (::geteuid() == 0) return;
+    TmpDir t;
+    writeFile(t / "host/d/x.txt", "package x");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { dirLayer(t.str("host")) };
+    {
+        VfsState S; std::string err; CHECK(S.Init(sp, err));
+        CHECK_EQ(VfsUnlink(S, "d/x.txt"), 0);                        // wl/d/.wh.x.txt
+        fs::permissions(t / "wl", fs::perms::owner_read | fs::perms::owner_exec);   // d cannot come off wl
+        CHECK(VfsRmdir(S, "d") < 0);
+        fs::permissions(t / "wl", fs::perms::owner_all);
+        VfsAttr a;
+        CHECK_EQ(VfsGetattr(S, "d/x.txt", a), -ENOENT);
+    }
+    VfsState R; std::string err; CHECK(R.Init(sp, err));
+    VfsAttr a;
+    CHECK_EQ(VfsGetattr(R, "d/x.txt", a), -ENOENT);
 }
 
 // A deletion the writelayer cannot record fails, and the file stays — this session and the next (the marker was
