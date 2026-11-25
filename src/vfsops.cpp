@@ -339,22 +339,26 @@ int VfsOpen(VfsState &S, const std::string &v, int flags, OpenFile *&out)
     return 0;
 }
 
+//What FUSE's kernel lookup answers before a name is made on Linux, and WinFsp leaves to us: a name is made only in a
+//folder that is there (else the writelayer's parents were made for it, and a folder no one made appeared) and, with
+//Excl, only where none is (a name only a lower layer has is taken: else an empty writelayer entry shadowed it).
+static int MayMakeName(VfsState &S, const std::string &v, bool Excl)
+{
+    VfsAttr a;
+    if (Excl && VfsGetattr(S, v, a) == 0) return -EEXIST;
+    if (const size_t cut = v.find_last_of('/'); cut != std::string::npos)
+    {
+        if (int e = VfsGetattr(S, v.substr(0, cut), a); e != 0) return e;
+        if (!a.isDir) return -ENOTDIR;
+    }
+    return 0;
+}
+
 int VfsCreate(VfsState &S, const std::string &v, uint32_t mode, int flags, OpenFile *&out)
 {
     out = nullptr;
     if (S.readOnly) return -EROFS;
-    //What FUSE's kernel lookup answers before a create on Linux, and WinFsp leaves to us: a name only a lower layer has
-    //is taken (CREATE_NEW / O_EXCL: else an empty writelayer file shadowed it), and a file is made only in a folder that
-    //is there (else the writelayer's parents were made for it, and a folder no one made appeared).
-    {
-        VfsAttr a;
-        if ((flags & O_EXCL) && VfsGetattr(S, v, a) == 0) return -EEXIST;
-        if (const size_t cut = v.find_last_of('/'); cut != std::string::npos)
-        {
-            if (int e = VfsGetattr(S, v.substr(0, cut), a); e != 0) return e;
-            if (!a.isDir) return -ENOTDIR;
-        }
-    }
+    if (int e = MayMakeName(S, v, (flags & O_EXCL) != 0); e != 0) return e;   // CREATE_NEW / O_EXCL
 
     std::string host;
     const bool kept = PassthroughHost(S, v, host);
@@ -497,6 +501,7 @@ void VfsRelease(OpenFile *of)
 int VfsMkdir(VfsState &S, const std::string &v, uint32_t mode)
 {
     if (S.readOnly) return -EROFS;
+    if (int e = MayMakeName(S, v, true); e != 0) return e;
     std::string host;
     if (PassthroughHost(S, v, host))
     {
@@ -819,6 +824,7 @@ int VfsReadlink(VfsState &S, const std::string &v, std::string &target)
 int VfsSymlink(VfsState &S, const std::string &target, const std::string &v)
 {
     if (S.readOnly) return -EROFS;
+    if (int e = MayMakeName(S, v, true); e != 0) return e;
     std::string host;
     if (PassthroughHost(S, v, host))
     {
@@ -845,7 +851,7 @@ int VfsLink(VfsState &S, const std::string &vf, const std::string &vt)
     const bool isDir = (rr.kind == HitKind::ImplicitDir) ||
                        (rr.kind == HitKind::ZipEntry && (rr.zipEntry == nullptr || rr.zipEntry->isDir));
     if (isDir) return -EPERM;                                    // directories cannot be hard-linked
-    if (Resolve(S, vt).kind != HitKind::None) return -EEXIST;
+    if (int e = MayMakeName(S, vt, true); e != 0) return e;
     if (!rr.rwPassthrough && rr.kind != HitKind::WriteLayer)
         if (int e = CopyUp(S, vf, rr); e != 0) return e;
     std::string src;   // CopyUp put a lower file under a kept folder INTO the folder (as rename)
@@ -854,8 +860,10 @@ int VfsLink(VfsState &S, const std::string &vf, const std::string &vt)
     std::string dst;
     if (PassthroughHost(S, vt, dst)) { if (MarkerName(vt)) return -EINVAL; EnsureHostParent(dst); }
     else { if (int e = EnsureWriteParent(S, vt); e != 0) return e; dst = WLPath(S, vt); }
-    if (int e = HostIO::Link(src, dst); e != 0) return e;
+    S.BeginNameChange();   // a file made at the name is another file than one its open handles were opened on (VfsCreate)
+    if (int e = HostIO::Link(src, dst); e != 0) { S.EndNameChange({}); return e; }
     UnhideLower(S, vt);   // only now: a failed link must not bring back a deleted lower-layer file at that name
+    S.EndNameChange({ { vt, false } });
     return 0;
 }
 

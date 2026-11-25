@@ -36,6 +36,7 @@ struct MaskSnap {
 //lookups through a kept folder never touch the disk for them.
 struct KeptMasks {
     bool fold = false;   // keys folded (a case-insensitive mount): MaskKey
+    bool disk = false;   // read from the folder's markers, not these sets (VfsState::uncached)
     std::atomic<std::shared_ptr<const MaskSnap>> deleted;
     std::atomic<std::shared_ptr<const MaskSnap>> opaque;
 };
@@ -85,7 +86,8 @@ struct VfsState {
     // layers present links as they are: live runtime state written by the guest itself.
     bool                  flattenSymlinks = true;
     //No kernel cache of lookups, attributes, misses or listings (--uncached): a view of a writelayer that another mount
-    //of it writes (the sandbox's), read as it is now. Pays a round trip per look; for a mount that serves no game.
+    //of it writes (the sandbox's), read as it is now — its deletion markers too, from disk (whiteoutSet). Pays a round
+    //trip and a stat per marker per look; for a mount that serves no game.
     bool                  uncached = false;
     uint32_t              uid = 1000;    // forced ownership presented by getattr (POSIX; the WinFsp mount overrides it with the mounting user)
     uint32_t              gid = 1000;
@@ -103,7 +105,8 @@ struct VfsState {
 
     // Deletion masks, mirrored in memory: the set of whiteouted names and the set of opaque dirs. Resolve
     // consults ONLY these (pure lock-free set lookups — no host Lstat per path or per ancestor on the hot
-    // path). The on-disk `.wh.*` markers remain the durable truth for persisted writelayers: Init re-scans
+    // path) — except under uncached, where another mount writes the markers: there they are read from disk
+    // (a stat per marker and per ancestor), the sets unused. The on-disk `.wh.*` markers remain the durable truth for persisted writelayers: Init re-scans
     // the writelayer into the sets, and every runtime mutation (Create/RemoveWhiteout, MarkOpaque, the
     // rmdir marker sweep, dir renames) updates disk AND swaps the set copy-on-write under maskWriteMtx.
     // Known seam: a guest literally creating a `.wh.foo` file through the mount lands on disk but not in

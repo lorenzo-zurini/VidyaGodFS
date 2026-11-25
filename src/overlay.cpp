@@ -107,7 +107,7 @@ static void AddAncestors(std::set<std::string> &dst, const std::string &leaf)
 
 
 static void SeedMasksFromWritelayer(VfsState &S);   // defined with the mask machinery below
-static void SeedKeptMasks(Layer &L, bool Fold);      // likewise, for each kept folder
+static void SeedKeptMasks(Layer &L, bool Fold, bool Disk);      // likewise, for each kept folder
 
 static std::string PatchKey(const VfsState &S, const std::string &vrel);
 
@@ -227,7 +227,7 @@ bool VfsState::Init(const Spec &S, std::string &Err)
     implicitDirs.erase("\x01");
     implicitDirs.erase("");
     for (Layer &L : layers)
-        if (L.type == LayerType::Dir && L.rw) SeedKeptMasks(L, caseInsensitive);
+        if (L.type == LayerType::Dir && L.rw) SeedKeptMasks(L, caseInsensitive, uncached);
     if (caseInsensitive)
     {
         //Lowest layer first, first spelling kept: the base layer's case wins, as the packaging-time case resolver
@@ -448,9 +448,23 @@ std::string WhiteoutPath(const VfsState &S, const std::string &vrel)
     return WLPath(S, ParentVRel(vrel)) + "/.wh." + BaseName(vrel);
 }
 
+//A marker on disk. Under uncached the masks are read there, not from the sets: another mount of the writelayer (the
+//sandbox's) writes and removes them, and the sets know only this mount's own changes.
+static bool MarkerOnDisk(const std::string &P)
+{
+    HostIO::Stat st;
+    return HostIO::Lstat(P, st) == 0;
+}
+
+static std::string OpaqueMarker(const VfsState &S, const std::string &vrel)
+{
+    return WLPath(S, vrel) + "/.wh..wh..opq";
+}
+
 bool IsWhiteouted(const VfsState &S, const std::string &vrel)
 {
     if (S.writelayer.empty() || vrel.empty()) return false;
+    if (S.uncached) return MarkerOnDisk(WhiteoutPath(S, vrel));
     MaskPtr m = LoadMask(S.whiteoutSet);
     return m && m->count(MaskKey(S, vrel)) != 0;
 }
@@ -475,11 +489,6 @@ int RemoveWhiteout(VfsState &S, const std::string &vrel)
     if (int e = HostIO::Unlink(WhiteoutPath(S, vrel)); e != 0 && e != -ENOENT) return e;   // still on disk: still masked
     EditMask(S, S.whiteoutSet, MaskKey(S, vrel), false);
     return 0;
-}
-
-static std::string OpaqueMarker(const VfsState &S, const std::string &vrel)
-{
-    return WLPath(S, vrel) + "/.wh..wh..opq";
 }
 
 int MarkOpaque(VfsState &S, const std::string &vrel)
@@ -526,6 +535,12 @@ void RenameMaskPrefix(VfsState &S, const std::string &oldName, const std::string
 bool IsUnderWhiteout(const VfsState &S, const std::string &vrel)
 {
     if (S.writelayer.empty()) return false;
+    if (S.uncached)
+    {
+        for (std::string cur = ParentVRel(vrel); !cur.empty(); cur = ParentVRel(cur))
+            if (MarkerOnDisk(WhiteoutPath(S, cur))) return true;
+        return false;
+    }
     MaskPtr m = LoadMask(S.whiteoutSet);
     if (!m || m->empty()) return false;
     for (std::string cur = ParentVRel(MaskKey(S, vrel)); !cur.empty(); cur = ParentVRel(cur))
@@ -538,6 +553,14 @@ bool IsUnderWhiteout(const VfsState &S, const std::string &vrel)
 bool IsUnderOpaque(const VfsState &S, const std::string &vrel)
 {
     if (S.writelayer.empty()) return false;
+    if (S.uncached)
+    {
+        for (std::string cur = ParentVRel(vrel);; cur = ParentVRel(cur))
+        {
+            if (MarkerOnDisk(OpaqueMarker(S, cur))) return true;
+            if (cur.empty()) return false;   // the root's, last
+        }
+    }
     MaskPtr m = LoadMask(S.opaqueSet);
     if (!m || m->empty()) return false;
     for (std::string cur = ParentVRel(MaskKey(S, vrel)); !cur.empty(); cur = ParentVRel(cur))
@@ -733,8 +756,20 @@ static bool InMask(const Layer &L, const std::atomic<MaskPtr> &a, const std::str
     return m && m->count(KeptKey(L, rel)) != 0;
 }
 
+//rel deleted in kept folder L / made again over a deleted one there: read from the folder under uncached (KeptMasks::disk).
+static bool KeptDeleted(const Layer &L, const std::string &rel)
+{
+    if (L.kept->disk) return !rel.empty() && MarkerOnDisk(KeptMarker(L, rel));
+    return InMask(L, L.kept->deleted, rel);
+}
+static bool KeptOpaque(const Layer &L, const std::string &rel)
+{
+    if (L.kept->disk) return MarkerOnDisk(KeptHost(L, rel) + "/.wh..wh..opq");
+    return InMask(L, L.kept->opaque, rel);
+}
+
 //Init-time: one walk of each kept folder for its markers (the folder holds only what the user's games wrote).
-static void SeedKeptMasks(Layer &L, bool Fold)
+static void SeedKeptMasks(Layer &L, bool Fold, bool Disk)
 {
     auto del = std::make_shared<MaskSet>(), opq = std::make_shared<MaskSet>();
     std::function<void(const std::string &)> walk = [&](const std::string &rel) {
@@ -752,6 +787,7 @@ static void SeedKeptMasks(Layer &L, bool Fold)
     walk(L.subpath);
     L.kept = std::make_shared<KeptMasks>();
     L.kept->fold = Fold;
+    L.kept->disk = Disk;
     L.kept->deleted.store(WholeMask(std::move(del)), std::memory_order_release);
     L.kept->opaque.store(WholeMask(std::move(opq)), std::memory_order_release);
 }
@@ -774,7 +810,7 @@ int HideLower(VfsState &S, const std::string &vrel)
 int UnhideLower(VfsState &S, const std::string &vrel)
 {
     if (const Layer *L = KeptLayerFor(S, vrel))
-        if (const std::string rel = SourceRel(*L, vrel); !rel.empty() && InMask(*L, L->kept->deleted, rel))
+        if (const std::string rel = SourceRel(*L, vrel); !rel.empty() && KeptDeleted(*L, rel))
         {
             if (int e = HostIO::Unlink(KeptMarker(*L, rel)); e != 0 && e != -ENOENT) return e;
             EditMask(S, L->kept->deleted, KeptKey(*L, rel), false);
@@ -785,17 +821,28 @@ int UnhideLower(VfsState &S, const std::string &vrel)
 bool KeptHidden(const VfsState &S, const std::string &vrel)
 {
     const Layer *L = KeptLayerFor(S, vrel);
-    return L && InMask(*L, L->kept->deleted, SourceRel(*L, vrel));
+    return L && KeptDeleted(*L, SourceRel(*L, vrel));
 }
 
 bool KeptOpaqueDir(const Layer &L, const std::string &vrel)
 {
-    return L.kept && InMask(L, L.kept->opaque, SourceRel(L, vrel));
+    return L.kept && KeptOpaque(L, SourceRel(L, vrel));
 }
 
 bool KeptMasked(const Layer &L, const std::string &vrel)
 {
     if (!L.kept) return false;
+    if (L.kept->disk)
+    {
+        const std::string rel = SourceRel(L, vrel);
+        if (rel.empty()) return false;
+        if (KeptDeleted(L, rel)) return true;
+        for (std::string cur = ParentVRel(rel);; cur = ParentVRel(cur))
+        {
+            if (KeptDeleted(L, cur) || KeptOpaque(L, cur)) return true;
+            if (cur.empty()) return false;
+        }
+    }
     MaskPtr del = LoadMask(L.kept->deleted), opq = LoadMask(L.kept->opaque);
     const bool anyDel = del && !del->empty(), anyOpq = opq && !opq->empty();
     if (!anyDel && !anyOpq) return false;

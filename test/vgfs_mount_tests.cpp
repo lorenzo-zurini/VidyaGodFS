@@ -15,6 +15,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -359,8 +360,6 @@ TEST(a_patched_file_reads_patched_through_the_mount) {
     CHECK(F.TornDown(std::chrono::seconds(10)));
 }
 
-// A --watch-pid that is not a process id is refused with a message, no mount and no crash. Teeth: std::stoll (an
-// uncaught exception: the helper aborts with SIGABRT).
 // Rewrites F's spec as VidyaGod's launch writes one: writable, over `layer`, with `wl` as its writelayer.
 static void WritableSpec(const Fixture &F, const fs::path &layer, const fs::path &wl)
 {
@@ -419,6 +418,60 @@ TEST(what_one_mount_writes_another_of_its_writelayer_reads_at_once) {
     CHECK(Host.TornDown(std::chrono::seconds(10)));
 }
 
+// A launch's two mounts again, now deleting what the LOWER layers ship: deletion markers. The host mount deleted the
+// shipped Saves before the game ran (an OVERRIDE Delete); the game made it again with a save in it, deleted a shipped
+// file and folder, and in a kept folder deleted a shipped file and made a shipped folder again, empty but for its own.
+// Teardown reads all of it through the host mount as the game left it — the capture is that walk. Teeth: the host
+// helper answering from the markers it loaded at its start and made itself (Saves still deleted: the save was lost
+// without a word; the deleted shipped files still there), for the writelayer's and for the kept folder's.
+TEST(what_one_mount_deletes_from_below_another_of_its_writelayer_sees_gone_at_once) {
+    Fixture Host, Game;
+    const fs::path Layer = Host.root / "layer", Kept = Host.root / "kept", Wl = Host.root / "wl";
+    for (const char *D : { "Saves", "Config", "Kept/sub" }) fs::create_directories(Layer / D);
+    fs::create_directories(Kept);
+    for (const char *F : { "Saves/shipped.sav", "Config/c.ini", "Kept/k.cfg", "Kept/sub/x.ini" }) std::ofstream(Layer / F) << "shipped";
+    for (Fixture *F : { &Host, &Game })
+        std::ofstream(F->spec, std::ios::trunc) << "{\"mountpoint\":\"" << F->mp.string() << "\",\"readonly\":false,\"writelayer\":\""
+            << Wl.string() << "\",\"layers\":[{\"type\":\"dir\",\"source\":\"" << Layer.string() << "\",\"target\":\"\"},"
+            << "{\"type\":\"dir\",\"source\":\"" << Kept.string() << "\",\"target\":\"Kept\",\"rw\":true}]}";
+    Host.helperArgs = { "--uncached" };
+    pid_t SH = 0, SG = 0;
+    struct stat St {};
+    CHECK(MountedBySpawner(Host, SH, false));
+    CHECK(::unlink((Host.mp / "Saves" / "shipped.sav").c_str()) == 0);
+    CHECK(::rmdir((Host.mp / "Saves").c_str()) == 0);
+    for (const char *F : { "a.txt", "Config/c.ini", "Kept/k.cfg", "Kept/sub/x.ini" }) CHECK(ReadFile(Host.mp / F) == (std::string(F) == "a.txt" ? "hi" : "shipped"));
+    CHECK(MountedBySpawner(Game, SG, false));
+    CHECK(::mkdir((Game.mp / "Saves").c_str(), 0755) == 0);
+    { std::ofstream(Game.mp / "Saves" / "slot1.sav") << "progress"; }
+    CHECK(::unlink((Game.mp / "a.txt").c_str()) == 0);
+    CHECK(::unlink((Game.mp / "Config" / "c.ini").c_str()) == 0);
+    CHECK(::rmdir((Game.mp / "Config").c_str()) == 0);
+    CHECK(::unlink((Game.mp / "Kept" / "k.cfg").c_str()) == 0);
+    CHECK(::unlink((Game.mp / "Kept" / "sub" / "x.ini").c_str()) == 0);
+    CHECK(::rmdir((Game.mp / "Kept" / "sub").c_str()) == 0);
+    CHECK(::mkdir((Game.mp / "Kept" / "sub").c_str(), 0755) == 0);
+    { std::ofstream(Game.mp / "Kept" / "sub" / "new.ini") << "mine"; }
+    CHECK(::stat((Host.mp / "Saves").c_str(), &St) == 0 && S_ISDIR(St.st_mode));
+    CHECK(ReadFile(Host.mp / "Saves" / "slot1.sav") == "progress");
+    CHECK(::stat((Host.mp / "Saves" / "shipped.sav").c_str(), &St) != 0 && errno == ENOENT);
+    for (const char *F : { "a.txt", "Config", "Kept/k.cfg", "Kept/sub/x.ini" })
+        CHECK(::stat((Host.mp / F).c_str(), &St) != 0 && errno == ENOENT);
+    CHECK(ReadFile(Host.mp / "Kept" / "sub" / "new.ini") == "mine");
+    std::set<std::string> Captured;
+    std::error_code Ec;
+    for (fs::recursive_directory_iterator E(Host.mp, Ec), End; !Ec && E != End; E.increment(Ec))
+        Captured.insert(fs::relative(E->path(), Host.mp).string());
+    CHECK(!Ec);
+    CHECK((Captured == std::set<std::string>{ "Saves", "Saves/slot1.sav", "Kept", "Kept/sub", "Kept/sub/new.ini" }));
+    CHECK(::kill(-SG, SIGKILL) == 0); waitpid(SG, nullptr, 0);
+    CHECK(::kill(-SH, SIGKILL) == 0); waitpid(SH, nullptr, 0);
+    CHECK(Game.TornDown(std::chrono::seconds(10)));
+    CHECK(Host.TornDown(std::chrono::seconds(10)));
+}
+
+// A --watch-pid that is not a process id is refused with a message, no mount and no crash. Teeth: std::stoll (an
+// uncaught exception: the helper aborts with SIGABRT).
 TEST(a_watch_pid_that_is_no_pid_is_refused_not_a_crash) {
     Fixture F;
     for (const char *Bad : { "abc", "12x", "-5", " 7", "4294967297", "99999999999999999999" })

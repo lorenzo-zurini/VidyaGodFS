@@ -1118,6 +1118,85 @@ TEST(an_exclusive_create_over_a_lower_name_is_refused_and_a_missing_folder_is_no
     CHECK(fs::exists(t / "wl/b.txt"));
 }
 
+// The rest of what WinFsp leaves to us, as for a create: a folder, a link or a hard link is made only in a folder that
+// is there and over no name, a lower layer's included — a mkdir under a deleted folder made the folder appear again.
+// A hard link is a name change (an open between resolving and taking its marker looks again). Teeth: any of the checks
+// dropped from mkdir, symlink or link; link without BeginNameChange.
+TEST(a_folder_or_link_is_made_only_in_a_folder_that_is_there_and_over_no_name) {
+    TmpDir t;
+    writeFile(t / "host/a.txt", "package");
+    writeFile(t / "host/gone/inside.txt", "package");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { dirLayer(t.str("host")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    CHECK_EQ(VfsUnlink(S, "gone/inside.txt"), 0);
+    CHECK_EQ(VfsRmdir(S, "gone"), 0);
+    for (const std::string V : { "gone/sub", "nodir/sub" })
+    {
+        CHECK_EQ(VfsMkdir(S, V, 0755), -ENOENT);
+        CHECK_EQ(VfsSymlink(S, "a.txt", V), -ENOENT);
+        CHECK_EQ(VfsLink(S, "a.txt", V), -ENOENT);
+    }
+    CHECK(!fs::exists(t / "wl/gone"));
+    CHECK(!fs::exists(t / "wl/nodir"));
+    VfsAttr A;
+    CHECK_EQ(VfsGetattr(S, "gone", A), -ENOENT);
+    CHECK_EQ(VfsMkdir(S, "a.txt/sub", 0755), -ENOTDIR);
+    CHECK_EQ(VfsMkdir(S, "a.txt", 0755), -EEXIST);
+    CHECK_EQ(VfsSymlink(S, "x", "a.txt"), -EEXIST);
+    CHECK(!fs::exists(t / "wl/a.txt"));
+    CHECK_EQ(VfsGetattr(S, "a.txt", A), 0);
+    CHECK(!A.isDir);
+    CHECK_EQ(A.size, (uint64_t)7);
+    CHECK_EQ(VfsMkdir(S, "made", 0755), 0);
+    const unsigned long long Before = S.detaches.load();
+    CHECK_EQ(VfsLink(S, "a.txt", "made/b.txt"), 0);
+    CHECK(S.detaches.load() > Before);
+    CHECK(fs::exists(t / "wl/made/b.txt"));
+}
+
+// Two mounts of one writelayer (a launch's host mount, --uncached, and the sandbox's): what the other deletes from the
+// lower layers, or makes again over a deletion, the uncached one sees at its next look — in the writelayer and in a kept
+// folder, by name and under a deleted or made-again folder. Teeth: the uncached state answering from the masks it
+// seeded at Init (every check below reads the other's change through them).
+TEST(an_uncached_state_reads_the_markers_another_state_writes) {
+    TmpDir t;
+    for (const char *F : { "host/a.txt", "host/Saves/shipped.sav", "host/Config/c.ini", "host/Kept/k.cfg", "host/Kept/sub/x.ini" })
+        writeFile(t / F, "package");
+    fs::create_directories(t / "keep");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl");
+    sp.layers = { dirLayer(t.str("host")), dirLayer(t.str("keep"), "Kept", true) };
+    VfsState Host, Game; std::string err;
+    Host.uncached = true;
+    CHECK(Host.Init(sp, err));
+    CHECK_EQ(VfsUnlink(Host, "Saves/shipped.sav"), 0);
+    CHECK_EQ(VfsRmdir(Host, "Saves"), 0);
+    CHECK(Game.Init(sp, err));
+    VfsAttr A;
+    CHECK_EQ(VfsGetattr(Game, "Saves", A), -ENOENT);
+    CHECK_EQ(VfsMkdir(Game, "Saves", 0755), 0);
+    CHECK_EQ(VfsUnlink(Game, "a.txt"), 0);
+    CHECK_EQ(VfsUnlink(Game, "Config/c.ini"), 0);
+    CHECK_EQ(VfsRmdir(Game, "Config"), 0);
+    CHECK_EQ(VfsUnlink(Game, "Kept/k.cfg"), 0);
+    CHECK_EQ(VfsUnlink(Game, "Kept/sub/x.ini"), 0);
+    CHECK_EQ(VfsRmdir(Game, "Kept/sub"), 0);
+    CHECK_EQ(VfsMkdir(Game, "Kept/sub", 0755), 0);
+    CHECK_EQ(VfsGetattr(Host, "Saves", A), 0);
+    CHECK(A.isDir);
+    CHECK_EQ(VfsGetattr(Host, "Saves/shipped.sav", A), -ENOENT);   // under a folder made again
+    for (const char *V : { "a.txt", "Config", "Config/c.ini", "Kept/k.cfg", "Kept/sub/x.ini" })
+        CHECK_EQ(VfsGetattr(Host, V, A), -ENOENT);
+    std::vector<std::string> Saves, Sub;
+    CHECK_EQ(VfsReaddir(Host, "Saves", [&](const std::string &N) { Saves.push_back(N); }), 0);
+    CHECK_EQ(VfsReaddir(Host, "Kept/sub", [&](const std::string &N) { Sub.push_back(N); }), 0);
+    CHECK(Saves.empty());
+    CHECK(Sub.empty());
+    //And back: what the other made, it deletes again; the uncached state sees the shipped name gone, not back.
+    CHECK_EQ(VfsRmdir(Game, "Saves"), 0);
+    CHECK_EQ(VfsGetattr(Host, "Saves", A), -ENOENT);
+    CHECK_EQ(VfsGetattr(Host, "Saves/shipped.sav", A), -ENOENT);
+}
+
 // `touch` sets now (UTIME_NOW), a time left alone stays (UTIME_OMIT), and nanoseconds are kept. Teeth: seconds only
 // with nsec 0 (touch → 1970, the omitted time reset to 1970).
 TEST(utimens_keeps_now_omit_and_nanoseconds) {
