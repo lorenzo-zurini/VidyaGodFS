@@ -2900,6 +2900,8 @@ TEST(a_delta_with_a_crafted_block_size_is_refused) {
     std::string derr;
     CHECK(vgdelta::DeltaByteSource::Create(std::make_shared<MemByteSource>(Bad), baseSrc, derr, false) == nullptr);
     CHECK(derr.find("block size") != std::string::npos);
+    //...and the writer makes none: a delta that would not mount is no delta. (Teeth: the writer's cap gone.)
+    CHECK(vgdelta::GenerateDelta((const uint8_t *)base.data(), base.size(), (const uint8_t *)tgt.data(), tgt.size(), 128u << 20).empty());
     std::vector<uint8_t> Cut(delta.begin(), delta.end() - 8);   // the last block's frame cut short
     derr.clear();
     CHECK(vgdelta::DeltaByteSource::Create(std::make_shared<MemByteSource>(Cut), baseSrc, derr, false) == nullptr);
