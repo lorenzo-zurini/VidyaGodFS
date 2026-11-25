@@ -527,7 +527,7 @@ static int UnlinkImpl(VfsState &S, const std::string &v)
         int e = HostIO::Unlink(WLPath(S, v));
         if (e != 0 && e != -ENOENT) return e;
     }
-    if (Resolve(S, v).kind != HitKind::None) CreateWhiteout(S, v); // still visible below → hide it
+    if (Resolve(S, v).kind != HitKind::None) return CreateWhiteout(S, v); // still visible below → hide it (or fail)
     return 0;
 }
 
@@ -547,8 +547,7 @@ int VfsRmdir(VfsState &S, const std::string &v)
         if (const Layer *L = KeptLayerFor(S, v); L && SourceRel(*L, v).empty())
         {
             if (int e = KeptMarkOpaque(S, v); e != 0) return e;
-            CreateWhiteout(S, v);
-            return 0;
+            return CreateWhiteout(S, v);
         }
         const int e = HostIO::Rmdir(host);
         if (e != 0 && e != -ENOENT) return e;
@@ -566,9 +565,9 @@ int VfsRmdir(VfsState &S, const std::string &v)
             if (n == ".wh..wh..opq") { HostIO::Unlink(wl + "/" + n); UnmarkOpaque(S, v); }
             else RemoveWhiteout(S, v.empty() ? n.substr(4) : v + "/" + n.substr(4)); // unlinks marker + mask erase
         });
-        HostIO::Rmdir(wl);
+        if (int e = HostIO::Rmdir(wl); e != 0 && e != -ENOENT) return e;   // still there: not removed, say so
     }
-    if (Resolve(S, v).kind != HitKind::None) CreateWhiteout(S, v);
+    if (Resolve(S, v).kind != HitKind::None) return CreateWhiteout(S, v);
     return 0;
 }
 

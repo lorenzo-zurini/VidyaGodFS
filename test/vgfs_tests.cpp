@@ -2846,6 +2846,23 @@ TEST(a_refused_rename_into_a_kept_folder_keeps_what_the_user_deleted) {
     CHECK_EQ(VfsGetattr(R, "cfg/sub/x.txt", a), -ENOENT);
 }
 
+// A deletion the writelayer cannot record fails, and the file stays — this session and the next (the marker was
+// taken for written: the file was gone until a relaunch brought it back). Teeth: mask the name though its marker was
+// not written (unlink says 0, the file is hidden now and back after a remount).
+TEST(a_deletion_the_writelayer_cannot_record_fails) {
+    if (::geteuid() == 0) return;
+    TmpDir t;
+    writeFile(t / "host/save.dat", "package save");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { dirLayer(t.str("host")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    fs::create_directories(t / "wl");
+    fs::permissions(t / "wl", fs::perms::owner_read | fs::perms::owner_exec);
+    CHECK(VfsUnlink(S, "save.dat") < 0);
+    fs::permissions(t / "wl", fs::perms::owner_all);
+    VfsAttr a;
+    CHECK_EQ(VfsGetattr(S, "save.dat", a), 0);
+}
+
 // The kept folder's own root is a mount point: removing it empties it for good; it can be made again.
 TEST(removing_the_kept_folders_root_empties_it_for_good) {
     TmpDir t; Spec sp = keptOverTwo(t, "cfg/sub");

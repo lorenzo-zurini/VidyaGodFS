@@ -448,21 +448,26 @@ bool IsWhiteouted(const VfsState &S, const std::string &vrel)
     return m && m->count(vrel) != 0;
 }
 
-void CreateWhiteout(VfsState &S, const std::string &vrel)
+//The mask follows the disk: a marker that could not be written (a full disk, no inodes) is not taken for written —
+//the deletion fails, and the file is still there this session and the next (it came back after a relaunch).
+int CreateWhiteout(VfsState &S, const std::string &vrel)
 {
-    if (S.writelayer.empty()) return;
+    if (S.writelayer.empty()) return 0;
     std::error_code ec;
     fs::create_directories(WLPath(S, ParentVRel(vrel)), ec);
     HostIO::Fd fd = HostIO::Open(WhiteoutPath(S, vrel), O_CREAT | O_WRONLY, 0644);
-    if (fd >= 0) HostIO::Close(fd);
+    if (fd < 0) return (int)fd;
+    HostIO::Close(fd);
     EditMask(S, S.whiteoutSet, vrel, true);
+    return 0;
 }
 
-void RemoveWhiteout(VfsState &S, const std::string &vrel)
+int RemoveWhiteout(VfsState &S, const std::string &vrel)
 {
-    if (S.writelayer.empty()) return;
-    HostIO::Unlink(WhiteoutPath(S, vrel));
+    if (S.writelayer.empty()) return 0;
+    if (int e = HostIO::Unlink(WhiteoutPath(S, vrel)); e != 0 && e != -ENOENT) return e;   // still on disk: still masked
     EditMask(S, S.whiteoutSet, vrel, false);
+    return 0;
 }
 
 static std::string OpaqueMarker(const VfsState &S, const std::string &vrel)
@@ -751,8 +756,7 @@ int HideLower(VfsState &S, const std::string &vrel)
             return 0;
         }
     }
-    CreateWhiteout(S, vrel);
-    return 0;
+    return CreateWhiteout(S, vrel);
 }
 
 int UnhideLower(VfsState &S, const std::string &vrel)
@@ -763,8 +767,7 @@ int UnhideLower(VfsState &S, const std::string &vrel)
             if (int e = HostIO::Unlink(KeptMarker(*L, rel)); e != 0 && e != -ENOENT) return e;
             EditMask(S, L->kept->deleted, rel, false);
         }
-    RemoveWhiteout(S, vrel);
-    return 0;
+    return RemoveWhiteout(S, vrel);
 }
 
 bool KeptHidden(const VfsState &S, const std::string &vrel)

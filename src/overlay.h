@@ -182,8 +182,8 @@ std::string WLPath(const VfsState &S, const std::string &vrel);   // writelayer 
 std::string WhiteoutPath(const VfsState &S, const std::string &vrel);
 bool        IsWhiteouted(const VfsState &S, const std::string &vrel);      // in-memory set lookup
 bool        IsUnderWhiteout(const VfsState &S, const std::string &vrel);   // any ancestor deleted
-void        CreateWhiteout(VfsState &S, const std::string &vrel);          // disk marker + set insert
-void        RemoveWhiteout(VfsState &S, const std::string &vrel);          // disk unlink + set erase
+int         CreateWhiteout(VfsState &S, const std::string &vrel);          // disk marker + set insert (0, or why not: then not masked)
+int         RemoveWhiteout(VfsState &S, const std::string &vrel);          // disk unlink + set erase (a marker that stays stays masked)
 // A directory rename relocates the .wh. markers stored inside its writelayer subtree; mirror that in the
 // in-memory sets by rewriting every entry under oldv to the newv prefix (both whiteouts and opaque dirs).
 void        RenameMaskPrefix(VfsState &S, const std::string &oldv, const std::string &newv);
