@@ -49,10 +49,12 @@ static void ToStat(const VfsAttr &a, struct fuse_stat *st)
     st->st_size  = (fuse_off_t)a.size;
     st->st_uid   = a.uid;
     st->st_gid   = a.gid;
-    st->st_atim.tv_sec = (int32_t)a.mtime;
-    st->st_mtim.tv_sec = (int32_t)a.mtime;
-    st->st_ctim.tv_sec = (int32_t)a.mtime;
-    st->st_birthtim.tv_sec = (int32_t)a.mtime;
+    //Whole: cut to 32 bits, a time past 2038 (or a zip's odd one) read as 1901. One time is all the layers keep.
+    using Sec = decltype(st->st_mtim.tv_sec);
+    st->st_atim.tv_sec = (Sec)a.mtime;
+    st->st_mtim.tv_sec = (Sec)a.mtime;
+    st->st_ctim.tv_sec = (Sec)a.mtime;
+    st->st_birthtim.tv_sec = (Sec)a.mtime;
 }
 
 static OpenFile *OF(struct fuse3_file_info *fi) { return fi ? (OpenFile *)(uintptr_t)fi->fh : nullptr; }
@@ -72,8 +74,12 @@ static int op_readdir(const char *path, void *buf, fuse3_fill_dir_t filler, fuse
 {
     filler(buf, ".",  nullptr, 0, (enum fuse3_fill_dir_flags)0);
     filler(buf, "..", nullptr, 0, (enum fuse3_fill_dir_flags)0);
-    return VfsReaddir(*St(), V(path),
-                      [&](const std::string &n) { filler(buf, n.c_str(), nullptr, 0, (enum fuse3_fill_dir_flags)0); });
+    //Each entry with its attributes, from the one listing (as fuseops): handed none, WinFsp asked getattr for every
+    //entry — a resolve each — and listed a name its getattr then failed.
+    return VfsReaddirTyped(*St(), V(path), [&](const std::string &n, const VfsAttr &a) {
+        struct fuse_stat st; ToStat(a, &st);
+        filler(buf, n.c_str(), &st, 0, (enum fuse3_fill_dir_flags)0);
+    });
 }
 
 static int op_open(const char *path, struct fuse3_file_info *fi)
@@ -150,6 +156,7 @@ static int op_readlink(const char *path, char *buf, size_t size)
 }
 
 static int op_symlink(const char *target, const char *path) { return VfsSymlink(*St(), target, V(path)); }
+static int op_link(const char *from, const char *to)         { return VfsLink(*St(), V(from), V(to)); }
 static int op_flush(const char *, struct fuse3_file_info *)  { return 0; }
 static int op_fsync(const char *, int, struct fuse3_file_info *fi) { return VfsFsync(OF(fi)); }
 
@@ -181,6 +188,7 @@ const struct fuse3_operations *VidyagodfsFuse3Ops()
     ops.unlink   = op_unlink;
     ops.rmdir    = op_rmdir;
     ops.symlink  = op_symlink;
+    ops.link     = op_link;
     ops.rename   = op_rename;
     ops.chmod    = op_chmod;
     ops.chown    = op_chown;

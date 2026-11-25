@@ -112,6 +112,19 @@ static void CollectChildren(VfsState &S, const std::string &v, std::set<std::str
         for (const std::string &d : S.implicitDirs)
             if (std::string seg = SegmentAfter(v, d); !seg.empty()) out.insert(seg);
 
+    if (S.caseInsensitive)
+    {   // a marker hides its name in whatever case it was deleted by, as Resolve has it (MaskKey)
+        std::set<std::string> wf, kf, of;
+        for (const std::string &w : whiteouts) wf.insert(FoldCase(w));
+        for (const std::string &w : keptWhiteouts) kf.insert(FoldCase(w));
+        for (const std::string &o : keptOwn) of.insert(FoldCase(o));
+        for (auto it = out.begin(); it != out.end();)
+        {
+            const std::string f = FoldCase(*it);
+            it = (wf.count(f) || (kf.count(f) && !of.count(f))) ? out.erase(it) : std::next(it);
+        }
+        return;
+    }
     for (const std::string &w : whiteouts) out.erase(w);
     for (const std::string &w : keptWhiteouts) if (!keptOwn.count(w)) out.erase(w);
 }
@@ -330,6 +343,18 @@ int VfsCreate(VfsState &S, const std::string &v, uint32_t mode, int flags, OpenF
 {
     out = nullptr;
     if (S.readOnly) return -EROFS;
+    //What FUSE's kernel lookup answers before a create on Linux, and WinFsp leaves to us: a name only a lower layer has
+    //is taken (CREATE_NEW / O_EXCL: else an empty writelayer file shadowed it), and a file is made only in a folder that
+    //is there (else the writelayer's parents were made for it, and a folder no one made appeared).
+    {
+        VfsAttr a;
+        if ((flags & O_EXCL) && VfsGetattr(S, v, a) == 0) return -EEXIST;
+        if (const size_t cut = v.find_last_of('/'); cut != std::string::npos)
+        {
+            if (int e = VfsGetattr(S, v.substr(0, cut), a); e != 0) return e;
+            if (!a.isDir) return -ENOTDIR;
+        }
+    }
 
     std::string host;
     const bool kept = PassthroughHost(S, v, host);

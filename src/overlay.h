@@ -35,6 +35,7 @@ struct MaskSnap {
 //(SourceRel). Seeded from the folder at Init, swapped copy-on-write under VfsState::maskWriteMtx on every change, so
 //lookups through a kept folder never touch the disk for them.
 struct KeptMasks {
+    bool fold = false;   // keys folded (a case-insensitive mount): MaskKey
     std::atomic<std::shared_ptr<const MaskSnap>> deleted;
     std::atomic<std::shared_ptr<const MaskSnap>> opaque;
 };

@@ -1022,6 +1022,102 @@ TEST(a_case_only_rename_on_a_case_insensitive_mount_renames) {
     CHECK_EQ(VfsRename(S, "data", "Data"), 0);
 }
 
+// FS-16: on a case-insensitive mount a deletion holds whatever case the program spelled it in. A folder layer's own
+// files keep the caller's spelling (only registered names are made canonical), so `del DATA\X.TXT` of Data/x.txt was
+// masked as DATA/X.TXT and the next open of data\x.txt served the deleted file. Markers left that way on disk (a
+// Windows writelayer, a kept folder) hide it at the next mount too, in a listing as in a lookup. Teeth: the masks keyed
+// as spelled (live, seeded, or in the listing); a kept folder's masks unfolded.
+TEST(a_deletion_on_a_case_insensitive_mount_hides_the_name_in_any_case) {
+    TmpDir t;
+    writeFile(t / "host/Data/x.txt", "x");
+    writeFile(t / "host/Data/y.txt", "y");
+    writeFile(t / "host/Data/z.txt", "z");
+    writeFile(t / "host/Saves/b.sav", "lower b");
+    writeFile(t / "host/Saves/c.sav", "lower c");
+    writeFile(t / "keep/a.sav", "kept a");
+    writeFile(t / "host/Opq/w.txt", "w");
+    writeFile(t / "host/Saves/Sub/q.sav", "lower q");
+    writeFile(t / "wl/Data/.wh.X.TXT", "");      // deleted as DATA\X.TXT, an earlier session
+    writeFile(t / "wl/OPQ/.wh..wh..opq", "");    // made again as OPQ over the package's Opq
+    writeFile(t / "keep/.wh.B.SAV", "");         // a kept folder's marker, spelled likewise
+    writeFile(t / "keep/SUB/.wh..wh..opq", "");  // and its folder made again over the package's Sub
+    writeFile(t / "keep/.wh.A.SAV", "");         // a marker beside the folder's own a.sav: never hides its own
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.caseInsensitive = true;
+    sp.layers = { dirLayer(t.str("host")), dirLayer(t.str("keep"), "Saves", true) };
+    {
+        VfsState S; std::string err; CHECK(S.Init(sp, err));
+        CHECK(Resolve(S, "Data/x.txt").kind == HitKind::None);
+        CHECK(!readdirNames(S, "Data").count("x.txt"));
+        CHECK(readdirNames(S, "Data").count("y.txt"));
+        CHECK(Resolve(S, "Saves/b.sav").kind == HitKind::None);
+        CHECK(!readdirNames(S, "Saves").count("b.sav"));
+        CHECK(readdirNames(S, "Saves").count("a.sav") && readdirNames(S, "Saves").count("c.sav"));
+        CHECK(Resolve(S, "Opq/w.txt").kind == HitKind::None);
+        CHECK(Resolve(S, "Saves/Sub/q.sav").kind == HitKind::None);
+        const Layer *K = KeptLayerFor(S, "Saves/a.sav");
+        CHECK(K != nullptr);
+        if (!K) return;
+        CHECK(KeptMasked(*K, "Saves/B.Sav"));
+        // made live, in yet another case: the mask a lookup in any spelling finds
+        CHECK_EQ(CreateWhiteout(S, "DATA/Y.TXT"), 0);
+        CHECK(IsWhiteouted(S, "data/y.txt"));
+        CHECK(Resolve(S, "Data/y.txt").kind == HitKind::None);
+        CHECK_EQ(HideLower(S, "Saves/C.SAV"), 0);
+        CHECK(KeptHidden(S, "Saves/c.sav"));   // the target, Saves, is a registered name: CanonicalCase spells it
+        CHECK(Resolve(S, "Saves/c.sav").kind == HitKind::None);
+        CHECK_EQ(UnhideLower(S, "Saves/C.Sav"), 0);
+        CHECK(!KeptHidden(S, "Saves/c.sav"));
+        CHECK_EQ(KeptMarkOpaque(S, "Saves/NEW"), 0);
+        CHECK(KeptOpaqueDir(*K, "Saves/new"));
+        KeptRenamePrefix(S, "Saves/new", "Saves/Renamed");
+        CHECK(KeptOpaqueDir(*K, "Saves/RENAMED"));
+        CHECK(!KeptOpaqueDir(*K, "Saves/NEW"));
+        KeptDropMarkersUnder(S, "Saves/RENAMED");
+        CHECK(!KeptOpaqueDir(*K, "Saves/renamed"));
+        // a folder's deletion masks what is under it, whatever case it was deleted in
+        CHECK_EQ(CreateWhiteout(S, "DATA"), 0);
+        CHECK(IsUnderWhiteout(S, "Data/z.txt"));
+        CHECK_EQ(RemoveWhiteout(S, "data"), 0);
+        CHECK(!IsUnderWhiteout(S, "Data/z.txt"));
+        // made again (opaque) in one case, masking the lower layers in another
+        CHECK_EQ(MarkOpaque(S, "DATA"), 0);
+        CHECK(IsUnderOpaque(S, "Data/z.txt"));
+        UnmarkOpaque(S, "data");
+        CHECK(!IsUnderOpaque(S, "Data/z.txt"));
+        // a folder moved takes its deletions along, named in any case
+        RenameMaskPrefix(S, "data", "Moved");
+        CHECK(IsWhiteouted(S, "MOVED/X.TXT"));
+        CHECK(!IsWhiteouted(S, "Data/x.txt"));
+    }
+    // Case-sensitive (Linux): names as spelled, as before.
+    Spec cs = sp; cs.caseInsensitive = false;
+    VfsState C; std::string err; CHECK(C.Init(cs, err));
+    CHECK(Resolve(C, "Data/x.txt").kind != HitKind::None);
+}
+
+// FS-17: a create the kernel did not check first (WinFsp's CREATE_NEW, or a stale negative entry) is answered by the
+// layers: a name only a lower layer has is taken, and a file is made only in a folder that is there. Teeth: O_EXCL
+// checked on the writelayer copy only (an empty file shadows the package's); the parent's writelayer chain made.
+TEST(an_exclusive_create_over_a_lower_name_is_refused_and_a_missing_folder_is_not_made) {
+    TmpDir t;
+    writeFile(t / "host/a.txt", "package");
+    Spec sp; sp.readOnly = false; sp.writelayer = t.str("wl"); sp.layers = { dirLayer(t.str("host")) };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    OpenFile *N = nullptr;
+    CHECK_EQ(VfsCreate(S, "a.txt", 0644, O_WRONLY | O_CREAT | O_EXCL, N), -EEXIST);
+    CHECK(N == nullptr);
+    CHECK(!fs::exists(t / "wl/a.txt"));
+    VfsAttr A;
+    CHECK_EQ(VfsGetattr(S, "a.txt", A), 0);
+    CHECK_EQ(A.size, (uint64_t)7);
+    CHECK_EQ(VfsCreate(S, "nodir/x.txt", 0644, O_WRONLY | O_CREAT, N), -ENOENT);
+    CHECK(!fs::exists(t / "wl/nodir"));
+    CHECK_EQ(VfsCreate(S, "a.txt/x", 0644, O_WRONLY | O_CREAT, N), -ENOTDIR);
+    CHECK_EQ(VfsCreate(S, "b.txt", 0644, O_WRONLY | O_CREAT | O_EXCL, N), 0);   // a new name: made
+    if (N) VfsRelease(N);
+    CHECK(fs::exists(t / "wl/b.txt"));
+}
+
 // `touch` sets now (UTIME_NOW), a time left alone stays (UTIME_OMIT), and nanoseconds are kept. Teeth: seconds only
 // with nsec 0 (touch → 1970, the omitted time reset to 1970).
 TEST(utimens_keeps_now_omit_and_nanoseconds) {
