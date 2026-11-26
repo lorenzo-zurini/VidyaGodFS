@@ -15,6 +15,10 @@
 #include "vgdelta.h"
 #include "bytesource.h"
 #include "deflatelayer.h"
+#include "coding.h"
+#include <lzma.h>
+#include <lz4.h>
+#include <lz4hc.h>
 #include <zlib.h>
 
 #include <cerrno>
@@ -3364,4 +3368,182 @@ TEST(a_deflate_source_refuses_a_record_that_does_not_fit) {
         CHECK(!deflatelayer::DeflateByteSource::Create(std::make_shared<MemByteSource>(badType), std::make_shared<MemByteSource>(content), stream.size(), err));
     }
     CHECK(deflatelayer::DeflateByteSource::Create(std::make_shared<MemByteSource>(dec), std::make_shared<MemByteSource>(content), stream.size(), err) != nullptr);
+}
+
+// ================================================================ the coding algebra: shipped bytes from content + decisions + a DESCRIPTION
+static std::vector<uint8_t> lzmaAlone(const std::vector<uint8_t> &in, uint32_t preset, uint32_t lc, uint32_t lp, uint32_t pb) {
+    lzma_options_lzma o; lzma_lzma_preset(&o, preset); o.lc = lc; o.lp = lp; o.pb = pb;
+    lzma_stream z = LZMA_STREAM_INIT; if (lzma_alone_encoder(&z, &o) != LZMA_OK) return {};
+    std::vector<uint8_t> out(in.size() + in.size() / 2 + 65536); z.next_in = in.data(); z.avail_in = in.size(); z.next_out = out.data(); z.avail_out = out.size();
+    const lzma_ret r = lzma_code(&z, LZMA_FINISH); out.resize(z.total_out); lzma_end(&z); return r == LZMA_STREAM_END ? out : std::vector<uint8_t>{};
+}
+static std::vector<uint8_t> lz4Block(const std::vector<uint8_t> &in, int level) {
+    std::vector<uint8_t> out((size_t)LZ4_compressBound((int)in.size()) + 16);
+    const int n = level ? LZ4_compress_HC((const char *)in.data(), (char *)out.data(), (int)in.size(), (int)out.size(), level)
+                        : LZ4_compress_default((const char *)in.data(), (char *)out.data(), (int)in.size(), (int)out.size());
+    out.resize((size_t)std::max(n, 0)); return out;
+}
+static coding::Description lzmaFor(const std::vector<uint8_t> &alone) {
+    const uint8_t pr = alone[0]; const uint32_t dict = alone[1] | alone[2] << 8 | alone[3] << 16 | (uint32_t)alone[4] << 24;
+    return coding::LzmaDescription(pr % 9, (pr / 9) % 5, pr / 45, dict, true);
+}
+// Mint a shipped stream, then serve it from description + record + content: every byte, every random range.
+static std::shared_ptr<coding::CodedByteSource> codedSource(const coding::Description &d, const uint8_t *s, size_t n, const std::vector<uint8_t> &want,
+                                                            uint64_t spacing, std::vector<uint8_t> *recordOut = nullptr) {
+    std::vector<uint8_t> content, record; std::string err;
+    if (!coding::Mint(d, s, n, want.size(), want.size(), spacing, content, record, err)) { std::cerr << "  mint: " << err << "\n"; return nullptr; }
+    if (content != want) { std::cerr << "  mint: the content differs\n"; return nullptr; }
+    if (recordOut) *recordOut = record;
+    auto src = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d)), std::make_shared<MemByteSource>(record),
+                                               std::make_shared<MemByteSource>(content), n, err);
+    if (!src) std::cerr << "  create: " << err << "\n";
+    return src;
+}
+
+// A description is data: it serializes and parses back to the same bytes, for every format this repository writes.
+TEST(a_coding_description_survives_serialization) {
+    for (const coding::Description &d : {coding::LzmaDescription(3, 0, 2, 1u << 20, true), coding::LzmaDescription(0, 2, 0, 4096, false),
+                                         coding::DeflateDescription(), coding::Lz4BlockDescription()}) {
+        const auto bytes = coding::Serialize(d); coding::Description back; std::string err;
+        CHECK(coding::Parse(bytes.data(), bytes.size(), back, err));
+        CHECK(coding::Serialize(back) == bytes);
+        CHECK(back.name == d.name);
+    }
+}
+
+// LZMA streams from liblzma at several presets and literal/position settings decode to their content and are served
+// back exactly, from checkpoints, anywhere.
+TEST(lzma_streams_are_served_from_content_and_decisions) {
+    int cases = 0;
+    for (int kind = 0; kind < 4; ++kind) {
+        const auto in = sampleContent(kind, kind == 1 ? 40000 : 120000, (uint32_t)kind + 3);
+        for (uint32_t preset : {0u, 6u, 9u | LZMA_PRESET_EXTREME}) for (auto lcp : {std::array<uint32_t, 3>{3, 0, 2}, std::array<uint32_t, 3>{0, 2, 0}, std::array<uint32_t, 3>{4, 0, 1}}) {
+            if ((kind + (int)lcp[0] + (int)(preset & 0xF)) % 2 && preset != 6) continue;
+            const auto alone = lzmaAlone(in, preset, lcp[0], lcp[1], lcp[2]); CHECK(alone.size() > 13); if (alone.size() <= 13) continue;
+            auto src = codedSource(lzmaFor(alone), alone.data() + 13, alone.size() - 13, in, std::max<uint64_t>(256, (alone.size() - 13) / 8));
+            CHECK(src != nullptr); if (!src) continue;
+            CHECK(src->checkpoints() >= 4);                                  // random reads start from checkpoints, not only the start
+            std::vector<uint8_t> shipped(alone.begin() + 13, alone.end());
+            CHECK(readsBack(*src, shipped, (uint32_t)(kind * 7 + preset), 40));
+            ++cases;
+        }
+    }
+    CHECK(cases >= 12);
+}
+
+// The same engine, a different description: deflate (dynamic, fixed and stored blocks, its header included) and LZ4
+// blocks, from the reference encoders, at many settings.
+TEST(deflate_and_lz4_streams_are_served_through_their_descriptions) {
+    const auto deflate = coding::DeflateDescription(), lz4 = coding::Lz4BlockDescription();
+    int cases = 0;
+    for (int kind = 0; kind < 4; ++kind) {
+        const auto in = sampleContent(kind, 90000, (uint32_t)kind + 11);
+        for (int level : {0, 1, 6, 9}) for (int st : {Z_DEFAULT_STRATEGY, Z_FIXED, Z_HUFFMAN_ONLY}) {
+            const auto stream = rawDeflate(in, level, 15, level ? 8 : 1, st);
+            auto src = codedSource(deflate, stream.data(), stream.size(), in, std::max<uint64_t>(256, stream.size() / 6)); CHECK(src != nullptr); if (!src) continue;
+            CHECK(src->checkpoints() >= 3);
+            CHECK(readsBack(*src, stream, (uint32_t)(level * 5 + st), 30)); ++cases;
+        }
+        for (int level : {0, 3, 9, 12}) {
+            const auto blk = lz4Block(in, level);
+            auto src = codedSource(lz4, blk.data(), blk.size(), in, 4096); CHECK(src != nullptr); if (!src) continue;
+            CHECK(readsBack(*src, blk, (uint32_t)level, 30)); ++cases;
+        }
+    }
+    {   // deflate's one non-canonical spelling, made on purpose: a copy of 258 written as code 284 + extra 31
+        std::vector<uint8_t> w; uint64_t acc = 0; int nb = 0;
+        auto put = [&](uint32_t v, int n) { acc |= (uint64_t)v << nb; nb += n; while (nb >= 8) { w.push_back((uint8_t)acc); acc >>= 8; nb -= 8; } };
+        auto huff = [&](uint32_t c, int n) { for (int i = n - 1; i >= 0; --i) put((c >> i) & 1, 1); };
+        put(1, 1); put(1, 2);                                              // final, fixed
+        huff(0x30 + 'a', 8);                                               // the literal 'a'
+        huff(0xC0 + (284 - 280), 8); put(31, 5); huff(0, 5);              // 284 + 31 = 258, distance code 0 = 1
+        huff(0, 7); if (nb) put(0, 8 - nb);                                // end of block, pad
+        const std::vector<uint8_t> want(259, 'a');
+        auto src = codedSource(deflate, w.data(), w.size(), want, 4096); CHECK(src != nullptr); if (src) CHECK(readsBack(*src, w, 3, 5));
+    }
+    for (size_t n : {0, 1, 5, 13}) {                                       // the smallest LZ4 blocks: literals only
+        const auto in = sampleContent(0, n, 2); const auto blk = lz4Block(in, 0);
+        auto src = codedSource(lz4, blk.data(), blk.size(), in, 4096); CHECK(src != nullptr); if (src) CHECK(readsBack(*src, blk, 1, 5));
+    }
+    CHECK_EQ(cases, 64);
+}
+
+// A stream its format forbids is refused at mint, never split wrong: cut short, followed by more bytes, bits flipped
+// where zlib refuses too.
+TEST(a_broken_stream_is_refused_by_its_description) {
+    const auto in = sampleContent(3, 60000, 5);
+    std::vector<uint8_t> content, record; std::string err;
+    const auto deflate = coding::DeflateDescription();
+    const auto stream = rawDeflate(in, 6, 15, 8, Z_DEFAULT_STRATEGY);
+    auto cut = stream; cut.resize(cut.size() - 3);
+    CHECK(!coding::Mint(deflate, cut.data(), cut.size(), 0, 1 << 20, 4096, content, record, err));
+    auto more = stream; more.push_back(0);
+    CHECK(!coding::Mint(deflate, more.data(), more.size(), 0, 1 << 20, 4096, content, record, err));
+    int agree = 0, tried = 0;
+    for (int k = 0; k < 60; ++k) {
+        auto b = stream; b[(size_t)k * 977 % b.size()] ^= (uint8_t)(1u << (k % 8));
+        uint8_t sink[1 << 17]; z_stream z{}; inflateInit2(&z, -15); z.next_in = b.data(); z.avail_in = (uInt)b.size();
+        int r = Z_OK; while (r == Z_OK) { z.next_out = sink; z.avail_out = sizeof sink; r = inflate(&z, Z_NO_FLUSH); if (r == Z_BUF_ERROR && z.avail_in) r = Z_OK; }
+        const bool zok = r == Z_STREAM_END && z.avail_in == 0; inflateEnd(&z);
+        const bool ours = coding::Mint(deflate, b.data(), b.size(), 0, 1 << 20, 4096, content, record, err);
+        ++tried; agree += ours == zok;
+    }
+    CHECK_EQ(agree, tried);
+    const auto alone = lzmaAlone(in, 6, 3, 0, 2);
+    CHECK(!coding::Mint(lzmaFor(alone), alone.data() + 13, alone.size() - 13 - 9, in.size(), in.size(), 4096, content, record, err));
+}
+
+// Descriptions come from peers: anything that is not a valid description is refused at parse, and a valid one that
+// misbehaves (loops without progress, reads past its tables or slots) is refused when it runs - never obeyed.
+TEST(a_hostile_description_is_refused) {
+    std::string err; coding::Description d; int ran = 0;
+    const auto sample = rawDeflate(sampleContent(3, 20000, 4), 6, 15, 8, Z_DEFAULT_STRATEGY);
+    std::mt19937 r(9);
+    for (int i = 0; i < 300; ++i) {                                       // noise, and real descriptions with bytes broken
+        auto b = coding::Serialize(coding::DeflateDescription());
+        if (i % 3 == 0) { b.resize(64 + r() % 512); for (auto &x : b) x = (uint8_t)r(); }
+        else for (int k = 0; k < 4; ++k) b[r() % b.size()] ^= (uint8_t)(1u << (r() % 8));
+        if (coding::Parse(b.data(), b.size(), d, err) && i % 3) {        // what still parses must RUN safely on a real stream
+            std::vector<uint8_t> c2, r2; coding::Mint(d, sample.data(), sample.size(), 0, 1 << 18, 256, c2, r2, err); ++ran; }
+    }
+    CHECK(ran > 50);
+    auto base = [] { coding::Description x; x.name = "t"; x.ex = {coding::Ex{coding::EX_CONST, 0, 0, 0}}; return x; };
+    coding::Description fwd = base(); fwd.ex.push_back(coding::Ex{coding::EX_ADD, 2, 0, 0}); fwd.ex.push_back(coding::Ex{coding::EX_CONST, 0, 0, 1});
+    fwd.ops = {coding::Op{coding::OP_END}};
+    auto bytes = coding::Serialize(fwd); CHECK(!coding::Parse(bytes.data(), bytes.size(), d, err));
+    coding::Description newer = base(); newer.isa = coding::kIsa + 1; newer.ops = {coding::Op{coding::OP_END}};
+    bytes = coding::Serialize(newer); CHECK(!coding::Parse(bytes.data(), bytes.size(), d, err));
+    coding::Description wild = base(); coding::Op j; j.op = coding::OP_JMP; j.target = 5; wild.ops = {j};
+    bytes = coding::Serialize(wild); CHECK(!coding::Parse(bytes.data(), bytes.size(), d, err));
+    const uint8_t one[1] = {0}; std::vector<uint8_t> content, record;
+    coding::Description spin = base(); coding::Op self; self.op = coding::OP_JMP; self.target = 0; spin.ops = {self}; spin.coder = coding::kBits;
+    bytes = coding::Serialize(spin); CHECK(coding::Parse(bytes.data(), bytes.size(), d, err));
+    CHECK(!coding::Mint(d, one, 1, 0, 16, 4096, content, record, err)); CHECK(err.find("progress") != std::string::npos);
+    coding::Description tab = base(); tab.coder = coding::kBits; tab.tables = {{7}}; tab.ex.push_back(coding::Ex{coding::EX_CONST, 0, 0, 99}); tab.ex.push_back(coding::Ex{coding::EX_TABLE, 1, 0, 0});
+    coding::Op set; set.op = coding::OP_SET; set.tgt = 1; set.v = 2; tab.ops = {set, coding::Op{coding::OP_END}};
+    bytes = coding::Serialize(tab); CHECK(coding::Parse(bytes.data(), bytes.size(), d, err));
+    CHECK(!coding::Mint(d, one, 1, 0, 16, 4096, content, record, err)); CHECK(err.find("table") != std::string::npos);
+    coding::Description slot = base(); slot.nslots = 10; slot.ex.push_back(coding::Ex{coding::EX_CONST, 0, 0, 999999});
+    coding::Op bit; bit.op = coding::OP_BIT; bit.x = 1; slot.ops = {bit, coding::Op{coding::OP_END}};
+    bytes = coding::Serialize(slot); CHECK(coding::Parse(bytes.data(), bytes.size(), d, err));
+    CHECK(!coding::Mint(d, one, 1, 0, 16, 4096, content, record, err)); CHECK(err.find("slot") != std::string::npos);
+}
+
+// A record that does not belong is refused at creation; one source serves many threads at once.
+TEST(a_coded_source_refuses_a_bad_record_and_reads_from_many_threads) {
+    const auto in = sampleContent(3, 200000, 8); const auto alone = lzmaAlone(in, 6, 3, 0, 2);
+    std::vector<uint8_t> record; const auto d = lzmaFor(alone);
+    auto src = codedSource(d, alone.data() + 13, alone.size() - 13, in, 16384, &record); CHECK(src != nullptr); if (!src) return;
+    std::string err; auto desc = std::make_shared<MemByteSource>(coding::Serialize(d)); auto content = std::make_shared<MemByteSource>(in);
+    auto cutRec = record; cutRec.resize(cutRec.size() - 10);
+    CHECK(!coding::CodedByteSource::Create(desc, std::make_shared<MemByteSource>(cutRec), content, alone.size() - 13, err));
+    auto badRec = record; badRec[0] = 'X';
+    CHECK(!coding::CodedByteSource::Create(desc, std::make_shared<MemByteSource>(badRec), content, alone.size() - 13, err));
+    std::vector<uint8_t> shipped(alone.begin() + 13, alone.end());
+    std::atomic<int> bad{0}; std::vector<std::thread> th;
+    for (int t = 0; t < 8; ++t) th.emplace_back([&, t] { std::mt19937 rr((uint32_t)t); std::vector<uint8_t> b(32768);
+        for (int i = 0; i < 25; ++i) { const size_t a = rr() % shipped.size(), n = 1 + rr() % std::min<size_t>(32768, shipped.size() - a);
+            if (!src->preadAll(b.data(), n, a) || memcmp(b.data(), shipped.data() + a, n)) ++bad; } });
+    for (auto &x : th) x.join();
+    CHECK_EQ(bad.load(), 0);
 }

@@ -43,6 +43,8 @@ set(VGFS_CORE_SRC
     src/vfsops.cpp
     src/vgdelta.cpp
     src/deflatelayer.cpp
+    src/coding.cpp
+    src/codingdescs.cpp
     src/zipscan.cpp
 )
 if(WIN32)
@@ -106,7 +108,10 @@ if(VGFS_BUILD_TESTS AND NOT WIN32)
     add_executable(vgfs_tests test/vgfs_tests.cpp)
     set_target_properties(vgfs_tests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
     find_package(ZLIB REQUIRED)   # the tests make real deflate streams to rebuild (the core needs no zlib)
-    target_link_libraries(vgfs_tests PRIVATE vgfs_core PkgConfig::LIBZIP PkgConfig::LIBZSTD ZLIB::ZLIB)
+    # liblzma and liblz4 are the tests' reference encoders for the coding algebra (the core needs neither)
+    pkg_check_modules(TEST_LZMA REQUIRED IMPORTED_TARGET liblzma)
+    pkg_check_modules(TEST_LZ4 REQUIRED IMPORTED_TARGET liblz4)
+    target_link_libraries(vgfs_tests PRIVATE vgfs_core PkgConfig::LIBZIP PkgConfig::LIBZSTD ZLIB::ZLIB PkgConfig::TEST_LZMA PkgConfig::TEST_LZ4)
     target_compile_options(vgfs_tests PRIVATE ${VGFS_WARNINGS} $<$<BOOL:${VGFS_WERROR}>:-Werror>)
     if(VGFS_SANITIZE)
         target_compile_options(vgfs_tests PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
