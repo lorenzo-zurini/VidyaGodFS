@@ -1,5 +1,6 @@
 #include "treeplan.h"
 #include "vgdelta.h"
+#include "coding.h"
 #include "hostio.h"
 
 #include <algorithm>
@@ -17,7 +18,9 @@ bool Within(const std::string &vrel, const std::string &root)
 
 //A layer whose bytes a delta can be built over (named by its CID): a zip's file, a delta's rebuilt archive, a single
 //file's own bytes (a disc image).
-static bool CarriesBytes(const LayerSpec &L) { return L.type == LayerType::Zip || L.type == LayerType::Delta || L.type == LayerType::File; }
+static bool CarriesBytes(const LayerSpec &L) { return L.type == LayerType::Zip || L.type == LayerType::Delta || L.type == LayerType::File || L.type == LayerType::Coded; }
+//A layer rebuilt over the bytes its `bases` name: a delta over its base, a coded stream over its content.
+static bool Rebuilt(const LayerSpec &L) { return L.type == LayerType::Delta || L.type == LayerType::Coded; }
 static std::string Name(const LayerSpec &L)
 {
     const size_t S = L.source.find_last_of("/\\");
@@ -56,18 +59,18 @@ TreePlan PlanTree(const Spec &S, const std::vector<bool> &Failed)
             const auto It = Carrier.find(C);
             if (It == Carrier.end()) { if (Why.empty()) Why = "it names " + C + ", which no zip, delta or file here carries"; continue; }
             P.bases[D].push_back(It->second);
-            if (S.layers[It->second].type == LayerType::Delta)
+            if (Rebuilt(S.layers[It->second]))
             {
                 if (Seen[It->second] == Visiting) { if (Why.empty()) Why = "its bases name each other in a ring"; }
                 else if (!Rebuilds(It->second) && Why.empty()) Why = "it names " + C + ", the delta " + Name(S.layers[It->second]) + " that cannot rebuild";
             }
         }
         P.broken[D] = !Why.empty();
-        if (P.broken[D]) P.problems.push_back("delta " + Name(S.layers[D]) + " (at '" + S.layers[D].target + "') cannot rebuild: " + Why);
+        if (P.broken[D]) P.problems.push_back(std::string(S.layers[D].type == LayerType::Coded ? "coded stream " : "delta ") + Name(S.layers[D]) + " (at '" + S.layers[D].target + "') cannot rebuild: " + Why);
         Seen[D] = Done;
         return !P.broken[D];
     };
-    for (size_t I = 0; I < N; ++I) if (S.layers[I].type == LayerType::Delta) Rebuilds(I);
+    for (size_t I = 0; I < N; ++I) if (Rebuilt(S.layers[I])) Rebuilds(I);
     //Where each file is hidden, and up to which layer: a delta that rebuilds hides the files it names, beneath it, inside
     //its places — and what they were rebuilt from too, so whatever hides a file it names (from beneath that one) also
     //hides that file's own bases. Passed down the names, once per file: a chain of a thousand versions is a thousand
@@ -110,7 +113,7 @@ LayerBytes::LayerBytes(const Spec &Sp, const TreePlan &Pl, std::vector<bool> K)
     : S(Sp), P(Pl), Keep(std::move(K)), State(Sp.layers.size(), St::None), Memo(Sp.layers.size()), Uses(Sp.layers.size(), 0)
 {
     for (size_t D = 0; D < S.layers.size(); ++D)
-        if (S.layers[D].type == LayerType::Delta && !P.broken[D])
+        if (Rebuilt(S.layers[D]) && !P.broken[D])
             for (size_t B : P.bases[D]) ++Uses[B];
 }
 
@@ -118,7 +121,7 @@ std::shared_ptr<ByteSource> LayerBytes::Get(size_t I, std::string *Err)
 {
     auto Fail = [&](const std::string &Why) -> std::shared_ptr<ByteSource> {
         if (Err) *Err = Why;
-        if (S.layers[I].type == LayerType::Delta) State[I] = St::Failed; else State[I] = St::None;
+        if (Rebuilt(S.layers[I])) State[I] = St::Failed; else State[I] = St::None;
         return nullptr;
     };
     if (I >= S.layers.size() || !CarriesBytes(S.layers[I])) return nullptr;
@@ -126,13 +129,32 @@ std::shared_ptr<ByteSource> LayerBytes::Get(size_t I, std::string *Err)
     if (State[I] == St::Failed) return Fail("it did not rebuild");
     if (State[I] == St::Building) return Fail("its bases name each other in a ring");
     const LayerSpec &L = S.layers[I];
-    if (L.type == LayerType::Delta && P.broken[I]) return Fail("it cannot rebuild (see the plan's problems)");
+    if (Rebuilt(L) && P.broken[I]) return Fail("it cannot rebuild (see the plan's problems)");
     State[I] = St::Building;
     HostIO::Fd Fd = HostIO::Open(L.source, O_RDONLY);
     if (Fd < 0) return Fail("cannot open " + L.source);
     HostIO::Stat St_;
     if (HostIO::Fstat(Fd, St_) != 0) { HostIO::Close(Fd); return Fail("cannot stat " + L.source); }
     std::shared_ptr<ByteSource> Src = std::make_shared<FdByteSource>(Fd, St_.size, true);
+    if (L.type == LayerType::Coded)
+    {
+        std::string Why;
+        auto Content = Get(P.bases[I][0], &Why);
+        if (!Content) return Fail("its content " + L.bases[0] + " has no bytes (" + Why + ")");
+        HostIO::Fd Dfd = HostIO::Open(L.description, O_RDONLY);
+        if (Dfd < 0) return Fail("cannot open its description " + L.description);
+        HostIO::Stat Ds;
+        if (HostIO::Fstat(Dfd, Ds) != 0) { HostIO::Close(Dfd); return Fail("cannot stat its description " + L.description); }
+        auto Desc = std::make_shared<FdByteSource>(Dfd, Ds.size, true);
+        Src = coding::CodedByteSource::Create(Desc, Src, Content, 0, Why);
+        if (!Src) return Fail("bad coded stream " + L.source + ": " + Why);
+        for (size_t B : P.bases[I])                          // the stream reads its content through its own reference
+        {
+            if (Uses[B] == 0) continue;
+            --Uses[B];
+            if (Uses[B] == 0 && !(B < Keep.size() && Keep[B])) { Memo[B].reset(); State[B] = St::None; }
+        }
+    }
     if (L.type == LayerType::Delta)
     {
         std::vector<std::shared_ptr<ByteSource>> Parts;

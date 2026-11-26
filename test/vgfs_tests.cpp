@@ -3,6 +3,7 @@
 // directly, VfsState::Init, then drive Resolve / CollectChildren / the VfsOps surface. No mounting, no
 // HostIO mocking — the POSIX shim is exercised for real. Fixtures are torn down per test.
 
+#include "test_guard.h"
 #include <random>
 #include <thread>
 #include "overlay.h"
@@ -19,6 +20,8 @@
 #include <lzma.h>
 #include <lz4.h>
 #include <lz4hc.h>
+#include <zstd.h>
+#include <chrono>
 #include <zlib.h>
 
 #include <cerrno>
@@ -2798,10 +2801,16 @@ TEST(concat_part_boundary_is_defined_by_size) {
 }
 
 int main() {
+    GuardTestProcess();
+    //VGFS_TEST_FILTER=a,b,c runs only the tests whose names contain one of them (a mutation run's quick pass).
+    std::vector<std::string> only; size_t ran = 0;
+    if (const char *f = std::getenv("VGFS_TEST_FILTER")) { std::string F = f; for (size_t a = 0, b; a <= F.size(); a = b + 1) { b = F.find(',', a); if (b == std::string::npos) b = F.size(); if (b > a) only.push_back(F.substr(a, b - a)); } }
     for (auto &[name, fn] : g_tests) {
+        if (!only.empty() && std::none_of(only.begin(), only.end(), [&](const std::string &o) { return std::string(name).find(o) != std::string::npos; })) continue;
         std::cerr << "[ RUN ] " << name << "\n";
-        fn();
+        fn(); ++ran;
     }
+    if (!only.empty()) std::cerr << "(filter: " << ran << " of " << g_tests.size() << " tests)\n";
     std::cerr << "\n" << (g_fail ? "FAILED " : "PASSED ") << g_checks << " checks, " << g_fail << " failures across "
               << g_tests.size() << " tests\n";
     return g_fail ? 1 : 0;
@@ -3441,7 +3450,7 @@ TEST(deflate_and_lz4_streams_are_served_through_their_descriptions) {
         for (int level : {0, 1, 6, 9}) for (int st : {Z_DEFAULT_STRATEGY, Z_FIXED, Z_HUFFMAN_ONLY}) {
             const auto stream = rawDeflate(in, level, 15, level ? 8 : 1, st);
             auto src = codedSource(deflate, stream.data(), stream.size(), in, std::max<uint64_t>(256, stream.size() / 6)); CHECK(src != nullptr); if (!src) continue;
-            CHECK(src->checkpoints() >= 3);
+            CHECK(src->checkpoints() >= (level ? 3u : 2u));                   // a stored block is one byte run: a checkpoint per block
             CHECK(readsBack(*src, stream, (uint32_t)(level * 5 + st), 30)); ++cases;
         }
         for (int level : {0, 3, 9, 12}) {
@@ -3546,4 +3555,418 @@ TEST(a_coded_source_refuses_a_bad_record_and_reads_from_many_threads) {
             if (!src->preadAll(b.data(), n, a) || memcmp(b.data(), shipped.data() + a, n)) ++bad; } });
     for (auto &x : th) x.join();
     CHECK_EQ(bad.load(), 0);
+}
+
+// The validator's edges, one by one: what is one past an end is refused; what runs past slots or arrays is refused when
+// it runs; a description that loses what it decodes is refused by the mint's code-back check.
+TEST(a_description_is_checked_at_every_edge) {
+    std::string err; coding::Description d; const uint8_t one[1] = {1}; std::vector<uint8_t> content, record;
+    auto base = [] { coding::Description x; x.name = "edge"; x.coder = coding::kBits; x.ex = {coding::Ex{coding::EX_CONST, 0, 0, 0}}; return x; };
+    auto parses = [&](const coding::Description &x) { const auto b = coding::Serialize(x); return coding::Parse(b.data(), b.size(), d, err); };
+    coding::Op end; end.op = coding::OP_END;
+    { auto x = base(); x.ex.push_back(coding::Ex{coding::EX_ADD, 1, 0, 0}); x.ops = {end}; CHECK(!parses(x)); }            // refers to itself
+    { auto x = base(); x.ex.push_back(coding::Ex{coding::EX_ADD, 0, 0, 0}); x.ops = {end}; CHECK(parses(x)); }             // refers back: fine
+    { auto x = base(); coding::Op j; j.op = coding::OP_JMP; j.target = 1; x.ops = {j}; CHECK(!parses(x)); }               // one past the last op
+    { auto x = base(); coding::Op j; j.op = coding::OP_JMP; j.target = 0; x.ops = {j}; CHECK(parses(x)); }
+    { auto x = base(); x.nslots = 64; coding::Op t; t.op = coding::OP_TREE; t.nb = 25; x.ops = {t, end}; CHECK(!parses(x)); }         // a tree too deep
+    { auto x = base(); x.nslots = 64; coding::Op t; t.op = coding::OP_TREE; t.nb = 24; x.ops = {t, end}; CHECK(parses(x)); }
+    { auto x = base(); coding::Op h; h.op = coding::OP_HPUSH; h.tgt = 60; h.nb = 5; x.ops = {h, end}; CHECK(!parses(x)); }             // history past the registers
+    { auto x = base(); coding::Op h; h.op = coding::OP_HPUSH; h.tgt = 60; h.nb = 4; x.ops = {h, end}; CHECK(parses(x)); }
+    { auto x = base(); x.coder = coding::kRange; x.nslots = 20; coding::Op t; t.op = coding::OP_TREE; t.nb = 5; x.ops = {t, end};       // a tree past its slots
+      CHECK(parses(x)); CHECK(!coding::Mint(d, one, 1, 0, 16, 4096, content, record, err)); CHECK(err.find("out of range") != std::string::npos); }
+    { auto x = base(); x.arrays = {{1, 2}}; x.ex.push_back(coding::Ex{coding::EX_CONST, 0, 0, 2}); x.ex.push_back(coding::Ex{coding::EX_ARR, 1, 0, 0});  // past an array
+      coding::Op set; set.op = coding::OP_SET; set.tgt = 1; set.v = 2; x.ops = {set, end};
+      CHECK(parses(x)); CHECK(!coding::Mint(d, one, 1, 0, 16, 4096, content, record, err)); CHECK(err.find("array") != std::string::npos); }
+    { auto x = base(); x.tables = {{7}}; x.ex.push_back(coding::Ex{coding::EX_CONST, 0, 0, 1}); x.ex.push_back(coding::Ex{coding::EX_TABLE, 1, 0, 0});   // one past a table
+      coding::Op set; set.op = coding::OP_SET; set.tgt = 1; set.v = 2; x.ops = {set, end};
+      CHECK(parses(x)); CHECK(!coding::Mint(d, one, 1, 0, 16, 4096, content, record, err)); CHECK(err.find("table") != std::string::npos); }
+    { auto x = base(); x.ex.push_back(coding::Ex{coding::EX_CONST, 0, 0, 1});                                              // a copy of distance 0
+      coding::Op lit; lit.op = coding::OP_OUTLIT; lit.v = 0; coding::Op cp; cp.op = coding::OP_OUTCOPY; cp.x = 1; cp.v = 0; x.ops = {lit, cp, end};
+      CHECK(parses(x)); CHECK(!coding::Mint(d, one, 1, 0, 16, 4096, content, record, err)); CHECK(err.find("before the start") != std::string::npos); }
+    { auto x = base(); x.ex.push_back(coding::Ex{coding::EX_CONST, 0, 0, 8});                                              // a decision only DECODE records
+      coding::Op raw; raw.op = coding::OP_RAW; raw.flags = coding::kFree; raw.tgt = 1; raw.x = 1; coding::Op dec; dec.op = coding::OP_DEC; dec.tgt = 1; dec.modes = coding::kDecode;
+      x.ops = {raw, dec, end};
+      CHECK(parses(x)); CHECK(!coding::Mint(d, one, 1, 0, 16, 4096, content, record, err)); CHECK(err.find("left over") != std::string::npos); }
+    { auto x = base(); x.ex.push_back(coding::Ex{coding::EX_CONST, 0, 0, 8});                                              // decodes a byte, codes back 0
+      coding::Op raw; raw.op = coding::OP_RAW; raw.tgt = 1; raw.x = 1; raw.v = 0; x.ops = {raw, end};
+      CHECK(parses(x)); CHECK(!coding::Mint(d, one, 1, 0, 16, 4096, content, record, err)); CHECK(err.find("code back") != std::string::npos); }
+}
+
+// Records come from peers too. A record whose checkpoints are damaged (carry counts, probabilities, cursors, lengths:
+// payloads decompressed, broken, recompressed) is refused or read, never crashes or hangs a reader; a description built
+// to make its compiled form explode is refused; content over 4 GiB is refused before anything is allocated.
+TEST(a_hostile_record_or_oversized_description_is_refused) {
+    const auto in = sampleContent(1, 60000, 12); const auto alone = lzmaAlone(in, 6, 3, 0, 2); const auto d = lzmaFor(alone);
+    std::vector<uint8_t> record; auto src = codedSource(d, alone.data() + 13, alone.size() - 13, in, 2048, &record); CHECK(src != nullptr); if (!src) return;
+    // the record's index: magic, shipped size, total, count, then (out, dec, length) per checkpoint, then the payloads
+    auto var = [](const std::vector<uint8_t> &b, size_t &at) { uint64_t v = 0; for (int sh = 0;; sh += 7) { const uint8_t x = b[at++]; v |= (uint64_t)(x & 0x7F) << sh; if (!(x & 0x80)) return v; } };
+    auto put = [](std::vector<uint8_t> &o, uint64_t v) { while (v >= 0x80) { o.push_back((uint8_t)(v | 0x80)); v >>= 7; } o.push_back((uint8_t)v); };
+    size_t at = 4; const uint64_t shippedN = var(record, at), total = var(record, at), nck = var(record, at);
+    std::vector<uint64_t> outs, decs, lens; for (uint64_t k = 0; k < nck; ++k) { outs.push_back(var(record, at)); decs.push_back(var(record, at)); lens.push_back(var(record, at)); }
+    std::vector<std::vector<uint8_t>> pay; for (uint64_t k = 0; k < nck; ++k) { pay.emplace_back(record.begin() + (long)at, record.begin() + (long)(at + lens[k])); at += lens[k]; }
+    CHECK(nck > 3);
+    std::mt19937 r(31); std::string err; int refused = 0, served = 0;
+    for (int i = 0; i < 120; ++i) {
+        auto pays = pay; const size_t k = 1 + r() % (nck - 1);
+        std::vector<uint8_t> raw(ZSTD_getFrameContentSize(pays[k].data(), pays[k].size())); ZSTD_decompress(raw.data(), raw.size(), pays[k].data(), pays[k].size());
+        const int how = i % 3;
+        if (how == 0) for (int j = 0; j < 3; ++j) raw[r() % std::min<size_t>(raw.size(), 400)] ^= (uint8_t)(1u << (r() % 8));      // registers, coder, cursor
+        else if (how == 1) raw[r() % raw.size()] = 0xFF;                                                                           // anywhere
+        else { size_t s2 = 0; while (raw[s2] & 0x80) ++s2; ++s2; for (int j = 0; j < 12; ++j) raw[s2 + (size_t)(r() % 64)] = 0xFF; }  // the carry, the pc
+        std::vector<uint8_t> z(ZSTD_compressBound(raw.size())); z.resize(ZSTD_compress(z.data(), z.size(), raw.data(), raw.size(), 3)); pays[k] = z;
+        std::vector<uint8_t> rec = {'V', 'G', 'C', 'R'}; put(rec, shippedN); put(rec, total); put(rec, nck);
+        for (uint64_t j = 0; j < nck; ++j) { put(rec, outs[j]); put(rec, decs[j]); put(rec, pays[j].size()); }
+        for (auto &q : pays) rec.insert(rec.end(), q.begin(), q.end());
+        auto s2 = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d)), std::make_shared<MemByteSource>(rec),
+                                                  std::make_shared<MemByteSource>(in), alone.size() - 13, err);
+        if (!s2) { ++refused; continue; }
+        std::vector<uint8_t> b(4096); const size_t off = std::min<size_t>(outs[k] + 10, alone.size() - 13 - 1);
+        if (s2->pread(b.data(), std::min<size_t>(4096, alone.size() - 13 - off), off) < 0) ++refused; else ++served;
+    }
+    CHECK(refused + served == 120); CHECK(refused > 0);
+    {   // the first checkpoint must be the stream's start
+        std::vector<uint8_t> rec = {'V', 'G', 'C', 'R'}; put(rec, shippedN); put(rec, total); put(rec, nck);
+        for (uint64_t j = 0; j < nck; ++j) { put(rec, j ? outs[j] : 1); put(rec, decs[j]); put(rec, pay[j].size()); }
+        for (auto &q : pay) rec.insert(rec.end(), q.begin(), q.end());
+        CHECK(!coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d)), std::make_shared<MemByteSource>(rec),
+                                               std::make_shared<MemByteSource>(in), alone.size() - 13, err)); }
+    // an expression chain every op needs: its compiled form would be quadratic
+    coding::Description bomb; bomb.name = "bomb"; bomb.coder = coding::kBits; bomb.ex.push_back(coding::Ex{coding::EX_REG, 0, 0, 1});
+    for (uint16_t i = 1; i < 60000; ++i) bomb.ex.push_back(coding::Ex{coding::EX_ADD, (uint16_t)(i - 1), 0, 0});
+    for (uint16_t i = 0; i < 60000; i += 2) { coding::Op o; o.op = coding::OP_SET; o.tgt = 2; o.v = i; bomb.ops.push_back(o); }
+    coding::Op e; e.op = coding::OP_END; bomb.ops.push_back(e);
+    const auto bb = coding::Serialize(bomb); coding::Description parsed; CHECK(coding::Parse(bb.data(), bb.size(), parsed, err));
+    const auto t0 = std::chrono::steady_clock::now(); std::vector<uint8_t> c, rr; const uint8_t one[1] = {0};
+    CHECK(!coding::Mint(parsed, one, 1, 0, 16, 4096, c, rr, err)); CHECK(err.find("complex") != std::string::npos);
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));                     // (sanitizer builds run slow)
+    CHECK(!coding::Mint(coding::DeflateDescription(), one, 1, 0, (size_t)5 << 30, 4096, c, rr, err)); CHECK(err.find("4 GiB") != std::string::npos);
+}
+
+// A coded stream MOUNTS: its content is any layer carrying bytes (here a bytes-only file, named by CID), its record and
+// description are files; it appears as one file at its name, serves the shipped bytes exactly, hides nothing, and a
+// spec that names a content no layer carries is planned as broken, not mounted wrong.
+TEST(a_coded_stream_mounts_as_a_file) {
+    TmpDir t;
+    const auto in = sampleContent(3, 150000, 21); const auto alone = lzmaAlone(in, 6, 3, 0, 2); const auto d = lzmaFor(alone);
+    std::vector<uint8_t> content, record; std::string err;
+    CHECK(coding::Mint(d, alone.data() + 13, alone.size() - 13, in.size(), in.size(), 4096, content, record, err));
+    const auto desc = coding::Serialize(d);
+    auto put = [&](const std::string &n, const std::vector<uint8_t> &b) { std::ofstream(t / n, std::ios::binary).write((const char *)b.data(), (std::streamsize)b.size()); };
+    put("content.bin", content); put("stream.vgcr", record); put("lzma.vgcd", desc);
+    const std::string spec = std::string(R"({"mountpoint":"/m","readonly":true,"layers":[)")
+        + R"({"type":"file","source":")" + t.str("content.bin") + R"(","target":"","cid":"bafycontent","bytesOnly":true},)"
+        + R"({"type":"coded","source":")" + t.str("stream.vgcr") + R"(","description":")" + t.str("lzma.vgcd")
+        + R"(","bases":["bafycontent"],"name":"data/level1.bundle","target":"game","cid":"bafystream"}]})";
+    Spec sp; CHECK(ParseSpecText(spec, sp, err)); CHECK(sp.layers.size() == 2 && sp.layers[1].type == LayerType::Coded);
+    VfsState S; CHECK(S.Init(sp, err));
+    VfsAttr a; CHECK_EQ(VfsGetattr(S, "game/data/level1.bundle", a), 0); CHECK_EQ(a.size, (uint64_t)(alone.size() - 13));
+    CHECK_EQ(VfsGetattr(S, "content.bin", a), -ENOENT);                  // the content is bytes only
+    OpenFile *H = nullptr; CHECK_EQ(VfsOpen(S, "game/data/level1.bundle", O_RDONLY, H), 0);
+    if (H) {
+        std::vector<uint8_t> got(alone.size() - 13); size_t o = 0;
+        while (o < got.size()) { const ssize_t n = VfsRead(H, (char *)got.data() + o, std::min<size_t>(65536, got.size() - o), (off_t)o); if (n <= 0) break; o += (size_t)n; }
+        CHECK(o == got.size() && std::equal(got.begin(), got.end(), alone.begin() + 13));
+        const size_t at = got.size() / 3; std::vector<uint8_t> mid(std::min<size_t>(1500, got.size() - at));     // back to the middle, after the end
+        CHECK_EQ(VfsRead(H, (char *)mid.data(), mid.size(), (off_t)at), (ssize_t)mid.size());
+        CHECK(std::equal(mid.begin(), mid.end(), alone.begin() + 13 + (long)at));
+        CHECK(got.size() > 3000);
+        VfsRelease(H);
+    }
+    // the content named by a CID no layer carries: planned broken, nothing served
+    Spec bad; CHECK(ParseSpecText(spec.substr(0, spec.find("bafycontent")) + "bafynothing" + spec.substr(spec.find("bafycontent") + 11), bad, err));
+    CHECK(!PlanTree(bad).problems.empty());
+    VfsState B; CHECK(B.Init(bad, err)); CHECK_EQ(VfsGetattr(B, "game/data/level1.bundle", a), -ENOENT);
+    // a coded layer must name exactly one content, a description and a name
+    CHECK(!ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"coded","source":"/r","bases":["a","b"],"description":"/d","name":"x"}]})", bad, err));
+    CHECK(!ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"coded","source":"/r","bases":["a"],"name":"x"}]})", bad, err));
+    CHECK(!ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"zip","source":"/r","name":"x"}]})", bad, err));
+}
+
+// What the engine refuses on its own, whatever the description says: an over-subscribed Huffman code (three codes of one
+// bit), and the range coder's carry, which only a long stream exercises.
+TEST(the_engine_refuses_bad_codes_and_carries_correctly) {
+    DeflateBits w; w.put(1, 1); w.put(2, 2); w.put(0, 5); w.put(0, 5); w.put(14, 4);
+    const int clorder[18] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1};
+    for (int sym : clorder) w.put(sym == 0 ? 1 : sym == 1 || sym == 2 ? 2 : 0, 3);
+    auto len1 = [&] { w.code(2, 2); }; auto len0 = [&] { w.code(0, 1); };
+    len1(); len1(); for (int k = 2; k < 256; ++k) len0(); len1(); len1(); w.put(0, 16);
+    std::vector<uint8_t> content, record; std::string err;
+    CHECK(!coding::Mint(coding::DeflateDescription(), w.out.data(), w.out.size(), 0, 1 << 16, 4096, content, record, err));
+    CHECK(err.find("over-subscribed") != std::string::npos);
+    const auto in = sampleContent(1, 3 << 20, 77); const auto alone = lzmaAlone(in, 0, 3, 0, 2);
+    auto src = codedSource(lzmaFor(alone), alone.data() + 13, alone.size() - 13, in, 1 << 20);
+    CHECK(src != nullptr);
+    if (src) { std::vector<uint8_t> shipped(alone.begin() + 13, alone.end()); CHECK(readsBack(*src, shipped, 5, 10)); }
+}
+
+// The sequential cursor serves only what it holds: reads ending at every byte just past what a paused run produced.
+TEST(a_coded_source_cursor_never_serves_past_what_it_holds) {
+    const auto in = sampleContent(1, 50000, 3); const auto alone = lzmaAlone(in, 6, 3, 0, 2);
+    auto src = codedSource(lzmaFor(alone), alone.data() + 13, alone.size() - 13, in, 4096); CHECK(src != nullptr); if (!src) return;
+    std::vector<uint8_t> shipped(alone.begin() + 13, alone.end()), b(4096); size_t wrong = 0;
+    CHECK(src->preadAll(b.data(), 100, 0));
+    for (size_t e = 101; e < 2500; ++e) { const size_t n = e - 50; if (!src->preadAll(b.data(), n, 50) || memcmp(b.data(), shipped.data() + 50, n)) ++wrong; }
+    CHECK_EQ(wrong, (size_t)0);
+}
+
+// Checkpoints and records forged on purpose, field by field: a carry count no stream could hold, a probability that is
+// none, an index length past any record — refused, never run; and a description using an op newer than the
+// instruction set it names is refused.
+TEST(a_forged_checkpoint_or_record_field_is_refused) {
+    const auto in = sampleContent(1, 60000, 13); const auto alone = lzmaAlone(in, 6, 3, 0, 2); const auto d = lzmaFor(alone);
+    std::vector<uint8_t> record; auto src = codedSource(d, alone.data() + 13, alone.size() - 13, in, 2048, &record); CHECK(src != nullptr); if (!src) return;
+    auto var = [](const std::vector<uint8_t> &b, size_t &at) { uint64_t v = 0; for (int sh = 0;; sh += 7) { const uint8_t x = b[at++]; v |= (uint64_t)(x & 0x7F) << sh; if (!(x & 0x80)) return v; } };
+    auto put = [](std::vector<uint8_t> &o, uint64_t v) { while (v >= 0x80) { o.push_back((uint8_t)(v | 0x80)); v >>= 7; } o.push_back((uint8_t)v); };
+    size_t at = 4; const uint64_t shippedN = var(record, at), total = var(record, at), nck = var(record, at);
+    std::vector<uint64_t> outs, decs, lens; for (uint64_t k = 0; k < nck; ++k) { outs.push_back(var(record, at)); decs.push_back(var(record, at)); lens.push_back(var(record, at)); }
+    std::vector<std::vector<uint8_t>> pay; for (uint64_t k = 0; k < nck; ++k) { pay.emplace_back(record.begin() + (long)at, record.begin() + (long)(at + lens[k])); at += lens[k]; }
+    auto assemble = [&](const std::vector<std::vector<uint8_t>> &ps, uint64_t badLen) {
+        std::vector<uint8_t> rec = {'V', 'G', 'C', 'R'}; put(rec, shippedN); put(rec, total); put(rec, nck);
+        for (uint64_t j = 0; j < nck; ++j) { put(rec, outs[j]); put(rec, decs[j]); put(rec, j == 1 && badLen ? badLen : ps[j].size()); }
+        for (auto &q : ps) rec.insert(rec.end(), q.begin(), q.end());
+        return rec; };
+    std::string err; auto desc = std::make_shared<MemByteSource>(coding::Serialize(d)); auto content = std::make_shared<MemByteSource>(in);
+    CHECK(!coding::CodedByteSource::Create(desc, std::make_shared<MemByteSource>(assemble(pay, 1ull << 62)), content, 0, err));   // a length past any record
+    {   // two lengths that wrap: each past any record, their sum the record's own (a total check alone would pass it)
+        std::vector<uint8_t> rec = {'V', 'G', 'C', 'R'}; put(rec, shippedN); put(rec, total); put(rec, nck);
+        for (uint64_t j = 0; j < nck; ++j) { put(rec, outs[j]); put(rec, decs[j]); put(rec, pay[j].size() + (j == 1 || j == 2 ? 1ull << 63 : 0)); }
+        for (auto &q : pay) rec.insert(rec.end(), q.begin(), q.end());
+        CHECK(nck > 2); CHECK(!coding::CodedByteSource::Create(desc, std::make_shared<MemByteSource>(rec), content, 0, err));
+    }
+    // rewrite checkpoint 1's snapshot: pc, stack, 64 registers, low, range, cache, CARRY COUNT, ..., the first slot
+    auto forged = [&](int what) {
+        std::vector<uint8_t> raw(ZSTD_getFrameContentSize(pay[1].data(), pay[1].size())); ZSTD_decompress(raw.data(), raw.size(), pay[1].data(), pay[1].size());
+        size_t q = 0; const uint64_t sn = var(raw, q); const size_t s0 = q; std::vector<uint8_t> snap;
+        auto copyVar = [&](uint64_t replace, bool doIt) { const uint64_t v = var(raw, q); put(snap, doIt ? replace : v); };
+        copyVar(0, false); const uint64_t ns = var(raw, q); put(snap, ns); for (uint64_t i = 0; i < ns; ++i) copyVar(0, false);
+        for (int i = 0; i < 64; ++i) copyVar(0, false);
+        copyVar(0, false); copyVar(0, false); snap.push_back(raw[q++]);   // low, range, cache
+        copyVar(1ull << 40, what == 0);                                     // the carry count
+        copyVar(0, false); copyVar(0, false);                               // acc, bn
+        copyVar(what == 1 ? 0 : 4096, what >= 1);                           // the first slot: 0, or past 2047
+        snap.insert(snap.end(), raw.begin() + (long)q, raw.begin() + (long)(s0 + sn));
+        std::vector<uint8_t> np; put(np, snap.size()); np.insert(np.end(), snap.begin(), snap.end()); np.insert(np.end(), raw.begin() + (long)(s0 + sn), raw.end());
+        std::vector<uint8_t> z(ZSTD_compressBound(np.size())); z.resize(ZSTD_compress(z.data(), z.size(), np.data(), np.size(), 3));
+        auto ps = pay; ps[1] = z; return assemble(ps, 0); };
+    for (int what = 0; what < 3; ++what) {
+        auto s2 = coding::CodedByteSource::Create(desc, std::make_shared<MemByteSource>(forged(what)), content, 0, err);
+        CHECK(s2 != nullptr); if (!s2) continue;
+        std::vector<uint8_t> b(256); const auto t0 = std::chrono::steady_clock::now();
+        CHECK(s2->pread(b.data(), b.size(), outs[1] + 1) < 0);              // random read from the forged checkpoint: refused
+        CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
+    }
+    coding::Description old = coding::DeflateDescription(); old.isa = 2;    // uses ISA 3's runs
+    const auto ob = coding::Serialize(old); coding::Description back; CHECK(!coding::Parse(ob.data(), ob.size(), back, err));
+}
+
+// THE TARGET: read through an arbitrary number of layers, each a different encoding. Twenty-one layers cycling LZ4 ->
+// deflate -> LZMA, each layer's shipped stream the next one's content; the top is served through every layer below it,
+// as stacked sources and as a mount (coded layers chained by CID), front to back, anywhere, and from many threads.
+// A tiny description assembler for the compiler's own tests (the real formats' assembler is not part of the reader).
+struct MiniAsm {
+    coding::Description d;
+    uint16_t e(uint8_t op, uint16_t a, uint16_t b, uint32_t imm) { d.ex.push_back(coding::Ex{op, a, b, imm}); return (uint16_t)(d.ex.size() - 1); }
+    uint16_t C(uint32_t v) { return e(coding::EX_CONST, 0, 0, v); }
+    uint16_t R(int r) { return e(coding::EX_REG, 0, 0, (uint32_t)r); }
+    uint16_t X(uint8_t op, uint16_t a, uint16_t b) { return e(op, a, b, 0); }
+    uint16_t op(uint8_t o, uint8_t flags, uint8_t tgt, uint16_t x, uint16_t v, uint16_t target = 0) {
+        coding::Op p; p.op = o; p.flags = flags; p.tgt = tgt; p.x = x; p.v = v; p.m = C(0); p.target = target; d.ops.push_back(p); return (uint16_t)(d.ops.size() - 1);
+    }
+};
+// 16 raw bits per step; every content byte is an expression of them, so DECODE writes what the compiled form computes.
+static bool mintRaw(const std::function<uint16_t(MiniAsm &)> &expr, const std::vector<uint8_t> &shipped, size_t n, std::vector<uint8_t> &content, std::string &err) {
+    MiniAsm a; a.d.coder = coding::kBits; a.d.name = "raw-expr";
+    std::vector<uint32_t> tbl = {10, 20, 30, 40}; a.d.tables.push_back(tbl);
+    a.op(coding::OP_SET, 0, 2, a.C(0), a.C(0));
+    const uint16_t loop = a.op(coding::OP_RAW, coding::kFree, 1, a.C(16), a.C(0));
+    a.op(coding::OP_OUTLIT, 0, 0, a.C(0), expr(a));
+    a.op(coding::OP_SET, 0, 2, a.C(0), a.X(coding::EX_ADD, a.R(2), a.C(1)));
+    a.op(coding::OP_JZ, 0, 0, a.C(0), a.X(coding::EX_EQ, a.R(2), a.C((uint32_t)n)), loop);
+    a.op(coding::OP_FLUSH, 0, 0, a.C(0), a.C(0)); a.op(coding::OP_END, 0, 0, a.C(0), a.C(0));
+    std::vector<uint8_t> rec;
+    return coding::Mint(a.d, shipped.data(), shipped.size(), n, n, 4096, content, rec, err);
+}
+// The compiler folds expressions into affine forms and fuses op patterns; each fold must mean exactly what it folds.
+TEST(the_compiled_forms_mean_what_they_fold) {
+    std::string err; std::vector<uint8_t> c;
+    // (x & 0xFF) >> 4: the mask shifts with the value (a value with bits 8..11 set shows a mask left in place)
+    const std::vector<uint16_t> xs = {0x0ABC, 0x0F0F, 0xFFFF, 0x1234, 0x00F0};
+    std::vector<uint8_t> sh; for (uint16_t x : xs) { sh.push_back((uint8_t)x); sh.push_back((uint8_t)(x >> 8)); }
+    CHECK(mintRaw([](MiniAsm &a) { return a.X(coding::EX_SHR, a.X(coding::EX_AND, a.R(1), a.C(0xFF)), a.C(4)); }, sh, xs.size(), c, err));
+    for (size_t i = 0; i < xs.size() && i < c.size(); ++i) CHECK_EQ((int)c[i], (int)((xs[i] & 0xFF) >> 4));
+    // a table term in a sum: the last entry reads, one past it is refused
+    std::vector<uint8_t> in = {3, 0, 1, 0};
+    CHECK(mintRaw([](MiniAsm &a) { return a.X(coding::EX_ADD, a.e(coding::EX_TABLE, a.R(1), 0, 0), a.R(2)); }, in, 2, c, err));
+    if (c.size() == 2) { CHECK_EQ((int)c[0], 40); CHECK_EQ((int)c[1], 21); }
+    in = {4, 0, 1, 0};
+    CHECK(!mintRaw([](MiniAsm &a) { return a.X(coding::EX_ADD, a.e(coding::EX_TABLE, a.R(1), 0, 0), a.R(2)); }, in, 2, c, err));
+    CHECK(err.find("table read out of range") != std::string::npos);
+    // a refusal pending when the program returns (a table read out of range, then RET at the top) refuses the stream
+    {
+        MiniAsm q; q.d.coder = coding::kBits; q.d.name = "ret-refusal"; q.d.tables.push_back({10, 20, 30, 40});
+        q.op(coding::OP_RAW, coding::kFree, 1, q.C(8), q.C(0));
+        q.op(coding::OP_OUTLIT, 0, 0, q.C(0), q.X(coding::EX_ADD, q.e(coding::EX_TABLE, q.R(1), 0, 0), q.R(2)));
+        q.op(coding::OP_RET, 0, 0, q.C(0), q.C(0));
+        std::vector<uint8_t> rec, one = {2}, bad = {4};
+        CHECK(coding::Mint(q.d, one.data(), one.size(), 1, 1, 4096, c, rec, err)); CHECK(c.size() == 1 && c[0] == 30);
+        CHECK(!coding::Mint(q.d, bad.data(), bad.size(), 1, 1, 4096, c, rec, err));
+    }
+    // compute-a-bit + code-it + branch, with a jump landing on the BIT from another path: the fused form must not swallow
+    // the landing. The stream is range-coded here by a reference encoder, bit by bit through the one slot.
+    MiniAsm a; a.d.coder = coding::kRange; a.d.nslots = 1; a.d.name = "fusion-landing";
+    const int N = 40; std::mt19937 r(7); std::vector<uint8_t> bits(N); for (auto &b : bits) b = (uint8_t)(r() & 1);
+    const uint16_t bitOfContent = a.X(coding::EX_AND, a.e(coding::EX_BYTE, a.R(0), 0, 0), a.C(1));
+    a.op(coding::OP_SET, 0, 2, a.C(0), a.C(0));                                                   // 0: i = 0
+    const uint16_t loop = a.op(coding::OP_JZ, 0, 0, a.C(0), a.X(coding::EX_AND, a.R(2), a.C(1)), 0);   // 1: even i -> 4
+    a.op(coding::OP_SET, 0, 1, a.C(0), bitOfContent);                                            // 2: odd: compute the bit ...
+    a.op(coding::OP_JMP, 0, 0, a.C(0), a.C(0), 5);                                               // 3: ... and land on the BIT
+    a.op(coding::OP_SET, 0, 1, a.C(0), bitOfContent);                                            // 4: even: compute,
+    a.op(coding::OP_BIT, 0, 1, a.C(0), a.R(1));                                                  // 5: code it,
+    a.op(coding::OP_JZ, 0, 0, a.C(0), a.R(1), 9);                                                // 6: branch on it
+    a.op(coding::OP_OUTLIT, 0, 0, a.C(0), a.C(1));                                               // 7
+    a.op(coding::OP_JMP, 0, 0, a.C(0), a.C(0), 10);                                              // 8
+    a.op(coding::OP_OUTLIT, 0, 0, a.C(0), a.C(0));                                               // 9
+    a.op(coding::OP_SET, 0, 2, a.C(0), a.X(coding::EX_ADD, a.R(2), a.C(1)));                    // 10: i += 1
+    a.op(coding::OP_JZ, 0, 0, a.C(0), a.X(coding::EX_EQ, a.R(2), a.C(N)), loop);                 // 11
+    a.op(coding::OP_FLUSH, 0, 0, a.C(0), a.C(0)); a.op(coding::OP_END, 0, 0, a.C(0), a.C(0));
+    a.d.ops[loop].target = 4;
+    struct { uint64_t low = 0; uint32_t range = 0xFFFFFFFFu; uint8_t cache = 0; uint64_t cs = 1; std::vector<uint8_t> o;
+        void shift() { if ((uint32_t)low < 0xFF000000u || (low >> 32) != 0) { uint8_t t = cache; do { o.push_back((uint8_t)(t + (uint8_t)(low >> 32))); t = 0xFF; } while (--cs); cache = (uint8_t)((uint32_t)low >> 24); } cs++; low = (uint32_t)low << 8; }
+        void bit(uint16_t &p, int b) { const uint32_t bound = (range >> 11) * p; if (!b) { range = bound; p = (uint16_t)(p + ((2048 - p) >> 5)); } else { low += bound; range -= bound; p = (uint16_t)(p - (p >> 5)); } while (range < (1u << 24)) { range <<= 8; shift(); } }
+    } enc;
+    uint16_t prob = 1024; for (uint8_t b : bits) enc.bit(prob, b); for (int i = 0; i < 5; ++i) enc.shift();
+    std::vector<uint8_t> rec;
+    CHECK(coding::Mint(a.d, enc.o.data(), enc.o.size(), N, N, 4096, c, rec, err));
+    CHECK(c == bits);
+}
+
+// Axiom 10 (Demand): bytes a layer only COPIES (LZ4 literals, stored blocks) are handed down as ranges, never generated
+// again by each layer, and a layer asks the one below for about what it needs: in big windows (not one read per
+// literal), and nothing behind its segment unless its format reads there.
+struct ByteCountingSource : ByteSource {
+    std::shared_ptr<ByteSource> inner; std::atomic<uint64_t> bytes{0}, reads{0};
+    explicit ByteCountingSource(std::shared_ptr<ByteSource> s) : inner(std::move(s)) {}
+    ssize_t pread(void *buf, size_t n, uint64_t off) override { ++reads; const ssize_t r = inner->pread(buf, n, off); if (r > 0) bytes += (uint64_t)r; return r; }
+    uint64_t size() const override { return inner->size(); }
+};
+TEST(copy_runs_are_handed_down_through_every_layer) {
+    auto content = sampleContent(1, 400000, 51); { const auto text = sampleContent(0, 200000, 52); content.insert(content.end(), text.begin(), text.end()); }
+    // LZ4 over noise then game text, LZ4 over that (incompressible: long literal runs), deflate STORED, LZ4 fast on top
+    std::vector<std::vector<uint8_t>> S = {content}; std::vector<coding::Description> D; std::vector<std::vector<uint8_t>> R;
+    std::string err;
+    for (int k = 0; k < 4; ++k) {
+        const auto &in = S.back();
+        std::vector<uint8_t> out = k == 2 ? rawDeflate(in, 0, 15, 8, Z_DEFAULT_STRATEGY) : lz4Block(in, k == 3 ? 0 : 9);
+        const coding::Description d = k == 2 ? coding::DeflateDescription() : coding::Lz4BlockDescription();
+        std::vector<uint8_t> c, rec;
+        CHECK(coding::Mint(d, out.data(), out.size(), in.size(), in.size(), coding::SuggestedSpacing(d, out.size()), c, rec, err));
+        CHECK(c == in);
+        S.push_back(out); D.push_back(d); R.push_back(rec);
+    }
+    auto stack = [&](std::shared_ptr<ByteCountingSource> &bottom, std::vector<std::shared_ptr<coding::CodedByteSource>> &L) {
+        bottom = std::make_shared<ByteCountingSource>(std::make_shared<MemByteSource>(content));
+        std::shared_ptr<ByteSource> src = bottom; L.clear();
+        for (int k = 0; k < 4; ++k) {
+            auto c = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(D[(size_t)k])), std::make_shared<MemByteSource>(R[(size_t)k]), src, 0, err);
+            CHECK(c != nullptr); if (!c) return false; L.push_back(c); src = c;
+        }
+        return true;
+    };
+    std::shared_ptr<ByteCountingSource> bottom; std::vector<std::shared_ptr<coding::CodedByteSource>> L;
+    if (!stack(bottom, L)) return;
+    CHECK(readsBack(*L[3], S[4], 91, 60));
+    // a fresh stack read front to back, as a game loads it
+    if (!stack(bottom, L)) return;
+    std::vector<uint8_t> got(S[4].size());
+    for (size_t o = 0; o < got.size(); o += 65536) CHECK(L[3]->preadAll(got.data() + o, std::min<size_t>(65536, got.size() - o), o));
+    CHECK(got == S[4]);
+    std::cerr << "  generated: " << L[0]->bytesGenerated() << "/" << S[1].size() << " " << L[1]->bytesGenerated() << "/" << S[2].size() << " "
+              << L[2]->bytesGenerated() << "/" << S[3].size() << " " << L[3]->bytesGenerated() << "/" << S[4].size()
+              << "; content read " << bottom->bytes.load() << "/" << content.size() << " in " << bottom->reads.load() << " reads; decoded";
+    for (auto &c : L) std::cerr << " " << c->segmentsDecoded() << "/" << c->checkpoints();
+    std::cerr << "\n";
+    // copied bytes are handed down, not generated: the layers over noise generate only their framing
+    CHECK(L[0]->bytesGenerated() * 100 <= S[1].size() * 15);   // LZ4 over noise + text: the text's framing and short literals
+    CHECK(L[1]->bytesGenerated() * 100 <= S[2].size() * 5);    // LZ4 over LZ4
+    CHECK(L[2]->bytesGenerated() * 100 <= S[3].size() * 1);    // stored blocks: their headers
+    CHECK(L[3]->bytesGenerated() * 100 <= S[4].size() * 2);
+    // the content is read about once, in few big reads: short literals slide a window instead of a read each, nothing
+    // behind a segment is fetched for formats that never look back, and a long run leaves no burst of tiny segments
+    CHECK(bottom->bytes.load() * 2 <= content.size() * 3);
+    CHECK(bottom->reads.load() <= 64);
+    CHECK(L[0]->checkpoints() <= 12);
+    for (auto &c : L) CHECK_EQ(c->segmentsDecoded(), (uint64_t)c->checkpoints());   // each segment decoded once
+    // a read the layer below refuses is refused above it, copy run or not (never served as whatever the buffer held)
+    {
+        auto nz = sampleContent(1, 300000, 81); const auto sh = lz4Block(nz, 9); const auto dz = coding::Lz4BlockDescription(); std::vector<uint8_t> cz, rz;
+        CHECK(coding::Mint(dz, sh.data(), sh.size(), nz.size(), nz.size(), coding::SuggestedSpacing(dz, sh.size()), cz, rz, err));
+        auto failing = std::make_shared<CountingSource>(std::make_shared<MemByteSource>(nz));
+        failing->failAt = [](uint64_t off) { return off >= 150000 && off < 160000; };
+        auto top = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(dz)), std::make_shared<MemByteSource>(rz), failing, 0, err);
+        CHECK(top != nullptr);
+        if (top) { std::vector<uint8_t> b(4096);
+            CHECK(top->preadAll(b.data(), b.size(), 1000) && !memcmp(b.data(), sh.data() + 1000, b.size()));
+            CHECK(!top->preadAll(b.data(), b.size(), 152000)); }
+    }
+    // short literals far apart (text between long noise runs, which are handed down): each text block starts a small
+    // window of its own instead of fetching the noise again that the copy runs already handed down
+    std::vector<uint8_t> sparse;
+    for (int k = 0; k < 8; ++k) { const auto nz = sampleContent(1, 100000, 60 + k), tx = sampleContent(0, 3000, 70 + k); sparse.insert(sparse.end(), nz.begin(), nz.end()); sparse.insert(sparse.end(), tx.begin(), tx.end()); }
+    const auto sz = lz4Block(sparse, 9); const auto d1 = coding::Lz4BlockDescription(); std::vector<uint8_t> c1, r1;
+    CHECK(coding::Mint(d1, sz.data(), sz.size(), sparse.size(), sparse.size(), 4u << 20, c1, r1, err));   // one segment: the jumps fall inside one window
+    auto sb = std::make_shared<ByteCountingSource>(std::make_shared<MemByteSource>(sparse));
+    auto s1 = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d1)), std::make_shared<MemByteSource>(r1), sb, 0, err);
+    CHECK(s1 != nullptr);
+    if (s1) { std::vector<uint8_t> g(sz.size());
+        for (size_t o = 0; o < g.size(); o += 65536) CHECK(s1->preadAll(g.data() + o, std::min<size_t>(65536, g.size() - o), o));
+        CHECK(g == sz);
+        std::cerr << "  sparse: content read " << sb->bytes.load() << "/" << sparse.size() << " in " << sb->reads.load() << " reads\n";
+        CHECK(sb->bytes.load() * 10 <= sparse.size() * 13); }
+}
+TEST(a_deep_stack_of_mixed_encodings_reads_through_every_layer) {
+    const int depth = 21;
+    std::vector<std::vector<uint8_t>> S = {sampleContent(3, 300000, 41)};      // S[0] the content, S[k] layer k's stream
+    std::vector<coding::Description> D; std::vector<std::vector<uint8_t>> rec;
+    std::string err;
+    for (int k = 1; k <= depth; ++k) {
+        const auto &in = S.back(); std::vector<uint8_t> out; coding::Description d; size_t skip = 0;
+        if (k % 3 == 1) { out = lz4Block(in, 9); d = coding::Lz4BlockDescription(); }
+        else if (k % 3 == 2) { out = rawDeflate(in, 6, 15, 8, Z_DEFAULT_STRATEGY); d = coding::DeflateDescription(); }
+        else { out = lzmaAlone(in, 1, 3, 0, 2); d = lzmaFor(out); skip = 13; }
+        std::vector<uint8_t> shipped(out.begin() + (long)skip, out.end()), content, record;
+        CHECK(coding::Mint(d, shipped.data(), shipped.size(), in.size(), in.size(), coding::SuggestedSpacing(d), content, record, err));
+        CHECK(content == in);
+        S.push_back(shipped); D.push_back(d); rec.push_back(record);
+    }
+    // as stacked sources
+    std::shared_ptr<ByteSource> src = std::make_shared<MemByteSource>(S[0]);
+    for (int k = 1; k <= depth; ++k) {
+        auto c = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(D[(size_t)k - 1])), std::make_shared<MemByteSource>(rec[(size_t)k - 1]), src, 0, err);
+        CHECK(c != nullptr); if (!c) return; src = c;
+    }
+    CHECK(readsBack(*src, S[depth], 77, 30));
+    std::atomic<int> bad{0}; std::vector<std::thread> th;
+    for (int t = 0; t < 8; ++t) th.emplace_back([&, t] { std::mt19937 rr((uint32_t)t); std::vector<uint8_t> b(16384);
+        for (int i = 0; i < 12; ++i) { const size_t a = rr() % S[depth].size(), n = 1 + rr() % std::min<size_t>(16384, S[depth].size() - a);
+            if (!src->preadAll(b.data(), n, a) || memcmp(b.data(), S[depth].data() + a, n)) ++bad; } });
+    for (auto &x : th) x.join();
+    CHECK_EQ(bad.load(), 0);
+    // as a mount: the content a bytes-only file, every layer a coded layer naming the one below by CID, the top surfacing
+    TmpDir t;
+    auto put = [&](const std::string &n, const std::vector<uint8_t> &b) { std::ofstream(t / n, std::ios::binary).write((const char *)b.data(), (std::streamsize)b.size()); };
+    put("c0.bin", S[0]);
+    std::string layers = R"({"type":"file","source":")" + t.str("c0.bin") + R"(","target":"","cid":"c0","bytesOnly":true})";
+    for (int k = 1; k <= depth; ++k) {
+        put("r" + std::to_string(k), rec[(size_t)k - 1]); put("d" + std::to_string(k), coding::Serialize(D[(size_t)k - 1]));
+        layers += R"(,{"type":"coded","source":")" + t.str("r" + std::to_string(k)) + R"(","description":")" + t.str("d" + std::to_string(k))
+                + R"(","bases":["c)" + std::to_string(k - 1) + R"("],"name":"top.bin","target":"","cid":"c)" + std::to_string(k) + R"(")" + (k < depth ? R"(,"bytesOnly":true)" : "") + "}";
+    }
+    Spec sp; CHECK(ParseSpecText(R"({"mountpoint":"/m","readonly":true,"layers":[)" + layers + "]}", sp, err));
+    CHECK(PlanTree(sp).problems.empty());
+    VfsState V; CHECK(V.Init(sp, err));
+    VfsAttr a; CHECK_EQ(VfsGetattr(V, "top.bin", a), 0); CHECK_EQ(a.size, (uint64_t)S[depth].size());
+    OpenFile *H = nullptr; CHECK_EQ(VfsOpen(V, "top.bin", O_RDONLY, H), 0);
+    if (H) { std::vector<uint8_t> got(S[depth].size()); size_t o = 0;
+        while (o < got.size()) { const ssize_t n = VfsRead(H, (char *)got.data() + o, std::min<size_t>(131072, got.size() - o), (off_t)o); if (n <= 0) break; o += (size_t)n; }
+        CHECK(o == got.size() && got == S[depth]); VfsRelease(H); }
 }

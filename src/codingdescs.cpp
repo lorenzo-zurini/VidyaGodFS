@@ -54,6 +54,8 @@ struct Asm {
     void Assert(uint16_t v) { op(OP_ASSERT, 0, 0, 0, Z(), v, Z(), 0); }
     void Flush() { op(OP_FLUSH, 0, 0, 0, Z(), Z(), Z(), 0); }
     void Mark() { op(OP_MARK, 0, 0, 0, Z(), Z(), Z(), 0); }
+    void HuffRun(int tab, uint16_t n, int runReg, int termReg, uint16_t lim) { op(OP_HUFFRUN, 0, (uint8_t)termReg, (uint8_t)runReg, n, Z(), lim, (uint32_t)tab); }
+    void ByteRun(uint16_t n) { op(OP_BYTERUN, 0, 0, 0, n, Z(), Z(), 0); }
     void End() { op(OP_END, 0, 0, 0, Z(), Z(), Z(), 0); }
     uint16_t ADD(uint16_t a, uint16_t b) { return X(EX_ADD, a, b); }
     uint16_t SUB(uint16_t a, uint16_t b) { return X(EX_SUB, a, b); }
@@ -77,8 +79,8 @@ enum : uint32_t { S_ISMATCH = 0, S_ISREP = 192, S_REPG0 = 204, S_REPG1 = 216, S_
                   S_POSENC = 688, S_ALIGN = 802, S_LEN = 818, S_REPLEN = 818 + 514, S_LIT = 818 + 1028 };
 enum { Z_STREAM, Z_LOOP, Z_ENDC, Z_ENDD, Z_TOK, Z_SLOT1, Z_REP0, Z_MTF, Z_REPLEN, Z_SHORT, Z_MATCH, Z_ALIGN, Z_SMALL, Z_PUSH, Z_ENDTOK,
        Z_LIT, Z_PLAIN, Z_LE, Z_LEN0 };
-void LzLen(Asm &a, uint32_t base, int l0) {
-    const uint16_t V = a.R(LR_V), PS = a.R(LR_PS), B = a.R(LR_B);
+void LzLen(Asm &a, uint32_t base, int l0, uint16_t PS) {
+    const uint16_t V = a.R(LR_V), B = a.R(LR_B);
     a.Mode(kCodePrice); a.Set(LR_B, a.GE(V, a.C(8))); a.Mode(0); a.Bit(a.C(base), B, LR_B); a.Jz(B, l0);
     a.Mode(kCodePrice); a.Set(LR_B, a.GE(V, a.C(16))); a.Mode(0); a.Bit(a.C(base + 1), B, LR_B); a.Jz(B, l0 + 1);
     a.Mode(kCodePrice); a.Set(LR_T2, a.SUB(V, a.C(16))); a.Mode(0); a.Tree(a.C(base + 2 + 256), 8, a.R(LR_T2), LR_T2);
@@ -92,7 +94,7 @@ void LzLen(Asm &a, uint32_t base, int l0) {
 }
 
 // ---- deflate
-enum { DR_K = 1, DR_L, DR_D, DR_BF, DR_BT, DR_SYM, DR_C, DR_E, DR_DC, DR_N, DR_I, DR_HLIT, DR_HDIST, DR_HCLEN, DR_R, DR_T, DR_LEN, DR_NLEN, DR_B };
+enum { DR_K = 1, DR_L, DR_D, DR_BF, DR_BT, DR_SYM, DR_C, DR_E, DR_DC, DR_N, DR_I, DR_HLIT, DR_HDIST, DR_HCLEN, DR_R, DR_T, DR_LEN, DR_NLEN, DR_B, DR_RUN };
 enum { DA_LENS, DA_CL, DA_FIXL, DA_FIXD };
 enum { DT_LBASE, DT_LEXT, DT_DBASE, DT_DEXT, DT_CLORDER, DT_LSYM };
 enum { G_STREAM, G_BLOCK, G_DYN, G_TOKENS, G_BEND, G_STORED, G_SLOOP, G_DYNHDR, G_CLCLR, G_CLGO, G_CLRD, G_CLB, G_LL, G_RLE, G_Z, G_Z18,
@@ -107,23 +109,23 @@ enum { Q_STREAM, Q_SEQ, Q_LX, Q_LITS, Q_LL, Q_LDONE, Q_LAST, Q_MX, Q_COPY, Q_END
 Description LzmaDescription(int lc, int lp, int pb, uint32_t dict, bool hasEnd) {
     Asm a;
     const uint16_t P = a.R(kRegPlace), K = a.R(LR_K), L = a.R(LR_L), D = a.R(LR_D), SL = a.R(LR_SL), S = a.R(LR_S), B = a.R(LR_B), H0 = a.R(LR_H0), T0 = a.R(LR_T0);
-    const uint16_t PS = a.R(LR_PS), FB = a.R(LR_FB), BASE = a.R(LR_BASE);
-    // the stream: tokens (decisions: kind, length, history slot, distance - 1), then the end marker
+    const uint16_t PS = a.AND(P, a.C((1u << pb) - 1)), FB = a.R(LR_FB), BASE = a.R(LR_BASE);   // the position state: an expression
+    // the stream: tokens until the end marker (a copy no stream can reach) or, without one, the content's end.
+    // Decisions per token: its kind; a copy adds length, history slot, distance - 1 (a literal needs nothing more).
     a.Label(Z_STREAM); a.Label(Z_LOOP); a.Mark();
-    a.Mode(kCode); a.Jz(a.X1(EX_DLEFT, 0), Z_ENDC); a.Dec(LR_K); a.Dec(LR_L); a.Dec(LR_SL); a.Dec(LR_D);
-    a.Mode(0); a.Call(Z_TOK);
-    a.Mode(kDecode); a.Jz(a.NE(K, a.C(2)), Z_ENDD); a.Dec(LR_K); a.Dec(LR_L); a.Dec(LR_SL); a.Dec(LR_D);
-    if (!hasEnd) a.Jz(a.X1(EX_XLEFT, 0), Z_ENDD);
-    a.Mode(0); a.Jmp(Z_LOOP);
-    a.Label(Z_ENDC); a.Mode(kCode);
-    if (hasEnd) { a.Set(LR_K, a.C(1)); a.Set(LR_L, a.C(2)); a.Set(LR_SL, a.C(kNoSlot)); a.Set(LR_D, a.C(0xFFFFFFFFu)); a.Call(Z_TOK); }
-    a.Flush(); a.Mode(0);
+    if (!hasEnd) a.Jz(a.X1(EX_XLEFT, 0), Z_ENDC);
+    a.Mode(kCode); a.Dec(LR_K); a.Mode(0);
+    a.Call(Z_TOK);
+    a.Jz(a.NE(K, a.C(2)), Z_ENDC);
+    a.Jmp(Z_LOOP);
+    a.Label(Z_ENDC); a.Mode(kCode); a.Flush(); a.Mode(0);
     a.Label(Z_ENDD); a.End();
     // one token
     a.Label(Z_TOK);
-    a.Set(LR_PS, a.AND(P, a.C((1u << pb) - 1)));
     a.Bit(a.ADD(a.C(S_ISMATCH), a.ADD(a.SHL(S, a.C(4)), PS)), K, LR_K);
+    a.Mode(kDecode); a.Dec(LR_K); a.Mode(0);
     a.Jz(K, Z_LIT);
+    a.Mode(kCode); a.Dec(LR_L); a.Dec(LR_SL); a.Dec(LR_D); a.Mode(0);
     a.Mode(kCodePrice); a.Set(LR_B, a.NE(SL, a.C(kNoSlot))); a.Mode(0); a.Bit(a.ADD(a.C(S_ISREP), S), B, LR_B); a.Jz(B, Z_MATCH);
     a.Mode(kCodePrice); a.Set(LR_B, a.NE(SL, a.C(0))); a.Mode(0); a.Bit(a.ADD(a.C(S_REPG0), S), B, LR_B); a.Jz(B, Z_REP0);
     a.Mode(kCodePrice); a.Set(LR_B, a.NE(SL, a.C(1))); a.Mode(0); a.Bit(a.ADD(a.C(S_REPG1), S), B, LR_B); a.Jz(B, Z_SLOT1);
@@ -134,14 +136,15 @@ Description LzmaDescription(int lc, int lp, int pb, uint32_t dict, bool hasEnd) 
     a.Mode(kCodePrice); a.Set(LR_B, a.NE(L, a.C(1))); a.Mode(0); a.Bit(a.ADD(a.C(S_REP0LONG), a.ADD(a.SHL(S, a.C(4)), PS)), B, LR_B); a.Jz(B, Z_SHORT); a.Jmp(Z_REPLEN);
     a.Label(Z_MTF); a.HMtf(LR_H0, 4, SL);
     a.Label(Z_REPLEN);
-    a.Mode(kCodePrice); a.Set(LR_V, a.SUB(L, a.C(2))); a.Mode(0); LzLen(a, S_REPLEN, Z_LEN0);
-    a.Mode(kDecode); a.Set(LR_L, a.ADD(a.R(LR_V), a.C(2))); a.Set(LR_D, a.C(0)); a.Mode(0);
+    a.Mode(kCodePrice); a.Set(LR_V, a.SUB(L, a.C(2))); a.Mode(0); LzLen(a, S_REPLEN, Z_LEN0, PS);
+    a.Mode(kDecode); a.Set(LR_L, a.ADD(a.R(LR_V), a.C(2))); a.Set(LR_D, a.C(0)); a.Dec(LR_L); a.Dec(LR_SL); a.Dec(LR_D); a.Mode(0);
     a.Set(LR_S, a.TB(2, S)); a.OutCopy(L, a.ADD(H0, a.C(1))); a.Ret();
-    a.Label(Z_SHORT); a.Mode(kDecode); a.Set(LR_L, a.C(1)); a.Set(LR_D, a.C(0)); a.Mode(0); a.Set(LR_S, a.TB(3, S)); a.OutCopy(a.C(1), a.ADD(H0, a.C(1))); a.Ret();
+    a.Label(Z_SHORT); a.Mode(kDecode); a.Set(LR_L, a.C(1)); a.Set(LR_D, a.C(0)); a.Dec(LR_L); a.Dec(LR_SL); a.Dec(LR_D); a.Mode(0);
+    a.Set(LR_S, a.TB(3, S)); a.OutCopy(a.C(1), a.ADD(H0, a.C(1))); a.Ret();
     a.Label(Z_MATCH); a.Mode(kDecode); a.Set(LR_SL, a.C(kNoSlot)); a.Mode(0); a.Set(LR_S, a.TB(1, S));
-    a.Mode(kCodePrice); a.Set(LR_V, a.SUB(L, a.C(2))); a.Mode(0); LzLen(a, S_LEN, Z_LEN0 + 3);
+    a.Mode(kCodePrice); a.Set(LR_V, a.SUB(L, a.C(2))); a.Mode(0); LzLen(a, S_LEN, Z_LEN0 + 3, PS);
     a.Mode(kDecode); a.Set(LR_L, a.ADD(a.R(LR_V), a.C(2))); a.Mode(0);
-    const uint16_t LTPS = a.SUB(a.SUB(L, a.C(2)), a.MUL(a.GE(L, a.C(6)), a.SUB(L, a.C(5))));
+    const uint16_t LTPS = a.TB(4, L);                                    // min(L - 2, 3): a table, so the slot index is affine
     a.Mode(kCodePrice); a.Set(LR_T0, a.X1(EX_LOG2SLOT, D)); a.Mode(0);
     a.Tree(a.ADD(a.C(S_POSSLOT), a.SHL(LTPS, a.C(6))), 6, T0, LR_T0);
     a.Jz(a.GE(T0, a.C(4)), Z_SMALL);
@@ -153,7 +156,8 @@ Description LzmaDescription(int lc, int lp, int pb, uint32_t dict, bool hasEnd) 
     a.Direct(a.SUB(FB, a.C(4)), a.SHR(a.SUB(D, BASE), a.C(4)), LR_T1); a.RTree(a.C(S_ALIGN), 4, a.AND(a.SUB(D, BASE), a.C(15)), LR_T2);
     a.Mode(kDecode); a.Set(LR_D, a.ADD(BASE, a.ADD(a.SHL(a.R(LR_T1), a.C(4)), a.R(LR_T2)))); a.Mode(0); a.Jmp(Z_PUSH);
     a.Label(Z_SMALL); a.Mode(kDecode); a.Set(LR_D, T0); a.Mode(0);
-    a.Label(Z_PUSH); a.Jz(a.NE(D, a.C(0xFFFFFFFFu)), Z_ENDTOK);
+    a.Label(Z_PUSH); a.Mode(kDecode); a.Dec(LR_L); a.Dec(LR_SL); a.Dec(LR_D); a.Mode(0);
+    a.Jz(a.NE(D, a.C(0xFFFFFFFFu)), Z_ENDTOK);
     a.HPush(LR_H0, 4, D); a.OutCopy(L, a.ADD(D, a.C(1))); a.Ret();
     a.Label(Z_ENDTOK); a.Set(LR_K, a.C(2)); a.Ret();
     a.Label(Z_LIT);
@@ -164,13 +168,13 @@ Description LzmaDescription(int lc, int lp, int pb, uint32_t dict, bool hasEnd) 
     a.MLit(LITCTX, a.R(LR_CUR), a.X1(EX_BYTE, a.SUB(a.SUB(P, H0), a.C(1))), LR_CUR); a.Jmp(Z_LE);
     a.Label(Z_PLAIN); a.Tree(LITCTX, 8, a.R(LR_CUR), LR_CUR);
     a.Label(Z_LE); a.Set(LR_S, a.TB(0, S));
-    a.Mode(kDecode); a.Set(LR_L, a.C(1)); a.Set(LR_SL, a.C(kNoSlot)); a.Set(LR_D, a.C(0)); a.Mode(0);
     a.OutLit(a.R(LR_CUR)); a.Ret();
     a.link();
     Description d = std::move(a.d);
     d.name = "LZMA"; d.coder = kRange; d.shift = 5; d.nslots = S_LIT + (0x300u << (lc + lp));
+    std::vector<uint32_t> ltps(274); for (uint32_t l = 0; l < 274; ++l) ltps[l] = l < 2 ? 0 : std::min<uint32_t>(l - 2, 3);
     d.tables = {std::vector<uint32_t>(kLitNext, kLitNext + 12), std::vector<uint32_t>(kMatchNext, kMatchNext + 12),
-                std::vector<uint32_t>(kRepNext, kRepNext + 12), std::vector<uint32_t>(kShortNext, kShortNext + 12)};
+                std::vector<uint32_t>(kRepNext, kRepNext + 12), std::vector<uint32_t>(kShortNext, kShortNext + 12), ltps};
     d.entryStream = (uint16_t)a.lab[Z_STREAM]; d.entryToken = a.lab[Z_TOK];
     d.window = dict; d.maxlen = 273; d.len1slot = 0; d.histbase = LR_H0; d.histlen = 4; d.tokK = LR_K; d.tokL = LR_L; d.tokSL = LR_SL; d.tokD = LR_D;
     return d;
@@ -186,8 +190,8 @@ Description DeflateDescription() {
     for (int v = 0; v < 256; ++v) { int s = 28; while ((uint32_t)(v + 3) < LBASE[s]) --s; lsym[(size_t)v] = (uint32_t)s; }
     for (int k = 0; k < 288; ++k) fixl[(size_t)k] = k < 144 ? 8 : k < 256 ? 9 : k < 280 ? 7 : 8;
     Asm a;
-    const uint16_t P = a.R(kRegPlace), K = a.R(DR_K), L = a.R(DR_L), D = a.R(DR_D), BF = a.R(DR_BF), BT = a.R(DR_BT), SYM = a.R(DR_SYM), Cc = a.R(DR_C), E = a.R(DR_E), DC = a.R(DR_DC);
-    const uint16_t N = a.R(DR_N), I = a.R(DR_I), HLIT = a.R(DR_HLIT), HDIST = a.R(DR_HDIST), HCLEN = a.R(DR_HCLEN), Rr = a.R(DR_R), T = a.R(DR_T), LEN = a.R(DR_LEN), NLEN = a.R(DR_NLEN), B = a.R(DR_B);
+    const uint16_t K = a.R(DR_K), L = a.R(DR_L), D = a.R(DR_D), BF = a.R(DR_BF), BT = a.R(DR_BT), SYM = a.R(DR_SYM), Cc = a.R(DR_C), E = a.R(DR_E), DC = a.R(DR_DC);
+    const uint16_t N = a.R(DR_N), I = a.R(DR_I), HLIT = a.R(DR_HLIT), HDIST = a.R(DR_HDIST), HCLEN = a.R(DR_HCLEN), Rr = a.R(DR_R), T = a.R(DR_T), LEN = a.R(DR_LEN), NLEN = a.R(DR_NLEN);
     const uint16_t PAD = a.AND(a.SUB(a.C(8), a.X1(EX_BITPOS, 0)), a.C(7)), ONE = a.C(1);
     a.Label(G_STREAM); a.Label(G_BLOCK); a.Mark();
     a.RawF(a.C(1), DR_BF); a.RawF(a.C(2), DR_BT); a.Assert(a.NE(BT, a.C(3)));
@@ -195,18 +199,16 @@ Description DeflateDescription() {
     a.Build(0, DA_FIXL, a.C(0), a.C(288)); a.Build(1, DA_FIXD, a.C(0), a.C(30)); a.Jmp(G_TOKENS);
     a.Label(G_DYN); a.Call(G_DYNHDR);
     a.Label(G_TOKENS); a.Mark();
-    a.Mode(kCode); a.Dec(DR_K); a.Dec(DR_L); a.Dec(DR_D); a.Mode(0);
+    a.Mode(kCode); a.Dec(DR_RUN); a.Dec(DR_K); a.Dec(DR_L); a.Dec(DR_D); a.Mode(0);
     a.Call(G_TOK);
-    a.Mode(kDecode); a.Dec(DR_K); a.Dec(DR_L); a.Dec(DR_D); a.Mode(0);
+    a.Mode(kDecode); a.Dec(DR_RUN); a.Dec(DR_K); a.Dec(DR_L); a.Dec(DR_D); a.Mode(0);
     a.Jz(a.EQ(K, a.C(2)), G_TOKENS);
     a.Label(G_BEND); a.Jz(BF, G_BLOCK);
     a.Set(DR_N, PAD); a.RawF(N, DR_T); a.Mode(kDecode); a.Assert(a.EQ(a.X1(EX_INLEFT, 0), a.C(0))); a.Mode(0); a.Flush(); a.End();
     a.Label(G_STORED);
     a.Set(DR_N, PAD); a.RawF(N, DR_T); a.RawF(a.C(16), DR_LEN);
     a.Mode(kCodePrice); a.Set(DR_NLEN, a.XOR(LEN, a.C(0xFFFF))); a.Mode(0); a.Raw(a.C(16), NLEN, DR_NLEN); a.Assert(a.EQ(NLEN, a.XOR(LEN, a.C(0xFFFF))));
-    a.Set(DR_I, a.C(0));
-    a.Label(G_SLOOP); a.Mark(); a.Jz(a.LT(I, LEN), G_BEND);
-    a.Mode(kCodePrice); a.Set(DR_B, a.X1(EX_BYTE, P)); a.Mode(0); a.Raw(a.C(8), B, DR_B); a.OutLit(B); a.Set(DR_I, a.ADD(I, ONE)); a.Jmp(G_SLOOP);
+    a.ByteRun(LEN); a.Jmp(G_BEND);
     a.Label(G_DYNHDR);
     a.RawF(a.C(5), DR_HLIT); a.RawF(a.C(5), DR_HDIST); a.RawF(a.C(4), DR_HCLEN); a.Assert(a.LT(HLIT, a.C(30))); a.Assert(a.LT(HDIST, a.C(30)));
     a.Set(DR_I, a.C(0));
@@ -228,15 +230,14 @@ Description DeflateDescription() {
     a.Label(G_LLDONE); a.Assert(a.NE(a.AR(DA_LENS, a.C(256)), a.C(0)));
     a.Build(0, DA_LENS, a.C(0), a.ADD(HLIT, a.C(257))); a.Build(1, DA_LENS, a.ADD(HLIT, a.C(257)), a.ADD(HDIST, ONE)); a.Ret();
     a.Label(G_TOK);
-    // kind 0 literal, 1 copy, 2 end of block, 3 a copy of 258 spelled 284 + 31 (deflate's one non-canonical spelling: a true
-    // choice, so a decision)
-    a.Mode(kCodePrice); a.Jz(K, G_TLIT); a.Jz(a.NE(K, a.C(2)), G_TEOB);
+    // a run of literals, then what ends it: kind 1 a copy, 2 the end of the block, 3 a copy of 258 spelled 284 + 31
+    // (deflate's one non-canonical spelling: a true choice, so a decision)
+    a.Mode(kCodePrice); a.Jz(a.NE(K, a.C(2)), G_TEOB);
     a.Set(DR_SYM, a.ADD(a.MUL(a.EQ(K, a.C(3)), a.C(284)), a.MUL(a.NE(K, a.C(3)), a.ADD(a.C(257), a.TB(DT_LSYM, a.SUB(L, a.C(3))))))); a.Jmp(G_TCODE);
-    a.Label(G_TEOB); a.Set(DR_SYM, a.C(256)); a.Jmp(G_TCODE);
-    a.Label(G_TLIT); a.Set(DR_SYM, a.X1(EX_BYTE, P));
+    a.Label(G_TEOB); a.Set(DR_SYM, a.C(256));
     a.Mode(0); a.Label(G_TCODE);
-    a.Huff(0, SYM, DR_SYM);
-    a.Jz(a.GE(SYM, a.C(256)), G_LIT); a.Jz(a.NE(SYM, a.C(256)), G_EOB);
+    a.HuffRun(0, a.R(DR_RUN), DR_RUN, DR_SYM, a.C(256));
+    a.Jz(a.NE(SYM, a.C(256)), G_EOB);
     a.Assert(a.LT(SYM, a.C(286)));
     a.Set(DR_C, a.SUB(SYM, a.C(257)));
     a.Mode(kCodePrice); a.Set(DR_E, a.SUB(L, a.TB(DT_LBASE, Cc))); a.Mode(0);
@@ -248,7 +249,6 @@ Description DeflateDescription() {
     a.Raw(a.TB(DT_DEXT, DC), E, DR_E);
     a.Mode(kDecode); a.Set(DR_D, a.ADD(a.TB(DT_DBASE, DC), E)); a.Set(DR_K, a.ADD(ONE, a.MUL(a.C(2), a.AND(a.EQ(Cc, a.C(27)), a.EQ(L, a.C(258)))))); a.Mode(0);
     a.OutCopy(L, D); a.Ret();
-    a.Label(G_LIT); a.Mode(kDecode); a.Set(DR_K, a.C(0)); a.Set(DR_L, ONE); a.Set(DR_D, a.C(0)); a.Mode(0); a.OutLit(SYM); a.Ret();
     a.Label(G_EOB); a.Mode(kDecode); a.Set(DR_K, a.C(2)); a.Set(DR_L, a.C(0)); a.Set(DR_D, a.C(0)); a.Mode(0); a.Ret();
     a.link();
     Description d = std::move(a.d);
@@ -263,7 +263,7 @@ Description DeflateDescription() {
 
 Description Lz4BlockDescription() {
     Asm a;
-    const uint16_t P = a.R(kRegPlace), LIT = a.R(QR_LIT), ML = a.R(QR_ML), OFF = a.R(QR_OFF), TK = a.R(QR_TK), Rr = a.R(QR_R), B = a.R(QR_B), I = a.R(QR_I);
+    const uint16_t LIT = a.R(QR_LIT), ML = a.R(QR_ML), OFF = a.R(QR_OFF), TK = a.R(QR_TK), Rr = a.R(QR_R), B = a.R(QR_B);
     const uint16_t F15 = a.C(15), B255 = a.C(255);
     auto MIN15 = [&](uint16_t x) { return a.SUB(x, a.MUL(a.GE(x, a.C(16)), a.SUB(x, F15))); };
     auto MIN255 = [&](uint16_t x) { return a.SUB(x, a.MUL(a.GE(x, a.C(256)), a.SUB(x, B255))); };
@@ -279,10 +279,7 @@ Description Lz4BlockDescription() {
     a.Raw(a.C(8), B, QR_B);
     a.Mode(kDecode); a.Set(QR_LIT, a.ADD(LIT, B)); a.Mode(0);
     a.Jz(a.EQ(B, B255), Q_LITS); a.Jmp(Q_LX);
-    a.Label(Q_LITS); a.Set(QR_I, a.C(0));
-    a.Label(Q_LL); a.Jz(a.LT(I, LIT), Q_LDONE);
-    a.Mode(kCodePrice); a.Set(QR_B, a.X1(EX_BYTE, P)); a.Mode(0); a.Raw(a.C(8), B, QR_B); a.OutLit(B); a.Set(QR_I, a.ADD(I, a.C(1))); a.Jmp(Q_LL);
-    a.Label(Q_LDONE);
+    a.Label(Q_LITS); a.ByteRun(LIT);
     a.Mode(kDecode); a.Jz(a.X1(EX_INLEFT, 0), Q_LAST);
     a.Mode(kCode); a.Jz(ML, Q_ENDC);
     a.Mode(0);

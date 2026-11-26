@@ -27,7 +27,7 @@
 
 namespace coding {
 
-constexpr uint32_t kIsa = 2;          // the instruction set a description may use; newer is refused
+constexpr uint32_t kIsa = 3;          // the instruction set a description may use; newer is refused (3: HUFFRUN, BYTERUN)
 constexpr int kRegs = 64;
 constexpr int kRegPlace = 0;          // register 0: the place in the content
 constexpr uint32_t kNoSlot = 255;
@@ -63,6 +63,11 @@ enum OpCode : uint8_t {
     OP_FLUSH,    // the coder writes out what it holds
     OP_MARK,     // a place where a checkpoint may be taken (between whole decisions)
     OP_END,
+    // ---- ISA 3: runs (22.12 flattening: a run of literals is one op, not one program per byte)
+    OP_HUFFRUN,  // a run of literals through code imm: CODE emits x content bytes then the terminating symbol in register nb;
+                 // DECODE reads symbols below m as literals (into the content) until one is not, which goes to register nb;
+                 // register tgt gets the run's length either way
+    OP_BYTERUN,  // x content bytes through the bit coder as they are (byte-aligned: copied whole)
     OP_COUNT
 };
 constexpr uint8_t kFree = 1;          // op flag: its value is a decision
@@ -99,6 +104,12 @@ Description LzmaDescription(int Lc, int Lp, int Pb, uint32_t Dict, bool EndMarke
 Description DeflateDescription();
 Description Lz4BlockDescription();
 
+// The checkpoint spacing a description suits: a coder without adaptive state (static codes, raw bytes) checkpoints
+// cheaply, so often (every block or so: a read starts at most that far back, and segments decode in parallel); one
+// with adaptive slots carries them in every checkpoint, so less often.
+// `Shipped` (the stream's size, 0 unknown) lets a small stream still split into enough segments to decode in parallel.
+uint64_t SuggestedSpacing(const Description &D, uint64_t Shipped = 0);
+
 // Mint: decode `Shipped` with `D` into its content and a RECORD (the decisions, plus checkpoints every `Spacing`
 // shipped bytes at the description's MARK points), then code it back and refuse unless every byte matches.
 // `ContentSize` is the expected content size (0: unknown, at most `ContentCap`).
@@ -106,17 +117,26 @@ bool Mint(const Description &D, const uint8_t *Shipped, size_t N, size_t Content
           std::vector<uint8_t> &Content, std::vector<uint8_t> &Record, std::string &Err);
 
 // A shipped stream served from a description, its content and its record: random access through the record's
-// checkpoints, safe for concurrent reads, nothing resident but the parsed description and the checkpoint index.
+// checkpoints, safe for concurrent reads. A reader going front to back (a game loading a bundle) is served by
+// READ-AHEAD: every checkpoint segment decodes on its own, so a shared pool of threads decodes the segments after the
+// one being read while it is read; decoded segments are kept in a small RAM ring, a few per stream, never on disk.
 class CodedByteSource : public ByteSource {
 public:
+    // ShippedSize: the size the caller expects (0: the record's own, which is always checked against it).
     static std::shared_ptr<CodedByteSource> Create(std::shared_ptr<ByteSource> Desc, std::shared_ptr<ByteSource> Record,
                                                    std::shared_ptr<ByteSource> Content, uint64_t ShippedSize, std::string &Err);
     ssize_t  pread(void *Buf, size_t N, uint64_t Off) override;
+    // [Off, Off+N) will be read soon: its segments are asked of the pool now, so a layer above that reads this one front
+    // to back finds them decoded (layers PIPELINE: every layer decodes ahead of the one reading it)
+    void     prefetch(uint64_t Off, uint64_t N) override;
     uint64_t size() const override { return Size; }
     size_t   checkpoints() const { return Cks.size(); }       // (tests)
+    uint64_t segmentsDecoded() const;                          // (tests, benchmarks: work done, against checkpoints())
+    uint64_t bytesGenerated() const;                           // (tests: bytes segments generated; copy runs are handed down, not counted)
     struct Ck { uint64_t out = 0, rec = 0, recLen = 0, dec = 0; };
     struct Impl;
 private:
+    static void remember(Impl &M, uint64_t Off, size_t N);   // where a read ended (read-ahead for readers going front to back)
     std::shared_ptr<Impl> I;
     std::shared_ptr<ByteSource> Rec, Content;
     std::vector<Ck> Cks;

@@ -74,6 +74,7 @@ bool ParseSpecText(const std::string &Text, Spec &Out, std::string &Err)
             else if (Type == "zip")   LS.type = LayerType::Zip;
             else if (Type == "file")  LS.type = LayerType::File;
             else if (Type == "delta") LS.type = LayerType::Delta;   // a .vgdelta over the earlier layers it names (`bases`)
+            else if (Type == "coded") LS.type = LayerType::Coded;   // a stream coded back from its content (`bases`) and decisions
             else { Err = "unknown layer type: " + Type; return false; }
             LS.source  = L.at("source").get<std::string>();
             LS.target  = NormalizeVPath(L.value("target", std::string()));
@@ -84,16 +85,17 @@ bool ParseSpecText(const std::string &Text, Spec &Out, std::string &Err)
             const size_t Self = Out.layers.size();
             const auto Bad = [&](const std::string &Why) { Err = "layer " + std::to_string(Self) + ": " + Why; return false; };
             //A layer of bytes — a zip, a delta, a single file (a disc image a delta is built over): what a delta names by CID.
-            const bool Bytes = LS.type == LayerType::Zip || LS.type == LayerType::Delta || LS.type == LayerType::File;
+            const bool Bytes = LS.type == LayerType::Zip || LS.type == LayerType::Delta || LS.type == LayerType::File || LS.type == LayerType::Coded;
+            const bool Rebuilt = LS.type == LayerType::Delta || LS.type == LayerType::Coded;
             if (L.contains("cid"))
             {
                 if (!Bytes) return Bad("only a zip, a delta or a file has a cid");
                 if (!L["cid"].is_string() || L["cid"].get<std::string>().empty()) return Bad("cid must be a non-empty string");
                 LS.cid = L["cid"].get<std::string>();
             }
-            if (L.contains("bases") != (LS.type == LayerType::Delta))
-                return Bad(L.contains("bases") ? "only a delta has bases" : "a delta must name its bases");
-            if (LS.type == LayerType::Delta)
+            if (L.contains("bases") != Rebuilt)
+                return Bad(L.contains("bases") ? "only a delta or a coded stream has bases" : "a delta or a coded stream must name its bases");
+            if (Rebuilt)
             {
                 if (!L["bases"].is_array()) return Bad("bases must be an array of CIDs");   // empty: the plan reports it
                 for (const auto &B : L["bases"])
@@ -104,11 +106,20 @@ bool ParseSpecText(const std::string &Text, Spec &Out, std::string &Err)
                     LS.bases.push_back(B.get<std::string>());
                 }
             }
+            if (LS.type == LayerType::Coded)
+            {
+                if (LS.bases.size() != 1) return Bad("a coded stream names exactly one base: its content");
+                if (!L.contains("description") || !L["description"].is_string() || L["description"].get<std::string>().empty()) return Bad("a coded stream needs its description");
+                if (!L.contains("name") || !L["name"].is_string() || NormalizeVPath(L["name"].get<std::string>()).empty()) return Bad("a coded stream needs the name it appears by");
+                LS.description = L["description"].get<std::string>();
+                LS.name = NormalizeVPath(L["name"].get<std::string>());
+            }
+            else if (L.contains("description") || L.contains("name")) return Bad("only a coded stream has a description and a name");
             LS.rw      = L.value("rw", false);
             LS.bytesOnly = L.value("bytesOnly", false);
             LS.fixed   = L.value("fixed", false);
             if (LS.bytesOnly && !Bytes)
-                return Bad("only a zip, a delta or a file can be bytes-only");
+                return Bad("only a zip, a delta, a file or a coded stream can be bytes-only");
             // SUBMOUNTS: array of Docker-style "src:dst" strings → (source,target) pairs (split on first ':').
             if (L.contains("submounts") && L["submounts"].is_array())
                 for (const auto &E : L["submounts"])

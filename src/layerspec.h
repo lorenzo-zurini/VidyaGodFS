@@ -10,7 +10,7 @@
 //one per launch (TempPath/vidyagodfs.spec.json) describing an ordered, target-rooted layer stack;
 //the helper serves the merged tree from it. See the plan / README for the format.
 
-enum class LayerType { Dir, Zip, File, Delta };
+enum class LayerType { Dir, Zip, File, Delta, Coded };
 
 struct LayerSpec {
     LayerType   type = LayerType::Dir;
@@ -34,7 +34,12 @@ struct LayerSpec {
     //answered from one listing taken at the mount (a small enough one). A folder another mount fills, or the user's,
     //is not: each lookup asks the host.
     bool        fixed = false;
-    bool        bytesOnly = false;   // zip/delta/file: read as a later delta's base, surfacing nowhere (a TAKE shows none of it)
+    bool        bytesOnly = false;   // zip/delta/file/coded: read as a later delta's base, surfacing nowhere (a TAKE shows none of it)
+    //CODED only: a compressed stream served from its decoded content (the one CID in `bases`, any layer carrying bytes:
+    //a file, a delta's rebuild) and its decisions (`source`, the record) through a format description (a file: data,
+    //never code — MetaPackageFormat 22.15). It appears as one file, `name`, in its target folder, and hides nothing.
+    std::string description;
+    std::string name;
 };
 
 //Bytes a launch puts into a file a lower layer serves (a BinaryPatch the app resolved against it): every read of the

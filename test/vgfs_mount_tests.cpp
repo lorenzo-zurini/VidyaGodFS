@@ -7,6 +7,7 @@
 //
 // Usage: vgfs_mount_tests <path to vidyagodfs>. Exits 77 (ctest SKIP) where FUSE cannot be mounted at all.
 
+#include "test_guard.h"
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -520,6 +521,7 @@ TEST(a_spawner_already_gone_gets_no_mount) {
 
 int main(int argc, char **argv)
 {
+    GuardTestProcess();
     if (argc < 2) { std::cerr << "usage: vgfs_mount_tests <path to vidyagodfs>\n"; return 2; }
     g_helper = argv[1];
     // FUSE needs the device and the setuid mount helper; a container without them cannot run this suite at all.

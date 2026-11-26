@@ -130,6 +130,21 @@ bool VfsState::Init(const Spec &S, std::string &Err)
     //hides. Then the bytes of each layer that surfaces, built on demand — a delta over its bases' bytes, released as
     //soon as no surfacing layer or unbuilt delta needs them. A delta that turns out not to rebuild hides nothing: the
     //plan is made again with it broken, so what it would have hidden surfaces — and again, while that finds more.
+    //A coded stream appears as ONE stored file, its `name`, in its target folder: an index of one entry over its bytes.
+    const auto CodedIndex = [](std::shared_ptr<ByteSource> Src, const LayerSpec &LS) {
+        auto Z = std::make_shared<ZipIndex>(); Z->archivePath = LS.source; Z->src = Src;
+        ZipEntry E; E.name = LS.name; E.size = Src->size(); E.stored = true; E.dataOffset = 0;
+        for (std::string Cur = LS.name;;)
+        {
+            const size_t Sl = Cur.find_last_of('/');
+            const std::string Parent = Sl == std::string::npos ? std::string() : Cur.substr(0, Sl), Child = Sl == std::string::npos ? Cur : Cur.substr(Sl + 1);
+            Z->dirChildren[Parent].insert(Child);
+            if (Parent.empty()) break;
+            Cur = Parent;
+        }
+        Z->byName.emplace(LS.name, E);
+        return Z;
+    };
     TreePlan P = PlanTree(S);
     for (const std::string &Why : P.problems) std::cerr << "[vidyagodfs] " << Why << " — it is left out\n";
     //What indexing reads first, asked for at once: an archive's central directory at its end, a delta's header and
@@ -163,8 +178,9 @@ bool VfsState::Init(const Spec &S, std::string &Err)
         for (size_t I = 0; I < S.layers.size(); ++I)
         {
             const LayerSpec &LS = S.layers[I];
-            if ((LS.type != LayerType::Zip && LS.type != LayerType::Delta) || P.whole[I] || Index[I] || Failed[I]) continue;
-            if (LS.type == LayerType::Delta && P.broken[I]) continue;
+            const bool Coded = LS.type == LayerType::Coded;
+            if ((LS.type != LayerType::Zip && LS.type != LayerType::Delta && !Coded) || P.whole[I] || Index[I] || Failed[I]) continue;
+            if ((LS.type == LayerType::Delta || Coded) && P.broken[I]) continue;
             std::string Why;
             std::shared_ptr<ByteSource> Src = Bytes.Get(I, &Why);
             if (!Src)
@@ -173,7 +189,7 @@ bool VfsState::Init(const Spec &S, std::string &Err)
                 if (Bytes.Failed(I)) { Failed[I] = true; NewFailure = true; }
                 continue;
             }
-            Index[I] = BuildZipIndex(Src, LS.source);
+            Index[I] = Coded ? CodedIndex(Src, LS) : BuildZipIndex(Src, LS.source);
             if (!Index[I]) std::cerr << "[vidyagodfs] skipping unreadable zip layer: " << LS.source << "\n";
         }
         for (size_t I = 0; I < S.layers.size(); ++I)          // a delta read only as a base can fail too
@@ -185,7 +201,7 @@ bool VfsState::Init(const Spec &S, std::string &Err)
     for (size_t gi = 0; gi < S.layers.size(); ++gi)
     {
         const LayerSpec &LS = S.layers[gi];
-        const bool Archive = LS.type == LayerType::Zip || LS.type == LayerType::Delta;
+        const bool Archive = LS.type == LayerType::Zip || LS.type == LayerType::Delta || LS.type == LayerType::Coded;
         if (Archive && (P.whole[gi] || !Index[gi])) continue;   // a byte input only, or nothing to serve
         for (const auto &[sub, tgt] : P.mounts[gi])
         {
