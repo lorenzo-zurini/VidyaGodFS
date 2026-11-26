@@ -78,6 +78,14 @@ set_target_properties(vidyagodfs PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 target_link_libraries(vidyagodfs PRIVATE vgfs_core)
 target_compile_options(vidyagodfs PRIVATE ${VGFS_WARNINGS} $<$<BOOL:${VGFS_WERROR}>:-Werror>)
 
+# vgcode: the coding algebra from the command line (mint, verify, rebuild coded streams)
+if(NOT WIN32)
+    add_executable(vgcode tools/vgcode.cpp)
+    set_target_properties(vgcode PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    target_link_libraries(vgcode PRIVATE vgfs_core)
+    target_compile_options(vgcode PRIVATE ${VGFS_WARNINGS} $<$<BOOL:${VGFS_WERROR}>:-Werror>)
+endif()
+
 if(WIN32)
     # WinFsp's FUSE-compatibility layer (<fuse3/fuse.h>): header-only glue whose static inlines
     # load winfsp-x64.dll at runtime, so we only need its include dir — no import lib for the FUSE API.

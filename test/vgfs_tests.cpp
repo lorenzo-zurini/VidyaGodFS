@@ -20,6 +20,7 @@
 #include <lzma.h>
 #include <lz4.h>
 #include <lz4hc.h>
+#include <lz4frame.h>
 #include <zstd.h>
 #include <chrono>
 #include <zlib.h>
@@ -3645,6 +3646,104 @@ TEST(a_hostile_record_or_oversized_description_is_refused) {
 // A coded stream MOUNTS: its content is any layer carrying bytes (here a bytes-only file, named by CID), its record and
 // description are files; it appears as one file at its name, serves the shipped bytes exactly, hides nothing, and a
 // spec that names a content no layer carries is planned as broken, not mounted wrong.
+// ---- BSA 105 (Skyrim Special Edition), from its description: an archive made here, member by member
+struct BsaMember { std::string name; std::vector<uint8_t> data; bool flip = false; int frameFlags = 0; };
+// frameFlags: 1 = block checksums, 2 = content checksum, 4 = content size, 8 = linked blocks, 16 = 64 KiB blocks
+static std::vector<uint8_t> lz4Frame(const std::vector<uint8_t> &in, int ff) {
+    LZ4F_preferences_t p{}; p.frameInfo.blockSizeID = ff & 16 ? LZ4F_max64KB : LZ4F_max4MB;
+    p.frameInfo.blockMode = ff & 8 ? LZ4F_blockLinked : LZ4F_blockIndependent;
+    p.frameInfo.contentChecksumFlag = ff & 2 ? LZ4F_contentChecksumEnabled : LZ4F_noContentChecksum;
+    p.frameInfo.blockChecksumFlag = ff & 1 ? LZ4F_blockChecksumEnabled : LZ4F_noBlockChecksum;
+    p.frameInfo.contentSize = ff & 4 ? in.size() : 0; p.compressionLevel = ff & 8 ? 9 : 0;
+    std::vector<uint8_t> out(LZ4F_compressFrameBound(in.size(), &p));
+    const size_t n = LZ4F_compressFrame(out.data(), out.size(), in.data(), in.size(), &p);
+    out.resize(LZ4F_isError(n) ? 0 : n); return out;
+}
+// Returns the archive; `content` gets what the description must decode it to (header region, then each member's bytes).
+static std::vector<uint8_t> makeBsa(const std::vector<std::pair<std::string, std::vector<BsaMember>>> &folders, uint32_t flags,
+                                    std::vector<uint8_t> &content, bool shuffle = false) {
+    auto u32 = [](std::vector<uint8_t> &v, uint32_t x) { for (int i = 0; i < 4; ++i) v.push_back((uint8_t)(x >> 8 * i)); };
+    auto u64 = [&](std::vector<uint8_t> &v, uint64_t x) { u32(v, (uint32_t)x); u32(v, (uint32_t)(x >> 32)); };
+    uint32_t nfiles = 0, tfn = 0, tfin = 0;
+    for (auto &f : folders) { nfiles += (uint32_t)f.second.size(); tfn += (uint32_t)f.first.size() + 1; for (auto &m : f.second) tfin += (uint32_t)m.name.size() + 1; }
+    std::vector<uint8_t> h; u32(h, 0x00415342); u32(h, 105); u32(h, 36); u32(h, flags);
+    u32(h, (uint32_t)folders.size()); u32(h, nfiles); u32(h, tfn); u32(h, tfin); u32(h, 0);
+    const uint32_t region = 36 + (uint32_t)folders.size() * 24 + (flags & 1 ? tfn + (uint32_t)folders.size() : 0) + nfiles * 16 + (flags & 2 ? tfin : 0);
+    // member bytes, in data order
+    std::vector<std::vector<uint8_t>> stored, decoded;
+    for (auto &f : folders) for (auto &m : f.second) {
+        const bool comp = ((flags >> 2) & 1) ^ m.flip;
+        std::vector<uint8_t> s, d;
+        if (flags & 0x100) { const std::string full = f.first + "\\" + m.name; s.push_back((uint8_t)full.size()); s.insert(s.end(), full.begin(), full.end()); d = s; }
+        if (comp) { u32(s, (uint32_t)m.data.size()); const auto fr = lz4Frame(m.data, m.frameFlags); s.insert(s.end(), fr.begin(), fr.end()); }
+        else s.insert(s.end(), m.data.begin(), m.data.end());
+        d.insert(d.end(), m.data.begin(), m.data.end());
+        stored.push_back(s); decoded.push_back(d);
+    }
+    std::vector<uint32_t> at; uint32_t o = region; for (auto &s : stored) { at.push_back(o); o += (uint32_t)s.size(); }
+    if (shuffle && at.size() > 1) std::swap(at[0], at[1]);                // records no longer in data order
+    size_t k = 0; uint32_t recOff = 36 + (uint32_t)folders.size() * 24;
+    std::vector<uint8_t> recs;
+    for (auto &f : folders) {
+        u64(h, 0x1234 + k); u32(h, (uint32_t)f.second.size()); u32(h, 0); u64(h, recOff + tfin + (uint32_t)recs.size());
+        if (flags & 1) { recs.push_back((uint8_t)(f.first.size() + 1)); recs.insert(recs.end(), f.first.begin(), f.first.end()); recs.push_back(0); }
+        for (auto &m : f.second) { u64(recs, 0x9876 + k); u32(recs, (uint32_t)stored[k].size() | (m.flip ? 1u << 30 : 0)); u32(recs, at[k]); ++k; }
+    }
+    h.insert(h.end(), recs.begin(), recs.end());
+    if (flags & 2) for (auto &f : folders) for (auto &m : f.second) { h.insert(h.end(), m.name.begin(), m.name.end()); h.push_back(0); }
+    content = h; std::vector<uint8_t> bsa = h;
+    for (size_t i = 0; i < stored.size(); ++i) { bsa.insert(bsa.end(), stored[i].begin(), stored[i].end()); content.insert(content.end(), decoded[i].begin(), decoded[i].end()); }
+    return bsa;
+}
+
+// Skyrim SE's archives decode to their header region and every member's bytes, and are coded back bit-exact from
+// those and the decisions: compressed and stored members (bit 30 flips one), every LZ4 frame option, embedded names.
+TEST(a_bsa_archive_is_served_through_its_description) {
+    const auto bsaD = coding::BsaDescription();
+    {   const auto bytes = coding::Serialize(bsaD); coding::Description back; std::string err;
+        CHECK(coding::Parse(bytes.data(), bytes.size(), back, err)); CHECK(coding::Serialize(back) == bytes); }
+    int cases = 0;
+    for (uint32_t flags : {0x7u, 0x3u, 0x107u}) {
+        std::vector<std::pair<std::string, std::vector<BsaMember>>> f = {
+            {"textures\\armor", {{"iron.dds", sampleContent(0, 70000, 3), false, 0}, {"steel.dds", sampleContent(1, 300000, 4), false, 1 | 2 | 4},
+                                 {"glass.dds", sampleContent(2, 5000, 5), true, 0}}},
+            {"meshes", {{"a.nif", sampleContent(3, 140000, 6), false, 8 | 16}, {"empty.nif", {}, false, 0}, {"b.nif", sampleContent(0, 90000, 7), false, 16 | 1}}}};
+        std::vector<uint8_t> want; const auto bsa = makeBsa(f, flags, want);
+        auto src = codedSource(bsaD, bsa.data(), bsa.size(), want, 4096);
+        CHECK(src != nullptr); if (!src) continue;
+        CHECK(src->checkpoints() >= (flags & 4 ? 12u : 4u));                  // members (and LZ4 sequences) are checkpoints
+        CHECK(coding::SuggestedSpacing(bsaD, bsa.size()) >= 4096);            // static coder: cheap checkpoints, but not per byte
+        CHECK(readsBack(*src, bsa, flags, 60)); ++cases;
+        // the streaming mint into a caller's buffer gives the same content and a record that serves the same bytes
+        std::vector<uint8_t> buf(want.size() + 64), rec; size_t len = 0; std::string err;
+        CHECK(coding::MintInto(bsaD, bsa.data(), bsa.size(), 0, buf.data(), buf.size(), 4096, len, rec, err));
+        CHECK(len == want.size() && std::equal(want.begin(), want.end(), buf.begin()));
+        std::vector<uint8_t> small(want.size() / 2);                          // too small a buffer is refused, never overrun
+        CHECK(!coding::MintInto(bsaD, bsa.data(), bsa.size(), 0, small.data(), small.size(), 4096, len, rec, err));
+    }
+    CHECK(cases == 3);
+    {   // members whose records are not in data order, and a wrong magic, are refused
+        std::vector<std::pair<std::string, std::vector<BsaMember>>> f = {{"x", {{"1", sampleContent(0, 3000, 1)}, {"2", sampleContent(1, 3000, 2)}}}};
+        std::vector<uint8_t> want, content, record; std::string err;
+        auto bsa = makeBsa(f, 0x7, want, true);
+        CHECK(!coding::Mint(bsaD, bsa.data(), bsa.size(), 0, want.size() * 2, 4096, content, record, err));
+        bsa = makeBsa(f, 0x7, want); bsa[2] = 'X';
+        CHECK(!coding::Mint(bsaD, bsa.data(), bsa.size(), 0, want.size() * 2, 4096, content, record, err));
+        bsa = makeBsa(f, 0x7, want); bsa[4] = 104;                            // version 104 (Oldrim) is another description
+        CHECK(!coding::Mint(bsaD, bsa.data(), bsa.size(), 0, want.size() * 2, 4096, content, record, err));
+    }
+}
+
+// ISA 4: a description using STREAMPOS is refused by a parser that claims an older instruction set.
+TEST(a_description_newer_than_its_isa_is_refused) {
+    auto d = coding::BsaDescription(); auto bytes = coding::Serialize(d);
+    coding::Description back; std::string err;
+    CHECK(coding::Parse(bytes.data(), bytes.size(), back, err));
+    // the ISA field follows the magic; claim ISA 3
+    CHECK(bytes.size() > 8 && bytes[4] == 4);
+    bytes[4] = 3; CHECK(!coding::Parse(bytes.data(), bytes.size(), back, err));
+}
+
 TEST(a_coded_stream_mounts_as_a_file) {
     TmpDir t;
     const auto in = sampleContent(3, 150000, 21); const auto alone = lzmaAlone(in, 6, 3, 0, 2); const auto d = lzmaFor(alone);

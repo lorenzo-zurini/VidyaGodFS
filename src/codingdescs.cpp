@@ -261,13 +261,15 @@ Description DeflateDescription() {
     return d;
 }
 
-Description Lz4BlockDescription() {
-    Asm a;
+// One LZ4 block's sequences, from Q_SEQ to Q_ENDC (the caller ends the stream or returns). DECODE: `atEnd` is 0 once the
+// block's input is consumed (after a literal run: that run was the last sequence). CODE: the last sequence is the one
+// whose match length decision is 0, or the decisions run out.
+static void Lz4Body(Asm &a, uint16_t atEnd) {
     const uint16_t LIT = a.R(QR_LIT), ML = a.R(QR_ML), OFF = a.R(QR_OFF), TK = a.R(QR_TK), Rr = a.R(QR_R), B = a.R(QR_B);
     const uint16_t F15 = a.C(15), B255 = a.C(255);
     auto MIN15 = [&](uint16_t x) { return a.SUB(x, a.MUL(a.GE(x, a.C(16)), a.SUB(x, F15))); };
     auto MIN255 = [&](uint16_t x) { return a.SUB(x, a.MUL(a.GE(x, a.C(256)), a.SUB(x, B255))); };
-    a.Label(Q_STREAM); a.Label(Q_SEQ); a.Mark();
+    a.Label(Q_SEQ); a.Mark();
     a.Mode(kCode); a.Jz(a.X1(EX_DLEFT, 0), Q_ENDC); a.Dec(QR_LIT); a.Dec(QR_ML); a.Dec(QR_OFF);
     a.Set(QR_TK, a.OR(a.SHL(MIN15(LIT), a.C(4)), a.MUL(a.NE(ML, a.C(0)), MIN15(a.SUB(ML, a.C(4))))));
     a.Mode(0); a.Raw(a.C(8), TK, QR_TK);
@@ -280,7 +282,7 @@ Description Lz4BlockDescription() {
     a.Mode(kDecode); a.Set(QR_LIT, a.ADD(LIT, B)); a.Mode(0);
     a.Jz(a.EQ(B, B255), Q_LITS); a.Jmp(Q_LX);
     a.Label(Q_LITS); a.ByteRun(LIT);
-    a.Mode(kDecode); a.Jz(a.X1(EX_INLEFT, 0), Q_LAST);
+    a.Mode(kDecode); a.Jz(atEnd, Q_LAST);
     a.Mode(kCode); a.Jz(ML, Q_ENDC);
     a.Mode(0);
     a.Raw(a.C(16), OFF, QR_OFF); a.Assert(a.NE(OFF, a.C(0)));
@@ -296,10 +298,93 @@ Description Lz4BlockDescription() {
     a.Mode(kDecode); a.Dec(QR_LIT); a.Dec(QR_ML); a.Dec(QR_OFF); a.Mode(0);
     a.Jmp(Q_SEQ);
     a.Label(Q_LAST); a.Mode(kDecode); a.Set(QR_ML, a.C(0)); a.Set(QR_OFF, a.C(0)); a.Dec(QR_LIT); a.Dec(QR_ML); a.Dec(QR_OFF); a.Mode(0);
-    a.Label(Q_ENDC); a.End();
+    a.Label(Q_ENDC);
+}
+
+Description Lz4BlockDescription() {
+    Asm a;
+    a.Label(Q_STREAM);
+    Lz4Body(a, a.X1(EX_INLEFT, 0));
+    a.End();
     a.link();
     Description d = std::move(a.d);
     d.name = "LZ4 block"; d.coder = kBits; d.entryStream = (uint16_t)a.lab[Q_STREAM]; d.entryToken = -1; d.window = 65535; d.maxlen = 0xFFFFFFFFu;
+    return d;
+}
+
+// ---- BSA (Bethesda archive, version 105: Skyrim Special Edition)
+// The CONTENT is the archive's header region as it is (header, folder records, folder names + file records, file names)
+// followed by every member's decoded bytes in data order (an embedded name, when the archive embeds them, stays with its
+// member). Members are uncompressed (copied: a copy run of the content) or a 4-byte original size + an LZ4 frame whose
+// blocks are LZ4 blocks or stored. Everything the archive's own header says is read back from the content, so the
+// header steers the walk and the decisions hold only what the encoder chose: frame flags, block sizes, sequences.
+enum { BR_FLAGS = 10, BR_NF, BR_FI, BR_Q, BR_CNT, BR_SZ, BR_LEN, BR_END, BR_ORIG, BR_CEND, BR_MAG, BR_FLG, BR_BD, BR_HC, BR_BS, BR_BEND, BR_X, BR_COMP };
+enum { B_STREAM = 40, B_FOLD, B_FILE, B_NEXTF, B_DONE, B_MEMBER, B_RAWMEM, B_NONAME, B_CS, B_DI, B_BLK, B_CBLK, B_BCK, B_BCS, B_FEND, B_FDONE, B_LZ4 };
+Description BsaDescription() {
+    Asm a;
+    auto R = [&](int r) { return a.R(r); };
+    auto BYTE = [&](uint16_t at) { return a.X1(EX_BYTE, at); };
+    auto U32 = [&](uint16_t at) { return a.OR(a.OR(BYTE(at), a.SHL(BYTE(a.ADD(at, a.C(1))), a.C(8))),
+                                              a.OR(a.SHL(BYTE(a.ADD(at, a.C(2))), a.C(16)), a.SHL(BYTE(a.ADD(at, a.C(3))), a.C(24)))); };
+    auto SPOS = [&] { return a.X1(EX_STREAMPOS, 0); };
+    auto BIT = [&](uint16_t x, int b) { return a.AND(a.SHR(x, a.C((uint32_t)b)), a.C(1)); };
+    const uint16_t PLACE = a.R(kRegPlace);
+    a.Label(B_STREAM);
+    // the header: 36 bytes as they are, then the rest of the header region, whose size the header gives
+    a.ByteRun(a.C(36));
+    a.Assert(a.EQ(U32(a.C(0)), a.C(0x00415342)));                       // "BSA\0"
+    a.Assert(a.EQ(U32(a.C(4)), a.C(105)));
+    a.Set(BR_FLAGS, U32(a.C(12))); a.Set(BR_NF, U32(a.C(16)));
+    {   const uint16_t F = R(BR_NF), N = U32(a.C(20)), TFN = U32(a.C(24)), TFIN = U32(a.C(28));
+        const uint16_t H = a.ADD(a.ADD(a.ADD(a.C(36), a.MUL(F, a.C(24))), a.MUL(BIT(R(BR_FLAGS), 0), a.ADD(TFN, F))),
+                                 a.ADD(a.MUL(N, a.C(16)), a.MUL(BIT(R(BR_FLAGS), 1), TFIN)));
+        a.Set(BR_X, H); }
+    a.Assert(a.GE(R(BR_X), a.C(36)));
+    a.ByteRun(a.SUB(R(BR_X), a.C(36)));
+    // walk the folders and their file records (in the content now): every member in data order
+    a.Set(BR_Q, a.ADD(a.C(36), a.MUL(R(BR_NF), a.C(24)))); a.Set(BR_FI, a.C(0));
+    a.Label(B_FOLD); a.Jz(a.LT(R(BR_FI), R(BR_NF)), B_DONE);
+    a.Set(BR_CNT, U32(a.ADD(a.ADD(a.C(36), a.MUL(R(BR_FI), a.C(24))), a.C(8))));
+    a.Set(BR_Q, a.ADD(R(BR_Q), a.MUL(BIT(R(BR_FLAGS), 0), a.ADD(a.C(1), BYTE(R(BR_Q))))));   // the folder's name (when named)
+    a.Label(B_FILE); a.Jz(R(BR_CNT), B_NEXTF);
+    a.Set(BR_SZ, U32(a.ADD(R(BR_Q), a.C(8))));
+    a.Assert(a.EQ(U32(a.ADD(R(BR_Q), a.C(12))), SPOS()));               // members lie in record order, back to back
+    a.Set(BR_Q, a.ADD(R(BR_Q), a.C(16))); a.Set(BR_CNT, a.SUB(R(BR_CNT), a.C(1)));
+    a.Call(B_MEMBER); a.Mark(); a.Jmp(B_FILE);
+    a.Label(B_NEXTF); a.Set(BR_FI, a.ADD(R(BR_FI), a.C(1))); a.Jmp(B_FOLD);
+    a.Label(B_DONE); a.Mode(kDecode); a.Assert(a.EQ(a.X1(EX_INLEFT, 0), a.C(0))); a.Mode(0); a.End();
+    // one member: its record's size (bit 30 flips the archive's default compression)
+    a.Label(B_MEMBER);
+    a.Set(BR_COMP, a.XOR(BIT(R(BR_FLAGS), 2), BIT(R(BR_SZ), 30)));
+    a.Set(BR_LEN, a.AND(R(BR_SZ), a.C(0x3FFFFFFFu))); a.Set(BR_END, a.ADD(SPOS(), R(BR_LEN)));
+    a.Jz(BIT(R(BR_FLAGS), 8), B_NONAME);                                   // an embedded name: its length byte, then the name
+    a.ByteRun(a.C(1)); a.ByteRun(BYTE(a.SUB(PLACE, a.C(1))));
+    a.Label(B_NONAME);
+    a.Jz(R(BR_COMP), B_RAWMEM);
+    a.RawF(a.C(32), BR_ORIG); a.Set(BR_CEND, a.ADD(PLACE, R(BR_ORIG)));
+    a.Raw(a.C(32), a.C(0x184D2204u), BR_MAG); a.Assert(a.EQ(R(BR_MAG), a.C(0x184D2204u)));
+    a.RawF(a.C(8), BR_FLG); a.RawF(a.C(8), BR_BD);
+    a.Assert(a.EQ(a.AND(R(BR_FLG), a.C(0xC2)), a.C(0x40)));             // version 01, reserved bit clear
+    a.Jz(BIT(R(BR_FLG), 3), B_CS); a.RawF(a.C(32), BR_X); a.RawF(a.C(32), BR_X);   // the content size
+    a.Label(B_CS); a.Jz(BIT(R(BR_FLG), 0), B_DI); a.RawF(a.C(32), BR_X);            // a dictionary id
+    a.Label(B_DI); a.RawF(a.C(8), BR_HC);
+    a.Label(B_BLK); a.RawF(a.C(32), BR_BS); a.Jz(R(BR_BS), B_FEND);
+    a.Jz(BIT(R(BR_BS), 31), B_CBLK);
+    a.ByteRun(a.AND(R(BR_BS), a.C(0x7FFFFFFFu))); a.Jmp(B_BCK);            // a stored block
+    a.Label(B_CBLK); a.Set(BR_BEND, a.ADD(SPOS(), R(BR_BS))); a.Call(B_LZ4);
+    a.Mode(kDecode); a.Assert(a.EQ(SPOS(), R(BR_BEND))); a.Mode(0);
+    a.Label(B_BCK); a.Jz(BIT(R(BR_FLG), 4), B_BLK); a.RawF(a.C(32), BR_X); a.Jmp(B_BLK);   // a block checksum
+    a.Label(B_FEND); a.Jz(BIT(R(BR_FLG), 2), B_FDONE); a.RawF(a.C(32), BR_X);             // the content checksum
+    a.Label(B_FDONE); a.Assert(a.EQ(PLACE, R(BR_CEND))); a.Assert(a.EQ(SPOS(), R(BR_END))); a.Ret();
+    a.Label(B_RAWMEM); a.ByteRun(a.SUB(R(BR_END), SPOS())); a.Ret();
+    // an LZ4 block, ending at BR_BEND (DECODE) or its last sequence (CODE)
+    a.Label(B_LZ4);
+    Lz4Body(a, a.NE(SPOS(), R(BR_BEND)));
+    a.Ret();
+    a.link();
+    Description d = std::move(a.d);
+    d.name = "BSA 105 (Skyrim Special Edition)"; d.coder = kBits; d.entryStream = (uint16_t)a.lab[B_STREAM]; d.entryToken = -1;
+    d.window = 65535; d.maxlen = 0xFFFFFFFFu;
     return d;
 }
 

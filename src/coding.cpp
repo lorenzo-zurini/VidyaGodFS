@@ -122,6 +122,7 @@ bool Parse(const uint8_t *Data, size_t N, Description &D, std::string &Err) {
     }
     for (const Ex &e : D.ex) {
         if ((e.op == EX_TABLE && e.imm >= nt) || (e.op == EX_ARR && e.imm >= na)) { Err = "an expression naming something the description lacks"; return false; }
+        if (e.op == EX_STREAMPOS && D.isa < 4) { Err = "an expression newer than the instruction set it names"; return false; }
     }
     return true;
 }
@@ -136,7 +137,7 @@ struct PriceInit { PriceInit() { for (uint32_t i = 8; i < 2048; i += 16) { uint3
 // folded, register and constant operands read in place, evaluation in index order. No recursion, no cycles.
 enum : uint8_t { M_ADD, M_ADDI, M_SUB, M_SUBI, M_RSUBI, M_MUL, M_MULI, M_SHL, M_SHLI, M_SHR, M_SHRI, M_AND, M_ANDI, M_OR, M_ORI, M_XOR, M_XORI,
                  M_LT, M_LTI, M_EQ, M_EQI, M_NE, M_NEI, M_GE, M_GEI, M_LDI, M_COPY,
-                 M_BYTE, M_TABLE, M_ARR, M_LOG2, M_BITPOS, M_DLEFT, M_XLEFT, M_INLEFT };
+                 M_BYTE, M_TABLE, M_ARR, M_LOG2, M_BITPOS, M_DLEFT, M_XLEFT, M_INLEFT, M_SPOS };
 struct Mu { uint8_t c; uint16_t d, a, b; uint32_t imm; };
 // An operand resolved once: a constant, a register, an AFFINE form (a constant plus up to four terms, each
 // ((src >> rs) & mask) << ls times mul, src a register or the content byte at a register + offset: what nearly every
@@ -191,11 +192,11 @@ struct Spec {
             for (const uint16_t i : nodes) {
                 if (isConst[i] || D.ex[i].op == EX_REG) continue;
                 const Ex &e = D.ex[i]; const uint16_t d = (uint16_t)(kRegs + i);
-                if (UnaryEx(e.op) || e.op == EX_BITPOS || e.op == EX_DLEFT || e.op == EX_XLEFT || e.op == EX_INLEFT) {
+                if (UnaryEx(e.op) || e.op == EX_BITPOS || e.op == EX_DLEFT || e.op == EX_XLEFT || e.op == EX_INLEFT || e.op == EX_STREAMPOS) {
                     uint16_t a = 0;
                     if (UnaryEx(e.op)) { if (isConst[e.a]) { mu.push_back({M_LDI, d, 0, 0, cval[e.a]}); a = d; } else a = loc(e.a); }
                     const uint8_t c = e.op == EX_BYTE ? M_BYTE : e.op == EX_TABLE ? M_TABLE : e.op == EX_ARR ? M_ARR : e.op == EX_LOG2SLOT ? M_LOG2 :
-                                      e.op == EX_BITPOS ? M_BITPOS : e.op == EX_DLEFT ? M_DLEFT : e.op == EX_XLEFT ? M_XLEFT : M_INLEFT;
+                                      e.op == EX_BITPOS ? M_BITPOS : e.op == EX_DLEFT ? M_DLEFT : e.op == EX_XLEFT ? M_XLEFT : e.op == EX_INLEFT ? M_INLEFT : M_SPOS;
                     mu.push_back({c, d, a, 0, e.imm}); continue;
                 }
                 static const uint8_t RR[] = {0, 0, M_ADD, M_SUB, M_MUL, M_SHL, M_SHR, M_AND, M_OR, M_XOR, M_LT, M_EQ, M_NE, M_GE};
@@ -406,6 +407,7 @@ struct Machine {
     const uint8_t *in = nullptr; size_t inn = 0, ip = 0;
     std::vector<uint8_t> *out = nullptr;
     std::vector<CopyRun> *runs = nullptr; uint64_t copied = 0;   // CODE on the read side: copy runs kept as ranges
+    uint64_t outBase = 0;                                         // CODE: where this run's output starts in the stream (a segment's checkpoint)
     Content X; Decisions Dc; std::vector<uint32_t> *decOut = nullptr;
     uint32_t price = 0;
     int pc = 0; std::vector<int> stk;
@@ -473,6 +475,7 @@ struct Machine {
             case M_DLEFT: o = (uint32_t)std::min<uint64_t>(0xFFFFFFFFu, Dc.total > Dc.consumed() ? Dc.total - Dc.consumed() : 0); break;
             case M_XLEFT: { const uint64_t sz = M == kDecode ? X.cap : X.size; o = sz > place() ? (uint32_t)std::min<uint64_t>(0xFFFFFFFFu, sz - place()) : 0; break; }
             case M_INLEFT: o = M == kDecode ? (uint32_t)std::min<uint64_t>(0xFFFFFFFFu, inn * 8 > bipos ? inn * 8 - bipos : 0) : 0; break;
+            case M_SPOS: o = (uint32_t)std::min<uint64_t>(0xFFFFFFFFu, M == kDecode ? (D.coder == kBits ? bipos >> 3 : ip) : M == kCode && out ? outBase + out->size() + copied + (uint64_t)(bn >> 3) : 0); break;
             }
         }
         return x[res];
@@ -733,35 +736,37 @@ uint64_t SuggestedSpacing(const Description &D, uint64_t Shipped) {
 // Record: "VGCR" | varint shipped size | varint total decisions | varint checkpoints | per checkpoint: varint shipped offset, varint
 // decisions before it, varint payload length | payloads. A payload is one zstd frame: varint snapshot length,
 // snapshot, varint decision count, the segment's decisions as varints.
-bool Mint(const Description &D, const uint8_t *Shipped, size_t N, size_t ContentSize, size_t ContentCap, uint64_t Spacing,
-          std::vector<uint8_t> &Content, std::vector<uint8_t> &Record, std::string &Err) {
+bool MintInto(const Description &D, const uint8_t *Shipped, size_t N, size_t ContentSize, uint8_t *Buf, size_t ContentCap, uint64_t Spacing,
+              size_t &ContentLen, std::vector<uint8_t> &Record, std::string &Err) {
     if (ContentCap > 0xFFFFFFFFu || ContentSize > ContentCap) { Err = "content over 4 GiB is not supported"; return false; }
     Spec S(D);
     if (!S.ok) { Err = "a description too complex to run"; return false; }
-    Content.assign(ContentCap, 0);
     std::vector<uint32_t> dec;
     {
-        Machine m(D, S, kDecode); m.in = Shipped; m.inn = N; m.X.w = Content.data(); m.X.cap = ContentSize ? ContentSize : ContentCap; m.decOut = &dec;
+        Machine m(D, S, kDecode); m.in = Shipped; m.inn = N; m.X.w = Buf; m.X.cap = ContentSize ? ContentSize : ContentCap; m.decOut = &dec;
         if (D.coder == kRange) { m.ip = 1; for (int i = 0; i < 4; ++i) m.code = (m.code << 8) | m.inByte(); }
         if (m.run(D.entryStream) != 1) { Err = std::string("decode: ") + (m.why ? m.why : "refused"); return false; }
         if (ContentSize && m.place() != ContentSize) { Err = "decode: the content is not the size expected"; return false; }
-        Content.resize(m.place());
+        ContentLen = m.place();
     }
-    // code it back, taking checkpoints at MARKs every Spacing shipped bytes
-    std::vector<uint8_t> out; out.reserve(N + 64);
+    // code it back, taking checkpoints at MARKs every Spacing shipped bytes; what it codes is compared and dropped segment by
+    // segment (`copied` counts what is out and gone), so a stream of gigabytes needs no second copy of itself
+    std::vector<uint8_t> out; out.reserve((size_t)std::min<uint64_t>(N + 64, Spacing * 2 + (1u << 20)));
     struct C { uint64_t out, dec; std::vector<uint8_t> snap; };
     std::vector<C> cks;
-    Machine m(D, S, kCode); m.out = &out; m.X.mem = Content.data(); m.X.size = Content.size(); m.Dc.setMem(dec.data(), dec.size()); m.Dc.total = dec.size();
+    Machine m(D, S, kCode); m.out = &out; m.X.mem = Buf; m.X.size = ContentLen; m.Dc.setMem(dec.data(), dec.size()); m.Dc.total = dec.size();
     m.pc = D.entryStream;
     cks.push_back({0, 0, m.snapshot()});
     for (bool first = true;; first = false) {
         m.stopAt = cks.back().out + Spacing;                 // from the LAST checkpoint: a long run (one token) does not leave a burst of tiny segments behind it
         const int r = m.run(D.entryStream, !first);
         if (r == 0) { Err = std::string("code: ") + (m.why ? m.why : "refused"); return false; }
+        if (m.copied + out.size() > N || (!out.empty() && memcmp(out.data(), Shipped + m.copied, out.size()) != 0)) { Err = "the stream does not code back to its own bytes"; return false; }
+        m.copied += out.size(); out.clear();
         if (r == 1) break;
-        cks.push_back({out.size(), m.Dc.consumed(), m.snapshot()});
+        cks.push_back({m.copied, m.Dc.consumed(), m.snapshot()});
     }
-    if (out.size() != N || memcmp(out.data(), Shipped, N) != 0) { Err = "the stream does not code back to its own bytes"; return false; }
+    if (m.copied != N) { Err = "the stream does not code back to its own bytes"; return false; }
     if (m.Dc.consumed() != dec.size()) { Err = "decisions left over"; return false; }
     // the record
     std::vector<std::vector<uint8_t>> pay;
@@ -775,6 +780,14 @@ bool Mint(const Description &D, const uint8_t *Shipped, size_t N, size_t Content
     for (size_t k = 0; k < cks.size(); ++k) { PutVar(Record, cks[k].out); PutVar(Record, cks[k].dec); PutVar(Record, pay[k].size()); }
     for (const auto &p : pay) Record.insert(Record.end(), p.begin(), p.end());
     return true;
+}
+
+bool Mint(const Description &D, const uint8_t *Shipped, size_t N, size_t ContentSize, size_t ContentCap, uint64_t Spacing,
+          std::vector<uint8_t> &Content, std::vector<uint8_t> &Record, std::string &Err) {
+    if (ContentCap > 0xFFFFFFFFu || ContentSize > ContentCap) { Err = "content over 4 GiB is not supported"; return false; }
+    Content.assign(ContentCap, 0); size_t len = 0;
+    if (!MintInto(D, Shipped, N, ContentSize, Content.data(), ContentCap, Spacing, len, Record, Err)) return false;
+    Content.resize(len); return true;
 }
 
 // ================================================================================================ the read side
@@ -842,7 +855,7 @@ struct CodedByteSource::Impl : std::enable_shared_from_this<CodedByteSource::Imp
         std::vector<uint8_t> p; if (!payload(k, p)) return nullptr;
         Rd r{p.data(), p.size()}; const uint64_t sn = r.var(); if (r.bad || r.at + sn > p.size()) return nullptr;
         auto c = std::make_unique<Cursor>(); c->base = cks[k].out; c->seg = k;
-        c->m = std::make_unique<Machine>(D, *S, kCode); Machine &m = *c->m; m.out = &c->out; m.maxCache = size + 1;
+        c->m = std::make_unique<Machine>(D, *S, kCode); Machine &m = *c->m; m.out = &c->out; m.maxCache = size + 1; m.outBase = cks[k].out;
         if (!m.restore(p.data() + r.at, (size_t)sn)) return nullptr;
         m.X.src = content.get(); m.X.size = content->size(); m.X.window = D.window;
         if (!chunk(k, p, r.at + (size_t)sn, m.Dc.chunk, m.Dc.base)) return nullptr;

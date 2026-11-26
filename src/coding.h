@@ -27,7 +27,7 @@
 
 namespace coding {
 
-constexpr uint32_t kIsa = 3;          // the instruction set a description may use; newer is refused (3: HUFFRUN, BYTERUN)
+constexpr uint32_t kIsa = 4;          // the instruction set a description may use; newer is refused (3: HUFFRUN, BYTERUN; 4: STREAMPOS)
 constexpr int kRegs = 64;
 constexpr int kRegPlace = 0;          // register 0: the place in the content
 constexpr uint32_t kNoSlot = 255;
@@ -45,6 +45,7 @@ enum ExOp : uint8_t {
     EX_DLEFT,     // decisions not yet consumed (CODE)
     EX_XLEFT,     // content bytes after the place
     EX_INLEFT,    // DECODE: shipped bits not yet read by the bit coder
+    EX_STREAMPOS, // ISA 4: the shipped stream's byte position: read so far (DECODE), written so far (CODE); 0 in PRICE
     EX_COUNT
 };
 enum OpCode : uint8_t {
@@ -103,6 +104,7 @@ bool Parse(const uint8_t *Data, size_t N, Description &D, std::string &Err);
 Description LzmaDescription(int Lc, int Lp, int Pb, uint32_t Dict, bool EndMarker);
 Description DeflateDescription();
 Description Lz4BlockDescription();
+Description BsaDescription();        // Bethesda archive v105 (Skyrim SE): header region + members, LZ4 frames
 
 // The checkpoint spacing a description suits: a coder without adaptive state (static codes, raw bytes) checkpoints
 // cheaply, so often (every block or so: a read starts at most that far back, and segments decode in parallel); one
@@ -115,6 +117,10 @@ uint64_t SuggestedSpacing(const Description &D, uint64_t Shipped = 0);
 // `ContentSize` is the expected content size (0: unknown, at most `ContentCap`).
 bool Mint(const Description &D, const uint8_t *Shipped, size_t N, size_t ContentSize, size_t ContentCap, uint64_t Spacing,
           std::vector<uint8_t> &Content, std::vector<uint8_t> &Record, std::string &Err);
+// The same into a caller's buffer of ContentCap bytes (a tool maps a big one lazily, so a stream of gigabytes costs only the
+// pages its content fills); the content's length is returned in ContentLen.
+bool MintInto(const Description &D, const uint8_t *Shipped, size_t N, size_t ContentSize, uint8_t *Buf, size_t ContentCap, uint64_t Spacing,
+              size_t &ContentLen, std::vector<uint8_t> &Record, std::string &Err);
 
 // A shipped stream served from a description, its content and its record: random access through the record's
 // checkpoints, safe for concurrent reads. A reader going front to back (a game loading a bundle) is served by
