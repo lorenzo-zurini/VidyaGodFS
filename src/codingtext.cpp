@@ -417,7 +417,18 @@ bool Read(const std::string &Text, Description &Out, std::string &Err, TextNames
     if (Text.size() > (64u << 20)) { Err = "a description too large"; return false; }
     ojson J;
     try { J = ojson::parse(Text); } catch (const std::exception &e) { Err = std::string("not a description (") + e.what() + ")"; return false; }
-    if (J.is_object() && J.contains("DESCRIPTION") && J.contains("LAYERS")) J = J["DESCRIPTION"];   // a node: its description
+    //a node: the description its CODED layers carry (one: a node coding several formats names the layer, by giving its
+    //description alone)
+    if (J.is_object() && J.contains("LAYERS") && J["LAYERS"].is_array()) {
+        ojson One;
+        for (const auto &L : J["LAYERS"])
+            if (L.is_object() && L.contains("CODED") && L.contains("DESCRIPTION") && L["DESCRIPTION"].is_object()) {
+                if (!One.is_null() && One != L["DESCRIPTION"]) { Err = "a node whose CODED layers carry different descriptions: give the one meant alone"; return false; }
+                One = L["DESCRIPTION"];
+            }
+        if (One.is_null()) { Err = "a node with no CODED layer carrying a description"; return false; }
+        J = One;
+    }
     if (!J.is_object()) { Err = "not a description"; return false; }
     Description D;
     Reader R{D};

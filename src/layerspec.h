@@ -38,10 +38,9 @@ struct LayerSpec {
     bool        bytesOnly = false;   // zip/delta/file/coded: read as a later delta's base, surfacing nowhere (a TAKE shows none of it)
     //CODED only: a compressed stream served from its decoded content (the one CID in `bases`, any layer carrying bytes:
     //a file, a delta's rebuild) and its decisions (`source`, the record) through a format description: data, never
-    //code (MetaPackageFormat 22.16) — the text of the DESCRIPTION its node holds, carried in the spec itself, and that
-    //node's CID (what a machine keys derived data by). It appears as one file, `name`, in its target folder.
+    //code (MetaPackageFormat 22.16) — its layer's DESCRIPTION, carried in the spec itself. It appears as one file, `name`,
+    //in its target folder.
     std::string description;
-    std::string descriptionCid;
     std::string name;
 };
 

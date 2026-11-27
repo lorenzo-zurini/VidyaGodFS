@@ -155,7 +155,7 @@ struct TextNames {
 // Print: the description's text (canonical: Read(Print(D)) runs as D does, and prints the same). False if it is not
 // valid, or sets a field its text form cannot say.
 bool Print(const Description &D, std::string &Out, std::string &Err, const TextNames *Names = nullptr);
-// Read: a description's text, or a node holding one in its DESCRIPTION; validated. Names: what the text called things
+// Read: a description's text, or a node whose CODED layers carry one (inline); validated. Names: what the text called things
 // (Print(D, …, Names) gives the text back in canonical form with them).
 bool Read(const std::string &Text, Description &D, std::string &Err, TextNames *Names = nullptr);
 // The same as bytes (the text, UTF-8): what a ByteSource of a description holds. Serialize is empty if Print fails.

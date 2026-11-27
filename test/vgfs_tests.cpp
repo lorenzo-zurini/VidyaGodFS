@@ -4188,8 +4188,8 @@ TEST(a_reader_never_loses_the_segment_it_waits_for) {
 
 // ISA 4: a description using STREAMPOS is refused by a parser that claims an older instruction set.
 // 22.16: a description is DATA in a node — readable text. A hand-written one runs; every built one reads back to what
-// it was (the same text, the same records); the names an author gave survive a round trip; a node holding one reads as
-// it; and text that is not a description is refused, saying where. Teeth: drop a name; misread a mode; accept a table
+// it was (the same text, the same records); the names an author gave survive a round trip; a node whose CODED layers
+// carry one reads as it (two different ones: refused); and text that is not a description is refused, saying where. Teeth: drop a name; misread a mode; accept a table
 // by number; let labels repeat; let values nest without bound.
 TEST(a_description_is_readable_text_in_a_node) {
     std::string err;
@@ -4219,9 +4219,13 @@ TEST(a_description_is_readable_text_in_a_node) {
     std::string back; CHECK(coding::Print(d, back, err, &names));
     CHECK(back.find("\"left\": 1") != std::string::npos && back.find("byterun left") != std::string::npos && back.find("@start") != std::string::npos);
     coding::Description d2; CHECK(coding::Read(back, d2, err)); CHECK(coding::Serialize(d2) == coding::Serialize(d));
-    // a node holding it
-    const std::string node = std::string(R"J({"LABEL": "copy v1", "DESCRIPTION": )J") + copy + R"J(, "LAYERS": []})J";
+    // a node whose CODED layers carry it (inline, each its own copy)
+    const std::string coded = std::string(R"J({"CODED": "a.vgcr", "NAME": "a", "BASE_SOURCES": ["Qmc"], "DESCRIPTION": )J") + copy + "}";
+    const std::string node = R"J({"LABEL": "copy v1", "LAYERS": [{"FILE": "x"}, )J" + coded + ", " + coded + "]}";
     CHECK(coding::Read(node, d2, err)); CHECK(coding::Serialize(d2) == coding::Serialize(d));
+    std::string other = copy; other.replace(other.find("a file as it is"), 15, "another format!");
+    CHECK(!coding::Read(R"J({"LAYERS": [)J" + coded + R"J(, {"CODED": "b.vgcr", "DESCRIPTION": )J" + other + "}]}", d2, err));
+    CHECK(!coding::Read(R"J({"LABEL": "none", "LAYERS": [{"FILE": "x"}]})J", d2, err));
     // ...but only a node is unwrapped: a description that merely holds a DESCRIPTION key is no description
     CHECK(!coding::Read(std::string(R"J({"DESCRIPTION": )J") + copy + R"J(, "junk": 1})J", d2, err));
     // every built description: printed, read, printed again is the same text, and mints the same record
@@ -4966,7 +4970,7 @@ TEST(a_coded_stream_mounts_as_a_file) {
     const std::string spec = std::string(R"({"mountpoint":"/m","readonly":true,"layers":[)")
         + R"({"type":"file","source":")" + t.str("content.bin") + R"(","target":"","cid":"bafycontent","bytesOnly":true},)"
         + R"({"type":"coded","source":")" + t.str("stream.vgcr") + R"(","description":)" + std::string(desc.begin(), desc.end())
-        + R"(,"descriptionCid":"bafydesc","bases":["bafycontent"],"name":"data/level1.bundle","target":"game","cid":"bafystream"}]})";
+        + R"(,"bases":["bafycontent"],"name":"data/level1.bundle","target":"game","cid":"bafystream"}]})";
     Spec sp; CHECK(ParseSpecText(spec, sp, err)); CHECK(sp.layers.size() == 2 && sp.layers[1].type == LayerType::Coded);
     VfsState S; CHECK(S.Init(sp, err));
     VfsAttr a; CHECK_EQ(VfsGetattr(S, "game/data/level1.bundle", a), 0); CHECK_EQ(a.size, (uint64_t)(alone.size() - 13));
@@ -4989,9 +4993,13 @@ TEST(a_coded_stream_mounts_as_a_file) {
     // a coded layer must name exactly one content, a description and a name
     CHECK(!ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"coded","source":"/r","bases":["a","b"],"description":"/d","name":"x"}]})", bad, err));
     CHECK(!ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"coded","source":"/r","bases":["a"],"name":"x"}]})", bad, err));
-    // the description is the node's text, carried whole, with that node's CID: a path to a file is not one
-    CHECK(!ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"coded","source":"/r","bases":["a"],"description":"/d","descriptionCid":"q","name":"x"}]})", bad, err));
+    // the description is the layer's own, carried whole and read where the spec is: a path to a file is not one, nor one
+    // that does not read, nor null
+    CHECK(!ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"coded","source":"/r","bases":["a"],"description":"/d","name":"x"}]})", bad, err));
     CHECK(!ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"coded","source":"/r","bases":["a"],"description":{"NAME":"d"},"name":"x"}]})", bad, err));
+    CHECK(err.find("does not read") != std::string::npos);
+    CHECK(!ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"coded","source":"/r","bases":["a"],"description":null,"name":"x"}]})", bad, err));
+    CHECK(ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"coded","source":"/r","bases":["a"],"description":)" + std::string(desc.begin(), desc.end()) + R"(,"name":"x"}]})", bad, err));
     CHECK(!ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"zip","source":"/r","name":"x"}]})", bad, err));
 }
 
@@ -5272,7 +5280,7 @@ TEST(a_deep_stack_of_mixed_encodings_reads_through_every_layer) {
     for (int k = 1; k <= depth; ++k) {
         put("r" + std::to_string(k), rec[(size_t)k - 1]); const auto dk = coding::Serialize(D[(size_t)k - 1]);
         layers += R"(,{"type":"coded","source":")" + t.str("r" + std::to_string(k)) + R"(","description":)" + std::string(dk.begin(), dk.end())
-                + R"(,"descriptionCid":"desc)" + std::to_string(k) + R"(","bases":["c)" + std::to_string(k - 1) + R"("],"name":"top.bin","target":"","cid":"c)" + std::to_string(k) + R"(")" + (k < depth ? R"(,"bytesOnly":true)" : "") + "}";
+                + R"(,"bases":["c)" + std::to_string(k - 1) + R"("],"name":"top.bin","target":"","cid":"c)" + std::to_string(k) + R"(")" + (k < depth ? R"(,"bytesOnly":true)" : "") + "}";
     }
     Spec sp; CHECK(ParseSpecText(R"({"mountpoint":"/m","readonly":true,"layers":[)" + layers + "]}", sp, err));
     CHECK(PlanTree(sp).problems.empty());

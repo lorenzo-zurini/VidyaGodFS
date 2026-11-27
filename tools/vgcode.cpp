@@ -1,5 +1,5 @@
 // vgcode: the coding algebra from the command line (authoring and verification; the mount reads coded layers itself).
-// A <description> is a node holding one in its DESCRIPTION, or the description's own JSON (chapter 22 §22.16).
+// A <description> is the description's own JSON, or a node whose CODED layers carry it (chapters 04, 22 §22.16).
 //   vgcode check <description> [canonical-out]
 //       read and validate a description; write its canonical text (the same names, values laid out canonically)
 //   vgcode mint [--plain] <description> <shipped> <content-out> <record-out> [spacing]
