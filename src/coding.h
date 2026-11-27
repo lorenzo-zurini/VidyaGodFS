@@ -139,6 +139,12 @@ public:
     size_t   checkpoints() const { return Cks.size(); }       // (tests)
     uint64_t segmentsDecoded() const;                          // (tests, benchmarks: work done, against checkpoints())
     uint64_t bytesGenerated() const;                           // (tests: bytes segments generated; copy runs are handed down, not counted)
+    // (tests) the interleavings of a busy pool, forced: hold a reader's place on the segment holding Off (as a waiting
+    // reader does: the segment is not evicted), ask whether that segment is decoded and kept, and have the next reader
+    // woken from waiting lose its segment at that moment (as if read-ahead had evicted it while it woke).
+    void     debugHoldWaiter(uint64_t Off, bool On);
+    bool     debugCached(uint64_t Off) const;
+    void     debugDropOnNextWake();
     struct Ck { uint64_t out = 0, rec = 0, recLen = 0, dec = 0; };
     struct Impl;
 private:

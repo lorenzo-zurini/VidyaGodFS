@@ -836,6 +836,7 @@ struct CodedByteSource::Impl : std::enable_shared_from_this<CodedByteSource::Imp
     uint64_t ends[8] = {0}; int nend = 0;                                   // where recent reads ended (readers going front to back)
     std::atomic<uint64_t> decodes{0}, generated{0};
     std::set<size_t> queued, running, bad;                                  // asked of the pool, not started; being decoded; failed
+    bool dropOnWake = false;                                                // (tests) the next woken reader loses its segment
     uint32_t depth = 0;                                                     // coded layers under this one (the pool runs lower ones first)
 
     uint64_t segEnd(size_t k) const { return k + 1 < cks.size() ? cks[k + 1].out : size; }
@@ -939,6 +940,7 @@ struct CodedByteSource::Impl : std::enable_shared_from_this<CodedByteSource::Imp
             //the cache under a slow content read) — decode it once more, here
             if (!running.count(j)) { queued.insert(j); run(j, l); continue; }
             Waiters &w = waits[j]; ++w.n; w.cv.wait(l); if (--w.n == 0) waits.erase(j);
+            if (dropOnWake && segs.count(j)) { dropOnWake = false; segs.erase(j); used.erase(j); }   // (tests)
         }
     }
 };
@@ -985,6 +987,13 @@ std::shared_ptr<CodedByteSource> CodedByteSource::Create(std::shared_ptr<ByteSou
 }
 
 uint64_t CodedByteSource::segmentsDecoded() const { return I->decodes.load(); }
+void CodedByteSource::debugHoldWaiter(uint64_t Off, bool On) {
+    std::lock_guard<std::mutex> g(I->mu);
+    const size_t j = I->segOf(Off);
+    if (On) ++I->waits[j].n; else if (I->waits.count(j) && --I->waits[j].n <= 0) I->waits.erase(j);
+}
+bool CodedByteSource::debugCached(uint64_t Off) const { std::lock_guard<std::mutex> g(I->mu); return I->segs.count(I->segOf(Off)) > 0; }
+void CodedByteSource::debugDropOnNextWake() { std::lock_guard<std::mutex> g(I->mu); I->dropOnWake = true; }
 uint64_t CodedByteSource::bytesGenerated() const { return I->generated.load(); }
 
 void CodedByteSource::prefetch(uint64_t Off, uint64_t N) {

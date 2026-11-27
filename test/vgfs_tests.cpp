@@ -6,6 +6,7 @@
 #include "test_guard.h"
 #include <random>
 #include <thread>
+#include <condition_variable>
 #include "overlay.h"
 #include "hostio.h"
 #include "treeplan.h"
@@ -3777,6 +3778,62 @@ TEST(a_coded_stream_reads_whole_under_slow_content_and_deep_read_ahead) {
         });
     for (auto &x : T) x.join();
     CHECK_EQ(bad.load(), 0);
+}
+
+// The two interleavings behind that failure, forced (Packagizer 2026-11-27): (1) a reader waiting on a segment a pool worker
+// decodes wakes to find it gone — it decodes it again, never EIO; (2) a segment a reader waits for is never evicted,
+// however many segments read-ahead decodes meanwhile. Teeth: return from await when the segment is gone; let eviction
+// pick a waited-for segment.
+struct GateSource : ByteSource {
+    std::shared_ptr<ByteSource> In; uint64_t From = 0, To = 0;
+    std::mutex M; std::condition_variable Cv; bool Open = true, Entered = false;
+    ssize_t pread(void *b, size_t n, uint64_t o) override {
+        if (o < To && o + n > From) {
+            std::unique_lock<std::mutex> l(M);
+            if (!Open) { Entered = true; Cv.notify_all(); Cv.wait(l, [this] { return Open; }); }
+        }
+        return In->pread(b, n, o);
+    }
+    uint64_t size() const override { return In->size(); }
+};
+TEST(a_reader_never_loses_the_segment_it_waits_for) {
+    const auto in = sampleContent(0, 1000000, 22);
+    const auto stream = rawDeflate(in, 6, 15, 8, Z_DEFAULT_STRATEGY);     // literals: decoding a segment reads the content
+    const auto d = coding::DeflateDescription();
+    std::vector<uint8_t> content, record; std::string err;
+    CHECK(coding::Mint(d, stream.data(), stream.size(), in.size(), in.size(), 2048, content, record, err));
+    auto gate = std::make_shared<GateSource>(); gate->In = std::make_shared<MemByteSource>(content);
+    auto src = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d)), std::make_shared<MemByteSource>(record), gate, stream.size(), err);
+    CHECK(src != nullptr); if (!src) return;
+    CHECK(src->checkpoints() > 60);
+    // (1) a worker decodes the segment at half the stream and blocks reading its content; a reader waits on it; it is dropped as the
+    //     reader wakes: the reader must decode it again and get its bytes
+    const uint64_t At = stream.size() / 2;
+    gate->From = 0; gate->To = UINT64_MAX;                                 // every content read blocks while closed
+    { std::lock_guard<std::mutex> l(gate->M); gate->Open = false; gate->Entered = false; }
+    src->prefetch(At, 1);                                                 // a pool worker takes it
+    { std::unique_lock<std::mutex> l(gate->M); gate->Cv.wait_for(l, std::chrono::seconds(10), [&] { return gate->Entered; }); }
+    CHECK(gate->Entered);
+    src->debugDropOnNextWake();
+    std::vector<uint8_t> got(4096); bool ok = false;
+    std::thread reader([&] { ok = src->preadAll(got.data(), got.size(), At); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));           // the reader is waiting on the worker now
+    { std::lock_guard<std::mutex> l(gate->M); gate->Open = true; } gate->Cv.notify_all();
+    reader.join();
+    CHECK(ok);
+    CHECK(memcmp(got.data(), stream.data() + At, got.size()) == 0);
+    // (2) a segment held by a waiting reader survives read-ahead decoding far more segments than the cache keeps
+    std::vector<uint8_t> one(1);
+    CHECK(src->preadAll(one.data(), 1, 0));                               // segment 0 decoded
+    src->debugHoldWaiter(0, true);
+    std::vector<uint8_t> b(64 << 10);
+    for (uint64_t o = stream.size() / 8; o < stream.size(); o += b.size()) {   // every later segment, read and decoded
+        const size_t n = (size_t)std::min<uint64_t>(b.size(), stream.size() - o);
+        src->prefetch(o + n, 1u << 20);
+        CHECK(src->preadAll(b.data(), n, o));
+    }
+    CHECK(src->debugCached(0));
+    src->debugHoldWaiter(0, false);
 }
 
 // ISA 4: a description using STREAMPOS is refused by a parser that claims an older instruction set.
