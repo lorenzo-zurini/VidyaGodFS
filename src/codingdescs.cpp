@@ -56,6 +56,7 @@ struct Asm {
     void Mark() { op(OP_MARK, 0, 0, 0, Z(), Z(), Z(), 0); }
     void HuffRun(int tab, uint16_t n, int runReg, int termReg, uint16_t lim) { op(OP_HUFFRUN, 0, (uint8_t)termReg, (uint8_t)runReg, n, Z(), lim, (uint32_t)tab); }
     void ByteRun(uint16_t n) { op(OP_BYTERUN, 0, 0, 0, n, Z(), Z(), 0); }
+    void Predict(int family, uint32_t knob, int tgt, uint16_t at, uint16_t lo, uint16_t hi) { op(OP_PREDICT, 0, (uint8_t)family, (uint8_t)tgt, at, lo, hi, knob); }
     void End() { op(OP_END, 0, 0, 0, Z(), Z(), Z(), 0); }
     uint16_t ADD(uint16_t a, uint16_t b) { return X(EX_ADD, a, b); }
     uint16_t SUB(uint16_t a, uint16_t b) { return X(EX_SUB, a, b); }
@@ -102,7 +103,10 @@ enum { G_STREAM, G_BLOCK, G_DYN, G_TOKENS, G_BEND, G_STORED, G_SLOOP, G_DYNHDR, 
 
 // ---- LZ4
 enum { QR_LIT = 1, QR_ML, QR_OFF, QR_TK, QR_R, QR_B, QR_I };
-enum { Q_STREAM, Q_SEQ, Q_LX, Q_LITS, Q_LL, Q_LDONE, Q_LAST, Q_MX, Q_COPY, Q_ENDC };
+enum { QR_A = 40, QR_PL, QR_PM, QR_PO, QR_F };                       // with a family: the anchor, the predicted token, the flag
+enum { Q_STREAM, Q_SEQ, Q_LX, Q_LITS, Q_LL, Q_LDONE, Q_LAST, Q_MX, Q_COPY, Q_ENDC, Q_TOKEN, Q_PRED, Q_GOT, Q_RECORD, Q_RECDONE };
+// An LZ4 block's encoder family: its parse of the block [lo, hi) (registers) predicts every sequence
+struct Lz4Family { uint32_t attempts; int lo, hi; };
 
 } // namespace
 
@@ -264,14 +268,32 @@ Description DeflateDescription() {
 // One LZ4 block's sequences, from Q_SEQ to Q_ENDC (the caller ends the stream or returns). DECODE: `atEnd` is 0 once the
 // block's input is consumed (after a literal run: that run was the last sequence). CODE: the last sequence is the one
 // whose match length decision is 0, or the decisions run out.
-static void Lz4Body(Asm &a, uint16_t atEnd) {
+// With a family (`Fam`), a sequence's decisions are a flag: 0 the family's token, else 1 and the token as it is.
+static void Lz4Body(Asm &a, uint16_t atEnd, const Lz4Family *Fam = nullptr) {
     const uint16_t LIT = a.R(QR_LIT), ML = a.R(QR_ML), OFF = a.R(QR_OFF), TK = a.R(QR_TK), Rr = a.R(QR_R), B = a.R(QR_B);
     const uint16_t F15 = a.C(15), B255 = a.C(255);
     auto MIN15 = [&](uint16_t x) { return a.SUB(x, a.MUL(a.GE(x, a.C(16)), a.SUB(x, F15))); };
     auto MIN255 = [&](uint16_t x) { return a.SUB(x, a.MUL(a.GE(x, a.C(256)), a.SUB(x, B255))); };
+    auto predict = [&] { a.Predict(kFamilyLz4hc, Fam->attempts, QR_PL, a.R(QR_A), a.R(Fam->lo), a.R(Fam->hi)); };
+    // DECODE, a sequence read: its decisions (with a family: whether it is the family's, and if not, itself)
+    auto record = [&](int next) {
+        a.Mode(kDecode);
+        if (!Fam) { a.Dec(QR_LIT); a.Dec(QR_ML); a.Dec(QR_OFF); a.Mode(0); a.Jmp(next); return; }
+        predict();
+        a.Set(QR_F, a.OR(a.OR(a.NE(LIT, a.R(QR_PL)), a.NE(ML, a.R(QR_PM))), a.NE(OFF, a.R(QR_PO))));
+        a.Dec(QR_F); a.Jz(a.R(QR_F), next); a.Dec(QR_LIT); a.Dec(QR_ML); a.Dec(QR_OFF); a.Mode(0); a.Jmp(next);
+    };
     a.Label(Q_SEQ); a.Mark();
-    a.Mode(kCode); a.Jz(a.X1(EX_DLEFT, 0), Q_ENDC); a.Dec(QR_LIT); a.Dec(QR_ML); a.Dec(QR_OFF);
-    a.Set(QR_TK, a.OR(a.SHL(MIN15(LIT), a.C(4)), a.MUL(a.NE(ML, a.C(0)), MIN15(a.SUB(ML, a.C(4))))));
+    if (Fam) a.Set(QR_A, a.R(kRegPlace));
+    a.Mode(kCode); a.Jz(a.X1(EX_DLEFT, 0), Q_ENDC);
+    if (!Fam) { a.Dec(QR_LIT); a.Dec(QR_ML); a.Dec(QR_OFF); }
+    else {
+        a.Dec(QR_F); a.Jz(a.R(QR_F), Q_PRED); a.Dec(QR_LIT); a.Dec(QR_ML); a.Dec(QR_OFF); a.Jmp(Q_GOT);
+        a.Label(Q_PRED); predict(); a.Assert(a.NE(a.R(QR_PM), a.C(kNoPrediction)));      // a record whose flag the family cannot back
+        a.Set(QR_LIT, a.R(QR_PL)); a.Set(QR_ML, a.R(QR_PM)); a.Set(QR_OFF, a.R(QR_PO));
+        a.Label(Q_GOT);
+    }
+    a.Mode(kCode); a.Set(QR_TK, a.OR(a.SHL(MIN15(LIT), a.C(4)), a.MUL(a.NE(ML, a.C(0)), MIN15(a.SUB(ML, a.C(4))))));
     a.Mode(0); a.Raw(a.C(8), TK, QR_TK);
     a.Mode(kDecode); a.Set(QR_LIT, a.SHR(TK, a.C(4))); a.Mode(0);
     a.Jz(a.EQ(a.SHR(TK, a.C(4)), F15), Q_LITS);
@@ -295,9 +317,9 @@ static void Lz4Body(Asm &a, uint16_t atEnd) {
     a.Mode(kDecode); a.Set(QR_ML, a.ADD(ML, B)); a.Mode(0);
     a.Jz(a.EQ(B, B255), Q_COPY); a.Jmp(Q_MX);
     a.Label(Q_COPY); a.OutCopy(ML, OFF);
-    a.Mode(kDecode); a.Dec(QR_LIT); a.Dec(QR_ML); a.Dec(QR_OFF); a.Mode(0);
-    a.Jmp(Q_SEQ);
-    a.Label(Q_LAST); a.Mode(kDecode); a.Set(QR_ML, a.C(0)); a.Set(QR_OFF, a.C(0)); a.Dec(QR_LIT); a.Dec(QR_ML); a.Dec(QR_OFF); a.Mode(0);
+    record(Q_SEQ);
+    a.Label(Q_LAST); a.Mode(kDecode); a.Set(QR_ML, a.C(0)); a.Set(QR_OFF, a.C(0)); a.Mode(0);
+    record(Q_ENDC);
     a.Label(Q_ENDC);
 }
 
@@ -319,10 +341,10 @@ Description Lz4BlockDescription() {
 // blocks are LZ4 blocks or stored. Everything the archive's own header says is read back from the content, so the
 // header steers the walk and the decisions hold only what the encoder chose: frame flags, block sizes, sequences.
 enum { BR_FLAGS = 10, BR_NF, BR_FI, BR_Q, BR_CNT, BR_SZ, BR_LEN, BR_END, BR_ORIG, BR_CEND, BR_MAG, BR_FLG, BR_BD, BR_HC, BR_BS, BR_BEND, BR_X, BR_COMP,
-       BR_LEFT, BR_RQ };
+       BR_LEFT, BR_RQ, BR_BLO, BR_BHI };
 enum { B_STREAM = 40, B_FOLD, B_FILE, B_NEXTF, B_DONE, B_MEMBER, B_RAWMEM, B_NONAME, B_CS, B_DI, B_BLK, B_CBLK, B_BCK, B_BCS, B_FEND, B_FDONE, B_LZ4,
        B_LOOP, B_HAVE, B_SCAN, B_NEXT, B_NEXTFOLD, B_NONE };
-Description BsaDescription() {
+Description BsaDescription(uint32_t Attempts) {
     Asm a;
     auto R = [&](int r) { return a.R(r); };
     auto BYTE = [&](uint16_t at) { return a.X1(EX_BYTE, at); };
@@ -391,7 +413,13 @@ Description BsaDescription() {
     a.Label(B_BLK); a.RawF(a.C(32), BR_BS); a.Jz(R(BR_BS), B_FEND);
     a.Jz(BIT(R(BR_BS), 31), B_CBLK);
     a.ByteRun(a.AND(R(BR_BS), a.C(0x7FFFFFFFu))); a.Jmp(B_BCK);            // a stored block
-    a.Label(B_CBLK); a.Set(BR_BEND, a.ADD(SPOS(), R(BR_BS))); a.Call(B_LZ4);
+    a.Label(B_CBLK); a.Set(BR_BEND, a.ADD(SPOS(), R(BR_BS)));
+    if (Attempts) {                                                       // the block's content: the frame's block size, or what is left
+        const uint16_t BMAX = a.SHL(a.C(1), a.ADD(a.MUL(a.AND(a.SHR(R(BR_BD), a.C(4)), a.C(7)), a.C(2)), a.C(8)));
+        const uint16_t END = a.ADD(PLACE, BMAX);
+        a.Set(BR_BLO, PLACE); a.Set(BR_BHI, a.SUB(END, a.MUL(a.GE(END, R(BR_CEND)), a.SUB(END, R(BR_CEND)))));
+    }
+    a.Call(B_LZ4);
     a.Mode(kDecode); a.Assert(a.EQ(SPOS(), R(BR_BEND))); a.Mode(0);
     a.Label(B_BCK); a.Jz(BIT(R(BR_FLG), 4), B_BLK); a.RawF(a.C(32), BR_X); a.Jmp(B_BLK);   // a block checksum
     a.Label(B_FEND); a.Jz(BIT(R(BR_FLG), 2), B_FDONE); a.RawF(a.C(32), BR_X);             // the content checksum
@@ -399,11 +427,13 @@ Description BsaDescription() {
     a.Label(B_RAWMEM); a.ByteRun(a.SUB(R(BR_END), SPOS())); a.Ret();
     // an LZ4 block, ending at BR_BEND (DECODE) or its last sequence (CODE)
     a.Label(B_LZ4);
-    Lz4Body(a, a.NE(SPOS(), R(BR_BEND)));
+    const Lz4Family fam{Attempts, BR_BLO, BR_BHI};
+    Lz4Body(a, a.NE(SPOS(), R(BR_BEND)), Attempts ? &fam : nullptr);
     a.Ret();
     a.link();
     Description d = std::move(a.d);
-    d.name = "BSA 105 (Skyrim Special Edition)"; d.coder = kBits; d.entryStream = (uint16_t)a.lab[B_STREAM]; d.entryToken = -1;
+    if (Attempts) d.isa = 5;
+    d.name = Attempts ? "BSA 105 (Skyrim Special Edition), LZ4HC " + std::to_string(Attempts) : "BSA 105 (Skyrim Special Edition)"; d.coder = kBits; d.entryStream = (uint16_t)a.lab[B_STREAM]; d.entryToken = -1;
     d.window = 65535; d.maxlen = 0xFFFFFFFFu;
     return d;
 }

@@ -27,10 +27,12 @@
 
 namespace coding {
 
-constexpr uint32_t kIsa = 4;          // the instruction set a description may use; newer is refused (3: HUFFRUN, BYTERUN; 4: STREAMPOS)
+constexpr uint32_t kIsa = 5;          // the instruction set a description may use; newer is refused (3: HUFFRUN, BYTERUN; 4: STREAMPOS; 5: PREDICT)
 constexpr int kRegs = 64;
 constexpr int kRegPlace = 0;          // register 0: the place in the content
 constexpr uint32_t kNoSlot = 255;
+constexpr uint32_t kNoPrediction = 0xFFFFFFFFu;
+constexpr uint8_t kFamilyLz4hc = 1;
 
 enum Mode : uint8_t { kCode = 1, kDecode = 2, kPrice = 4, kAll = 7, kCodePrice = 5 };
 enum Coder : uint8_t { kRange = 0, kBits = 1 };
@@ -69,6 +71,11 @@ enum OpCode : uint8_t {
                  // DECODE reads symbols below m as literals (into the content) until one is not, which goes to register nb;
                  // register tgt gets the run's length either way
     OP_BYTERUN,  // x content bytes through the bit coder as they are (byte-aligned: copied whole)
+    // ---- ISA 5: encoder families (22.15.4: a family predicts the encoder's decisions, so a record holds corrections)
+    OP_PREDICT,  // registers tgt, tgt+1, tgt+2 = family nb's predicted token anchored at content place x, from its parse of
+                 // the content [v, m) (a block), knob imm. Family 1: LZ4 high compression (lz4family.h), imm = its attempts;
+                 // the token is (literals, copy length, distance), copy length 0 the block's last; no prediction at x (or a
+                 // run that predicts nothing: PRICE, a plain mint) gives copy length kNoPrediction
     OP_COUNT
 };
 constexpr uint8_t kFree = 1;          // op flag: its value is a decision
@@ -78,7 +85,7 @@ struct Op { uint8_t op = 0, modes = 0, flags = 0, nb = 0, tgt = 0; uint16_t x = 
 
 struct Description {
     std::string name;
-    uint32_t isa = kIsa;
+    uint32_t isa = 4;                                   // the instruction set it needs (a builder using newer ops says so)
     uint8_t coder = kRange;
     std::vector<Op> ops;
     std::vector<Ex> ex;
@@ -104,23 +111,30 @@ bool Parse(const uint8_t *Data, size_t N, Description &D, std::string &Err);
 Description LzmaDescription(int Lc, int Lp, int Pb, uint32_t Dict, bool EndMarker);
 Description DeflateDescription();
 Description Lz4BlockDescription();
-Description BsaDescription();        // Bethesda archive v105 (Skyrim SE): header region + members, LZ4 frames
+// Bethesda archive v105 (Skyrim SE): header region + members, LZ4 frames. Attempts: the LZ4 high-compression family that
+// predicts the frames' blocks (32768: Bethesda's own packer, lz4 1.7 level 16), 0 none (every sequence a decision).
+Description BsaDescription(uint32_t Attempts = 32768);
 
 // The checkpoint spacing a description suits: a coder without adaptive state (static codes, raw bytes) checkpoints
 // cheaply, so often (every block or so: a read starts at most that far back, and segments decode in parallel); one
 // with adaptive slots carries them in every checkpoint, so less often.
 // `Shipped` (the stream's size, 0 unknown) lets a small stream still split into enough segments to decode in parallel.
-uint64_t SuggestedSpacing(const Description &D, uint64_t Shipped = 0);
+// Plain: the spacing for a plain record of a description with families (an expansion's).
+uint64_t SuggestedSpacing(const Description &D, uint64_t Shipped = 0, bool Plain = false);
 
 // Mint: decode `Shipped` with `D` into its content and a RECORD (the decisions, plus checkpoints every `Spacing`
 // shipped bytes at the description's MARK points), then code it back and refuse unless every byte matches.
 // `ContentSize` is the expected content size (0: unknown, at most `ContentCap`).
+// A description with PREDICT ops (ISA 5) mints a PREDICTED record ("VGCQ": its decisions are corrections against the
+// families' predictions, so it is small, and a run of it runs the families); `Predict` false mints a PLAIN one ("VGCR":
+// every decision as the stream has it; fast to run, larger).
+bool UsesPrediction(const Description &D);
 bool Mint(const Description &D, const uint8_t *Shipped, size_t N, size_t ContentSize, size_t ContentCap, uint64_t Spacing,
-          std::vector<uint8_t> &Content, std::vector<uint8_t> &Record, std::string &Err);
+          std::vector<uint8_t> &Content, std::vector<uint8_t> &Record, std::string &Err, bool Predict = true);
 // The same into a caller's buffer of ContentCap bytes (a tool maps a big one lazily, so a stream of gigabytes costs only the
 // pages its content fills); the content's length is returned in ContentLen.
 bool MintInto(const Description &D, const uint8_t *Shipped, size_t N, size_t ContentSize, uint8_t *Buf, size_t ContentCap, uint64_t Spacing,
-              size_t &ContentLen, std::vector<uint8_t> &Record, std::string &Err);
+              size_t &ContentLen, std::vector<uint8_t> &Record, std::string &Err, bool Predict = true);
 
 // A shipped stream served from a description, its content and its record: random access through the record's
 // checkpoints, safe for concurrent reads. A reader going front to back (a game loading a bundle) is served by
@@ -138,6 +152,7 @@ public:
     uint64_t size() const override { return Size; }
     size_t   checkpoints() const { return Cks.size(); }       // (tests)
     uint64_t segmentsDecoded() const;                          // (tests, benchmarks: work done, against checkpoints())
+    bool     predicted() const;                                // a VGCQ record (its reads run the families: slower; see ExpandInto)
     uint64_t bytesGenerated() const;                           // (tests: bytes segments generated; copy runs are handed down, not counted)
     // (tests) the interleavings of a busy pool, forced: hold a reader's place on the segment holding Off (as a waiting
     // reader does: the segment is not evicted), ask whether that segment is decoded and kept, and have the next reader
@@ -153,7 +168,17 @@ private:
     std::shared_ptr<ByteSource> Rec, Content;
     std::vector<Ck> Cks;
     uint64_t Size = 0;
+    friend bool ExpandInto(std::shared_ptr<ByteSource>, std::shared_ptr<ByteSource>, std::shared_ptr<ByteSource>, uint8_t *, size_t,
+                           uint8_t *, size_t, uint64_t, std::vector<uint8_t> &, std::string &);
 };
+
+// EXPAND a predicted record into the plain one (the same stream, the same description, every decision stored: a machine
+// keeps this beside the content so its reads run at plain speed, never the families). The shipped bytes are generated
+// into ShippedBuf (the stream's size) and minted plain over ContentBuf (the content's size): a tool maps both lazily.
+// Refused unless the plain mint reproduces the stream and its content is the content given.
+bool ExpandInto(std::shared_ptr<ByteSource> Desc, std::shared_ptr<ByteSource> Record, std::shared_ptr<ByteSource> Content,
+                uint8_t *ShippedBuf, size_t ShippedCap, uint8_t *ContentBuf, size_t ContentCap, uint64_t Spacing,
+                std::vector<uint8_t> &Plain, std::string &Err);
 
 } // namespace coding
 

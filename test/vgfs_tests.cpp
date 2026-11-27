@@ -18,6 +18,7 @@
 #include "bytesource.h"
 #include "deflatelayer.h"
 #include "coding.h"
+#include "lz4family.h"
 #include <lzma.h>
 #include <lz4.h>
 #include <lz4hc.h>
@@ -1528,7 +1529,8 @@ TEST(a_malformed_base_list_is_refused) {
         return std::make_pair(ok, err);
     };
     CHECK(!spec("").first);                           // no bases: a delta names what it was built over
-    CHECK(spec("[]").first);                          // an empty list parses: the plan reports the delta (it names no base)
+    CHECK(spec("[]").first);                          // an empty list: a delta over nothing (its own bytes)
+    CHECK(spec("null").first);                        // null: it named no base (the plan reports it)
     CHECK(!spec("[\"QmA\", 7]").first);               // a non-CID entry
     CHECK(!spec("[\"\"]").first);                     // an empty CID
     CHECK(!spec("\"QmA\"").first);                    // a bare CID where a list belongs
@@ -1893,6 +1895,34 @@ TEST(a_delta_with_no_file_for_its_base_or_a_ring_is_reported_and_left_out) {
     VfsAttr at;
     CHECK_EQ(VfsGetattr(S, "z.txt", at), 0);
     CHECK(VfsGetattr(S, "c", at) != 0);
+}
+
+// A delta over NOTHING ("bases": []) is a file stored compressed: it mounts its own bytes, zstd blocks read at random;
+// a delta that named no base ("bases": null) is reported and left out. Teeth: refuse empty bases; read null as empty.
+TEST(a_delta_over_nothing_is_its_own_bytes_and_one_naming_none_is_left_out) {
+    TmpDir t;
+    std::string game(300000, 'g'); for (size_t i = 0; i < game.size(); ++i) game[i] = char('a' + ((i / 3) * 7 + i % 11) % 26);
+    writeStoreZip(t / "v1.zip", { { "game.exe", game, false } });
+    const auto Dl = vgdelta::GenerateDelta(reinterpret_cast<const uint8_t *>(""), 0, (const uint8_t *)slurpFile(t / "v1.zip").data(), slurpFile(t / "v1.zip").size());
+    CHECK(!Dl.empty() && Dl.size() < slurpFile(t / "v1.zip").size());     // compressed
+    { std::ofstream o(t / "v1.vgdelta", std::ios::binary); o.write((const char *)Dl.data(), (std::streamsize)Dl.size()); }
+    { std::ofstream o(t / "junk.vgdelta", std::ios::binary); o << "x"; }
+    LayerSpec Own = deltaLayer(t.str("v1.vgdelta"), "g", {}); Own.basesNamed = true;
+    LayerSpec None = deltaLayer(t.str("junk.vgdelta"), "n", {}); None.basesNamed = false;
+    Spec sp; sp.readOnly = true; sp.layers = { Own, None };
+    const TreePlan P = PlanTree(sp);
+    CHECK(!P.broken[0] && P.broken[1]);
+    CHECK(P.problems.size() == 1 && P.problems[0].find("names no base") != std::string::npos);
+    VfsState S; std::string err;
+    CHECK(S.Init(sp, err));
+    OpenFile *F = nullptr;
+    CHECK_EQ(VfsOpen(S, "g/game.exe", 0, F), 0);
+    std::string got(game.size(), 0);
+    CHECK_EQ(F ? VfsRead(F, got.data(), got.size(), 0) : -1, (ssize_t)game.size());
+    if (F) VfsRelease(F);
+    CHECK(got == game);
+    VfsAttr at;
+    CHECK(VfsGetattr(S, "n", at) != 0);
 }
 
 // A bytes-only delta (no TAKE shows it; another delta reads it) appears nowhere, so it hides nothing: the base it was
@@ -3662,6 +3692,7 @@ static std::vector<uint8_t> lz4Frame(const std::vector<uint8_t> &in, int ff) {
     const size_t n = LZ4F_compressFrame(out.data(), out.size(), in.data(), in.size(), &p);
     out.resize(LZ4F_isError(n) ? 0 : n); return out;
 }
+static std::vector<uint8_t> familyFrame(const std::vector<uint8_t> &in, uint32_t attempts, int bd);
 // Returns the archive; `content` gets what the description must decode it to (header region, then each member's bytes).
 static std::vector<uint8_t> makeBsa(const std::vector<std::pair<std::string, std::vector<BsaMember>>> &folders, uint32_t flags,
                                     std::vector<uint8_t> &content, bool shuffle = false) {
@@ -3678,7 +3709,9 @@ static std::vector<uint8_t> makeBsa(const std::vector<std::pair<std::string, std
         const bool comp = ((flags >> 2) & 1) ^ m.flip;
         std::vector<uint8_t> s, d;
         if (flags & 0x100) { const std::string full = f.first + "\\" + m.name; s.push_back((uint8_t)full.size()); s.insert(s.end(), full.begin(), full.end()); d = s; }
-        if (comp) { u32(s, (uint32_t)m.data.size()); const auto fr = lz4Frame(m.data, m.frameFlags); s.insert(s.end(), fr.begin(), fr.end()); }
+        if (comp) { u32(s, (uint32_t)m.data.size());
+            const auto fr = m.frameFlags & 64 ? familyFrame(m.data, 512, 0x40) : m.frameFlags & 128 ? familyFrame(m.data, 512, 0x70) : lz4Frame(m.data, m.frameFlags);
+            s.insert(s.end(), fr.begin(), fr.end()); }
         else s.insert(s.end(), m.data.begin(), m.data.end());
         d.insert(d.end(), m.data.begin(), m.data.end());
         stored.push_back(s); decoded.push_back(d);
@@ -3744,6 +3777,87 @@ TEST(a_bsa_archive_is_served_through_its_description) {
         bsa = makeBsa(f, 0x7, want); bsa[4] = 104;                            // version 104 (Oldrim) is another description
         CHECK(!coding::Mint(bsaD, bsa.data(), bsa.size(), 0, want.size() * 2, 4096, content, record, err));
     }
+}
+
+// An LZ4 frame as Bethesda's packer makes them, from the family itself (independent blocks of BlockMax, no checksums):
+// every sequence is the family's, so a predicted record holds flags only
+static std::vector<uint8_t> familyFrame(const std::vector<uint8_t> &in, uint32_t attempts, int bd) {
+    const size_t bmax = (size_t)1 << (2 * ((bd >> 4) & 7) + 8);
+    std::vector<uint8_t> f = {0x04, 0x22, 0x4D, 0x18, 0x60, (uint8_t)bd, 0x73};
+    coding::Lz4hcParser P; std::vector<coding::Lz4Seq> seqs;
+    auto len = [](std::vector<uint8_t> &o, size_t n) { for (; n >= 255; n -= 255) o.push_back(255); o.push_back((uint8_t)n); };
+    for (size_t o = 0; o < in.size(); o += bmax) {
+        const size_t n = std::min(bmax, in.size() - o); P.parse(in.data() + o, n, attempts, seqs);
+        std::vector<uint8_t> b;
+        for (const auto &q : seqs) {
+            const size_t ml = q.ml ? q.ml - 4 : 0;
+            b.push_back((uint8_t)((std::min<size_t>(q.lit, 15) << 4) | (q.ml ? std::min<size_t>(ml, 15) : 0)));
+            if (q.lit >= 15) len(b, q.lit - 15);
+            b.insert(b.end(), in.begin() + (long)(o + q.anchor), in.begin() + (long)(o + q.anchor + q.lit));
+            if (!q.ml) break;
+            b.push_back((uint8_t)q.off); b.push_back((uint8_t)(q.off >> 8));
+            if (ml >= 15) len(b, ml - 15);
+        }
+        for (int i = 0; i < 4; ++i) f.push_back((uint8_t)(b.size() >> 8 * i));
+        f.insert(f.end(), b.begin(), b.end());
+    }
+    for (int i = 0; i < 4; ++i) f.push_back(0);
+    return f;
+}
+
+// The family (ISA 5): a BSA whose frames Bethesda's packer made mints a PREDICTED record that holds only flags, far smaller
+// than the plain one, and serves the same bytes; EXPAND gives exactly the plain mint's record; a predicted record passed
+// off as plain is refused; frames from another encoder still mint (their sequences are corrections). Teeth: predict nothing
+// (records stay plain-sized); expand without the plain mint (records differ); ignore the flag.
+TEST(a_bsa_family_predicts_its_frames) {
+    const uint32_t att = 512;                                             // a cheap family keeps the test fast; the knob is data
+    const auto famD = coding::BsaDescription(att), plainD = coding::BsaDescription(0);
+    CHECK(coding::UsesPrediction(famD)); CHECK(!coding::UsesPrediction(plainD)); CHECK(famD.isa == 5 && plainD.isa == 4);
+    // the archive: members whose frames come from the family (64 KiB and 4 MiB blocks), with liblz4's members beside them
+    const auto m1 = sampleContent(0, 200000, 41), m2 = sampleContent(3, 90000, 42), m3 = sampleContent(1, 150000, 43);
+    std::vector<uint8_t> want;
+    // a and b: the family's own frames (frameFlags 64: 64 KiB blocks, 128: 4 MiB); c: liblz4's, checksummed
+    std::vector<uint8_t> content, recQ, recP; std::string err;
+    const auto bsa = makeBsa({{"t", {{"a.dds", m1, false, 64}, {"b.dds", m2, false, 128}, {"c.nif", m3, false, 1 | 4}}}}, 0x7, want);
+    CHECK(coding::Mint(famD, bsa.data(), bsa.size(), 0, want.size() * 2, 4096, content, recQ, err)); CHECK(content == want);
+    CHECK(coding::Mint(famD, bsa.data(), bsa.size(), 0, want.size() * 2, 4096, content, recP, err, false));
+    CHECK(recQ.size() >= 4 && recQ[3] == 'Q' && recP[3] == 'R');
+    CHECK(recQ.size() * 3 < recP.size());                                // flags, not tokens
+    auto mk = [&](const coding::Description &d, const std::vector<uint8_t> &rec) {
+        return coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d)), std::make_shared<MemByteSource>(rec),
+                                               std::make_shared<MemByteSource>(content), bsa.size(), err); };
+    auto q = mk(famD, recQ), p = mk(famD, recP);
+    CHECK(q && p); if (!q || !p) return;
+    CHECK(q->predicted() && !p->predicted());
+    CHECK(readsBack(*q, bsa, 51, 40)); CHECK(readsBack(*p, bsa, 52, 40));
+    // expand: the predicted record's plain twin is the plain mint's record, byte for byte
+    std::vector<uint8_t> sb(bsa.size()), cb(content.size()), plain;
+    CHECK(coding::ExpandInto(std::make_shared<MemByteSource>(coding::Serialize(famD)), std::make_shared<MemByteSource>(recQ), std::make_shared<MemByteSource>(content),
+                             sb.data(), sb.size(), cb.data(), cb.size(), 4096, plain, err));
+    CHECK(plain == recP);
+    // a predicted record passed off as plain: its flags name predictions a plain run does not make
+    auto fake = recQ; fake[3] = 'R';
+    auto bad = mk(famD, fake); CHECK(bad != nullptr);
+    if (bad) { std::vector<uint8_t> all(bsa.size()); CHECK(!bad->preadAll(all.data(), all.size(), 0)); }
+    // the family's knob is part of the description: another one predicts other tokens (a record minted under 512 attempts
+    // served under 1 either reads back exactly or is refused, never other bytes)
+    auto other = mk(coding::BsaDescription(1), recQ);
+    if (other) { std::vector<uint8_t> all(bsa.size()); if (other->preadAll(all.data(), all.size(), 0)) CHECK(all == bsa); }
+}
+
+// PREDICT is ISA 5 and bounded: an ISA-4 description naming it, a family the reader lacks, and a knob past the limit are
+// refused.
+TEST(a_predict_op_is_checked) {
+    auto d = coding::BsaDescription(512); std::string err; coding::Description back;
+    auto bytes = coding::Serialize(d); CHECK(coding::Parse(bytes.data(), bytes.size(), back, err));
+    auto with = [&](auto edit) { auto e = d; edit(e); const auto b = coding::Serialize(e); coding::Description x; return coding::Parse(b.data(), b.size(), x, err); };
+    size_t at = 0; for (; at < d.ops.size(); ++at) if (d.ops[at].op == coding::OP_PREDICT) break;
+    CHECK(at < d.ops.size());
+    CHECK(!with([](coding::Description &e) { e.isa = 4; }));
+    CHECK(!with([&](coding::Description &e) { e.ops[at].nb = 2; }));
+    CHECK(!with([&](coding::Description &e) { e.ops[at].imm = coding::kLz4hcMaxAttempts + 1; }));
+    CHECK(!with([&](coding::Description &e) { e.ops[at].imm = 0; }));
+    CHECK(with([&](coding::Description &e) { e.ops[at].imm = coding::kLz4hcMaxAttempts; }));
 }
 
 // Under a slow content read (a busy disk) and read-ahead far past the segment cache, readers on many threads still get
@@ -3847,7 +3961,7 @@ TEST(a_reader_never_loses_the_segment_it_waits_for) {
 
 // ISA 4: a description using STREAMPOS is refused by a parser that claims an older instruction set.
 TEST(a_description_newer_than_its_isa_is_refused) {
-    auto d = coding::BsaDescription(); auto bytes = coding::Serialize(d);
+    auto d = coding::BsaDescription(0); auto bytes = coding::Serialize(d);
     coding::Description back; std::string err;
     CHECK(coding::Parse(bytes.data(), bytes.size(), back, err));
     // the ISA field follows the magic; claim ISA 3

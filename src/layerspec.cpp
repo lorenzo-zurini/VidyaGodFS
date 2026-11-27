@@ -97,8 +97,11 @@ bool ParseSpecText(const std::string &Text, Spec &Out, std::string &Err)
                 return Bad(L.contains("bases") ? "only a delta or a coded stream has bases" : "a delta or a coded stream must name its bases");
             if (Rebuilt)
             {
-                if (!L["bases"].is_array()) return Bad("bases must be an array of CIDs");   // empty: the plan reports it
-                for (const auto &B : L["bases"])
+                //null: the layer named no base (its node has none, or a malformed list): the plan reports it and mounts none
+                //of it. An EMPTY list is a delta over nothing: its bytes are its own (a file stored compressed).
+                if (L["bases"].is_null() && LS.type == LayerType::Delta) LS.basesNamed = false;
+                else if (!L["bases"].is_array()) return Bad("bases must be an array of CIDs");
+                for (const auto &B : L["bases"].is_array() ? L["bases"] : nlohmann::json::array())
                 {
                     if (!B.is_string() || B.get<std::string>().empty()) return Bad("a base must be a CID");
                     if (std::find(LS.bases.begin(), LS.bases.end(), B.get<std::string>()) != LS.bases.end())

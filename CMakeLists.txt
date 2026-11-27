@@ -45,6 +45,7 @@ set(VGFS_CORE_SRC
     src/deflatelayer.cpp
     src/coding.cpp
     src/codingdescs.cpp
+    src/lz4family.cpp
     src/zipscan.cpp
 )
 if(WIN32)

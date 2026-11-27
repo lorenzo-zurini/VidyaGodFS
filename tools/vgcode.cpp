@@ -1,7 +1,11 @@
 // vgcode: the coding algebra from the command line (authoring and verification; the mount reads coded layers itself).
-//   vgcode describe <lz4|deflate|bsa|lzma:lc,lp,pb,dict[,end]> <out.vgcd>
-//   vgcode mint <description> <shipped> <content-out> <record-out> [spacing]
+//   vgcode describe <lz4|deflate|bsa[:attempts]|lzma:lc,lp,pb,dict[,end]> <out.vgcd>
+//       bsa: with Bethesda's packer as its family (LZ4HC, 32768 attempts); bsa:0 without a family
+//   vgcode mint [--plain] <description> <shipped> <content-out> <record-out> [spacing]
 //       decode the shipped file into its content and a record, code it back and refuse unless every byte matches
+//       (a description with a family mints a PREDICTED record, small; --plain mints every decision: larger, fast to read)
+//   vgcode expand <description> <record> <content> <plain-record-out> [spacing]
+//       a predicted record's plain twin (what a machine keeps beside the content, so reads never run the family)
 //   vgcode verify <description> <record> <content> <shipped>
 //       rebuild the shipped bytes through the read path (segments, copy runs, the pool) and compare them to the file
 //   vgcode cat <description> <record> <content> <out>
@@ -45,6 +49,7 @@ int main(int argc, char **argv) {
         if (n == "lz4") d = coding::Lz4BlockDescription();
         else if (n == "deflate") d = coding::DeflateDescription();
         else if (n == "bsa") d = coding::BsaDescription();
+        else if (n.rfind("bsa:", 0) == 0) d = coding::BsaDescription((uint32_t)std::stoul(n.substr(4)));
         else if (n.rfind("lzma:", 0) == 0) {
             unsigned lc, lp, pb, end = 1; unsigned long dict;
             if (std::sscanf(n.c_str() + 5, "%u,%u,%u,%lu,%u", &lc, &lp, &pb, &dict, &end) < 4) { std::cerr << "lzma:lc,lp,pb,dict[,end]\n"; return 2; }
@@ -53,6 +58,8 @@ int main(int argc, char **argv) {
         const auto b = coding::Serialize(d);
         return Spit(argv[3], b.data(), b.size()) ? 0 : 1;
     }
+    bool plain = false;
+    if (cmd == "mint" && argc > 2 && std::string(argv[2]) == "--plain") { plain = true; for (int i = 2; i + 1 < argc; ++i) argv[i] = argv[i + 1]; --argc; }
     if (cmd == "mint" && (argc == 6 || argc == 7)) {
         std::vector<uint8_t> db; std::string err; coding::Description d;
         if (!Slurp(argv[2], db) || !coding::Parse(db.data(), db.size(), d, err)) { std::cerr << "description: " << err << "\n"; return 1; }
@@ -61,13 +68,28 @@ int main(int argc, char **argv) {
         const size_t cap = 0xFFFFFFFFu;
         void *buf = mmap(nullptr, cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (buf == MAP_FAILED) { std::cerr << "cannot reserve the content buffer\n"; return 1; }
-        const uint64_t spacing = argc == 7 ? std::stoull(argv[6]) : coding::SuggestedSpacing(d, s.n);
+        const uint64_t spacing = argc == 7 ? std::stoull(argv[6]) : coding::SuggestedSpacing(d, s.n, plain);
         size_t len = 0; std::vector<uint8_t> rec; const double t0 = Now();
-        if (!coding::MintInto(d, s.p, (size_t)s.n, 0, (uint8_t *)buf, cap, spacing, len, rec, err)) { std::cerr << "refused: " << err << "\n"; return 1; }
+        if (!coding::MintInto(d, s.p, (size_t)s.n, 0, (uint8_t *)buf, cap, spacing, len, rec, err, !plain)) { std::cerr << "refused: " << err << "\n"; return 1; }
         const double dt = Now() - t0;
         if (!Spit(argv[4], (const uint8_t *)buf, len) || !Spit(argv[5], rec.data(), rec.size())) { std::cerr << "cannot write\n"; return 1; }
-        std::cout << "minted " << s.n << " shipped -> " << len << " content + " << rec.size() << " record (" << d.name << ", spacing "
+        std::cout << "minted " << s.n << " shipped -> " << len << " content + " << rec.size() << (rec[3] == 'Q' ? " predicted" : " plain") << " record (" << d.name << ", spacing "
                   << spacing << ") in " << dt << " s; codes back bit-exact\n";
+        return 0;
+    }
+    if (cmd == "expand" && (argc == 6 || argc == 7)) {
+        auto d = Map(argv[2]), r = Map(argv[3]), c = Map(argv[4]); if (!d || !r || !c) return 1;
+        std::string err; auto src = coding::CodedByteSource::Create(d, r, c, 0, err); if (!src) { std::cerr << "refused: " << err << "\n"; return 1; }
+        const size_t sn = (size_t)src->size(), cn = (size_t)c->size();
+        void *sb = mmap(nullptr, sn + 1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        void *cb = mmap(nullptr, cn + 1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (sb == MAP_FAILED || cb == MAP_FAILED) { std::cerr << "cannot reserve the buffers\n"; return 1; }
+        std::vector<uint8_t> db; coding::Description dd; Slurp(argv[2], db); coding::Parse(db.data(), db.size(), dd, err);
+        const uint64_t spacing = argc == 7 ? std::stoull(argv[6]) : coding::SuggestedSpacing(dd, sn, true);
+        std::vector<uint8_t> plainRec; const double t0 = Now();
+        if (!coding::ExpandInto(d, r, c, (uint8_t *)sb, sn, (uint8_t *)cb, cn, spacing, plainRec, err)) { std::cerr << "refused: " << err << "\n"; return 1; }
+        if (!Spit(argv[5], plainRec.data(), plainRec.size())) { std::cerr << "cannot write\n"; return 1; }
+        std::cout << "expanded " << r->size() << " -> " << plainRec.size() << " plain record (" << sn << " shipped) in " << Now() - t0 << " s\n";
         return 0;
     }
     if ((cmd == "verify" || cmd == "cat") && argc == 6) {
@@ -89,7 +111,8 @@ int main(int argc, char **argv) {
                   << src->segmentsDecoded() << "/" << src->checkpoints() << " segments)\n";
         return 0;
     }
-    std::cerr << "usage:\n  vgcode describe <lz4|deflate|bsa|lzma:lc,lp,pb,dict[,end]> <out>\n  vgcode mint <description> <shipped> <content-out> <record-out> [spacing]\n"
+    std::cerr << "usage:\n  vgcode describe <lz4|deflate|bsa[:attempts]|lzma:lc,lp,pb,dict[,end]> <out>\n  vgcode mint [--plain] <description> <shipped> <content-out> <record-out> [spacing]\n"
+                 "  vgcode expand <description> <record> <content> <plain-record-out> [spacing]\n"
                  "  vgcode verify <description> <record> <content> <shipped>\n  vgcode cat <description> <record> <content> <out>\n";
     return 2;
 }

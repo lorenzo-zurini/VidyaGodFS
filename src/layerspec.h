@@ -17,6 +17,7 @@ struct LayerSpec {
     std::string source;      // absolute host path (dir / archive / single file)
     std::string target;      // normalized virtual subtree root: no leading/trailing '/', "" == mount root
     std::string cid;         // zip/delta/file: the CID of `source`'s bytes — what a delta names it by ("" = none)
+    bool        basesNamed = true;   // DELTA: false when the layer named no base at all ("bases": null): it cannot rebuild
     std::vector<std::string> bases;   // DELTA only, REQUIRED: the CIDs of the files whose bytes, joined in this order,
                              // are the delta's base (a zip's file; a single file's own bytes — a disc image; a delta's
                              // rebuilt archive). Where those files are

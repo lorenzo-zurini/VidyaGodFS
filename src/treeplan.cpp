@@ -53,7 +53,9 @@ TreePlan PlanTree(const Spec &S, const std::vector<bool> &Failed)
         Seen[D] = Visiting;
         std::string Why;
         if (D < Failed.size() && Failed[D]) Why = "its bytes did not rebuild over its bases";
-        if (S.layers[D].bases.empty() && Why.empty()) Why = "it names no base";
+        //a delta over NO base is its own bytes, zstd-compressed with random access (content at rest); a coded stream
+        //always has its content
+        if ((S.layers[D].type == LayerType::Coded ? S.layers[D].bases.empty() : !S.layers[D].basesNamed) && Why.empty()) Why = "it names no base";
         for (const std::string &C : S.layers[D].bases)
         {
             const auto It = Carrier.find(C);
