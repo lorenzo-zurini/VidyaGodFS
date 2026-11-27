@@ -3648,13 +3648,15 @@ TEST(a_hostile_record_or_oversized_description_is_refused) {
 // spec that names a content no layer carries is planned as broken, not mounted wrong.
 // ---- BSA 105 (Skyrim Special Edition), from its description: an archive made here, member by member
 struct BsaMember { std::string name; std::vector<uint8_t> data; bool flip = false; int frameFlags = 0; };
-// frameFlags: 1 = block checksums, 2 = content checksum, 4 = content size, 8 = linked blocks, 16 = 64 KiB blocks
+// frameFlags: 1 = block checksums, 2 = content checksum, 4 = content size, 8 = linked blocks, 16 = 64 KiB blocks,
+// 32 = a dictionary id in the frame header
 static std::vector<uint8_t> lz4Frame(const std::vector<uint8_t> &in, int ff) {
     LZ4F_preferences_t p{}; p.frameInfo.blockSizeID = ff & 16 ? LZ4F_max64KB : LZ4F_max4MB;
     p.frameInfo.blockMode = ff & 8 ? LZ4F_blockLinked : LZ4F_blockIndependent;
     p.frameInfo.contentChecksumFlag = ff & 2 ? LZ4F_contentChecksumEnabled : LZ4F_noContentChecksum;
     p.frameInfo.blockChecksumFlag = ff & 1 ? LZ4F_blockChecksumEnabled : LZ4F_noBlockChecksum;
     p.frameInfo.contentSize = ff & 4 ? in.size() : 0; p.compressionLevel = ff & 8 ? 9 : 0;
+    p.frameInfo.dictID = ff & 32 ? 0x5EED1234u : 0;
     std::vector<uint8_t> out(LZ4F_compressFrameBound(in.size(), &p));
     const size_t n = LZ4F_compressFrame(out.data(), out.size(), in.data(), in.size(), &p);
     out.resize(LZ4F_isError(n) ? 0 : n); return out;
@@ -3707,7 +3709,7 @@ TEST(a_bsa_archive_is_served_through_its_description) {
         std::vector<std::pair<std::string, std::vector<BsaMember>>> f = {
             {"textures\\armor", {{"iron.dds", sampleContent(0, 70000, 3), false, 0}, {"steel.dds", sampleContent(1, 300000, 4), false, 1 | 2 | 4},
                                  {"glass.dds", sampleContent(2, 5000, 5), true, 0}}},
-            {"meshes", {{"a.nif", sampleContent(3, 140000, 6), false, 8 | 16}, {"empty.nif", {}, false, 0}, {"b.nif", sampleContent(0, 90000, 7), false, 16 | 1}}}};
+            {"meshes", {{"a.nif", sampleContent(3, 140000, 6), false, 8 | 16}, {"empty.nif", {}, false, 0}, {"b.nif", sampleContent(0, 90000, 7), false, 16 | 1}, {"c.nif", sampleContent(2, 20000, 8), false, 32 | 4}}}};
         std::vector<uint8_t> want; const auto bsa = makeBsa(f, flags, want);
         auto src = codedSource(bsaD, bsa.data(), bsa.size(), want, 4096);
         CHECK(src != nullptr); if (!src) continue;
