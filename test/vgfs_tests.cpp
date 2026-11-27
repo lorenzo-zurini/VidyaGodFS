@@ -3683,8 +3683,9 @@ static std::vector<uint8_t> makeBsa(const std::vector<std::pair<std::string, std
         d.insert(d.end(), m.data.begin(), m.data.end());
         stored.push_back(s); decoded.push_back(d);
     }
-    std::vector<uint32_t> at; uint32_t o = region; for (auto &s : stored) { at.push_back(o); o += (uint32_t)s.size(); }
-    if (shuffle && at.size() > 1) std::swap(at[0], at[1]);                // records no longer in data order
+    //shuffle: the members stored in the reverse of the order the records list them (data order != record order)
+    std::vector<size_t> order(stored.size()); for (size_t i = 0; i < order.size(); ++i) order[i] = shuffle ? order.size() - 1 - i : i;
+    std::vector<uint32_t> at(stored.size()); uint32_t o = region; for (size_t i : order) { at[i] = o; o += (uint32_t)stored[i].size(); }
     size_t k = 0; uint32_t recOff = 36 + (uint32_t)folders.size() * 24;
     std::vector<uint8_t> recs;
     for (auto &f : folders) {
@@ -3695,7 +3696,7 @@ static std::vector<uint8_t> makeBsa(const std::vector<std::pair<std::string, std
     h.insert(h.end(), recs.begin(), recs.end());
     if (flags & 2) for (auto &f : folders) for (auto &m : f.second) { h.insert(h.end(), m.name.begin(), m.name.end()); h.push_back(0); }
     content = h; std::vector<uint8_t> bsa = h;
-    for (size_t i = 0; i < stored.size(); ++i) { bsa.insert(bsa.end(), stored[i].begin(), stored[i].end()); content.insert(content.end(), decoded[i].begin(), decoded[i].end()); }
+    for (size_t i : order) { bsa.insert(bsa.end(), stored[i].begin(), stored[i].end()); content.insert(content.end(), decoded[i].begin(), decoded[i].end()); }
     return bsa;
 }
 
@@ -3725,10 +3726,18 @@ TEST(a_bsa_archive_is_served_through_its_description) {
         CHECK(!coding::MintInto(bsaD, bsa.data(), bsa.size(), 0, small.data(), small.size(), 4096, len, rec, err));
     }
     CHECK(cases == 3);
-    {   // members whose records are not in data order, and a wrong magic, are refused
-        std::vector<std::pair<std::string, std::vector<BsaMember>>> f = {{"x", {{"1", sampleContent(0, 3000, 1)}, {"2", sampleContent(1, 3000, 2)}}}};
+    {   // members stored in another order than the records list them (Skyrim SE's 2021 Misc.bsa) decode in data order and
+        // code back; a record pointing where no member starts, and a wrong magic, are refused
+        std::vector<std::pair<std::string, std::vector<BsaMember>>> f = {{"x", {{"1", sampleContent(0, 3000, 1)}, {"2", sampleContent(1, 5000, 2)}, {"3", sampleContent(2, 2000, 3)}}}};
         std::vector<uint8_t> want, content, record; std::string err;
         auto bsa = makeBsa(f, 0x7, want, true);
+        CHECK(coding::Mint(bsaD, bsa.data(), bsa.size(), 0, want.size() * 2, 4096, content, record, err));
+        CHECK(content == want);                                           // the header region, then the members in data order
+        auto src = codedSource(bsaD, bsa.data(), bsa.size(), content, 256);
+        CHECK(src != nullptr && readsBack(*src, bsa, 9, 30));
+        bsa = makeBsa(f, 0x7, want);
+        const size_t Rec1 = 36 + 24 + 1 + 2 + 16 + 12;                        // the second file record's offset field
+        bsa[Rec1] += 1;
         CHECK(!coding::Mint(bsaD, bsa.data(), bsa.size(), 0, want.size() * 2, 4096, content, record, err));
         bsa = makeBsa(f, 0x7, want); bsa[2] = 'X';
         CHECK(!coding::Mint(bsaD, bsa.data(), bsa.size(), 0, want.size() * 2, 4096, content, record, err));

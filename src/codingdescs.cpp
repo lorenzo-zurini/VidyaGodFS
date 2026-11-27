@@ -318,8 +318,10 @@ Description Lz4BlockDescription() {
 // member). Members are uncompressed (copied: a copy run of the content) or a 4-byte original size + an LZ4 frame whose
 // blocks are LZ4 blocks or stored. Everything the archive's own header says is read back from the content, so the
 // header steers the walk and the decisions hold only what the encoder chose: frame flags, block sizes, sequences.
-enum { BR_FLAGS = 10, BR_NF, BR_FI, BR_Q, BR_CNT, BR_SZ, BR_LEN, BR_END, BR_ORIG, BR_CEND, BR_MAG, BR_FLG, BR_BD, BR_HC, BR_BS, BR_BEND, BR_X, BR_COMP };
-enum { B_STREAM = 40, B_FOLD, B_FILE, B_NEXTF, B_DONE, B_MEMBER, B_RAWMEM, B_NONAME, B_CS, B_DI, B_BLK, B_CBLK, B_BCK, B_BCS, B_FEND, B_FDONE, B_LZ4 };
+enum { BR_FLAGS = 10, BR_NF, BR_FI, BR_Q, BR_CNT, BR_SZ, BR_LEN, BR_END, BR_ORIG, BR_CEND, BR_MAG, BR_FLG, BR_BD, BR_HC, BR_BS, BR_BEND, BR_X, BR_COMP,
+       BR_LEFT, BR_RQ };
+enum { B_STREAM = 40, B_FOLD, B_FILE, B_NEXTF, B_DONE, B_MEMBER, B_RAWMEM, B_NONAME, B_CS, B_DI, B_BLK, B_CBLK, B_BCK, B_BCS, B_FEND, B_FDONE, B_LZ4,
+       B_LOOP, B_HAVE, B_SCAN, B_NEXT, B_NEXTFOLD, B_NONE };
 Description BsaDescription() {
     Asm a;
     auto R = [&](int r) { return a.R(r); };
@@ -341,18 +343,36 @@ Description BsaDescription() {
         a.Set(BR_X, H); }
     a.Assert(a.GE(R(BR_X), a.C(36)));
     a.ByteRun(a.SUB(R(BR_X), a.C(36)));
-    // walk the folders and their file records (in the content now): every member in data order
-    a.Set(BR_Q, a.ADD(a.C(36), a.MUL(R(BR_NF), a.C(24)))); a.Set(BR_FI, a.C(0));
-    a.Label(B_FOLD); a.Jz(a.LT(R(BR_FI), R(BR_NF)), B_DONE);
+    // every member in DATA order (the order the archive stores them): the record whose offset is where the stream
+    // stands. Usually the record after the last one taken (a cursor walking folders and their file records, in the
+    // content now); where the archive stores members in another order than it lists them (Skyrim SE's 2021 Misc.bsa:
+    // 5,582 breaks among 21,474 files), the records are searched from the first, and the cursor continues from the match.
+    a.Set(BR_LEFT, U32(a.C(20)));                                          // members left: the archive's file count
+    a.Set(BR_Q, a.ADD(a.C(36), a.MUL(R(BR_NF), a.C(24)))); a.Set(BR_FI, a.C(0)); a.Set(BR_CNT, a.C(0));
+    a.Label(B_LOOP); a.Jz(R(BR_LEFT), B_DONE);
+    a.Call(B_NEXT);
+    a.Jz(a.AND(a.NE(R(BR_RQ), a.C(0)), a.EQ(U32(a.ADD(R(BR_RQ), a.C(12))), SPOS())), B_SCAN);
+    a.Label(B_HAVE);
+    a.Set(BR_SZ, U32(a.ADD(R(BR_RQ), a.C(8))));
+    a.Call(B_MEMBER); a.Mark();
+    a.Set(BR_LEFT, a.SUB(R(BR_LEFT), a.C(1))); a.Jmp(B_LOOP);
+    a.Label(B_SCAN);                                                       // from the first record
+    a.Set(BR_Q, a.ADD(a.C(36), a.MUL(R(BR_NF), a.C(24)))); a.Set(BR_FI, a.C(0)); a.Set(BR_CNT, a.C(0));
+    a.Label(B_FILE);
+    a.Call(B_NEXT);
+    a.Assert(a.NE(R(BR_RQ), a.C(0)));                                      // no member starts here: not this format
+    a.Jz(a.EQ(U32(a.ADD(R(BR_RQ), a.C(12))), SPOS()), B_FILE);
+    a.Jmp(B_HAVE);
+    a.Label(B_DONE); a.Mode(kDecode); a.Assert(a.EQ(a.X1(EX_INLEFT, 0), a.C(0))); a.Mode(0); a.End();
+    // the cursor's next file record (its address in BR_RQ; 0 after the last): through the folders, past each one's name
+    a.Label(B_NEXT);
+    a.Label(B_FOLD); a.Jz(R(BR_CNT), B_NEXTFOLD);
+    a.Set(BR_RQ, R(BR_Q)); a.Set(BR_Q, a.ADD(R(BR_Q), a.C(16))); a.Set(BR_CNT, a.SUB(R(BR_CNT), a.C(1))); a.Ret();
+    a.Label(B_NEXTFOLD); a.Jz(a.LT(R(BR_FI), R(BR_NF)), B_NONE);
     a.Set(BR_CNT, U32(a.ADD(a.ADD(a.C(36), a.MUL(R(BR_FI), a.C(24))), a.C(8))));
     a.Set(BR_Q, a.ADD(R(BR_Q), a.MUL(BIT(R(BR_FLAGS), 0), a.ADD(a.C(1), BYTE(R(BR_Q))))));   // the folder's name (when named)
-    a.Label(B_FILE); a.Jz(R(BR_CNT), B_NEXTF);
-    a.Set(BR_SZ, U32(a.ADD(R(BR_Q), a.C(8))));
-    a.Assert(a.EQ(U32(a.ADD(R(BR_Q), a.C(12))), SPOS()));               // members lie in record order, back to back
-    a.Set(BR_Q, a.ADD(R(BR_Q), a.C(16))); a.Set(BR_CNT, a.SUB(R(BR_CNT), a.C(1)));
-    a.Call(B_MEMBER); a.Mark(); a.Jmp(B_FILE);
-    a.Label(B_NEXTF); a.Set(BR_FI, a.ADD(R(BR_FI), a.C(1))); a.Jmp(B_FOLD);
-    a.Label(B_DONE); a.Mode(kDecode); a.Assert(a.EQ(a.X1(EX_INLEFT, 0), a.C(0))); a.Mode(0); a.End();
+    a.Set(BR_FI, a.ADD(R(BR_FI), a.C(1))); a.Jmp(B_FOLD);
+    a.Label(B_NONE); a.Set(BR_RQ, a.C(0)); a.Ret();
     // one member: its record's size (bit 30 flips the archive's default compression)
     a.Label(B_MEMBER);
     a.Set(BR_COMP, a.XOR(BIT(R(BR_FLAGS), 2), BIT(R(BR_SZ), 30)));
