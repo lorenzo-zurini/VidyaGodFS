@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <array>
 #include <map>
 #include <mutex>
 #include <queue>
@@ -43,6 +44,7 @@ constexpr size_t kMaxEx = 65535, kMaxOps = 65535, kMaxTable = 1u << 20, kMaxTabl
                  kMaxHuff = 4, kMaxSym = 1024, kMaxStack = 64;   // (LZX's main code: 256 + 8 x position slots, 656 at a 2 MiB window)
 bool BinaryEx(uint8_t op) { return (op >= EX_ADD && op <= EX_GE) || op == EX_DIV || op == EX_MOD; }
 bool DivEx(uint8_t op) { return op == EX_DIV || op == EX_MOD; }
+bool UsesE8(const Description &D) { for (const Op &o : D.ops) if (o.op == OP_E8FRAME) return true; return false; }
 bool UnaryEx(uint8_t op) { return op == EX_BYTE || op == EX_TABLE || op == EX_ARR || op == EX_LOG2SLOT || (op >= EX_U16 && op <= EX_U32BE); }
 bool CodingOp(uint8_t op) { return op <= OP_HUFF || op == OP_RAWBYTES; }
 
@@ -74,8 +76,11 @@ bool Validate(const Description &D, std::string &Err) {
     for (const auto &t : D.tables) if (t.size() > kMaxTable) { Err = "a table too large"; return false; }
     if (na > kMaxArrays) { Err = "too many arrays"; return false; }
     for (const auto &a : D.arrays) if (a.size() > kMaxTable) { Err = "an array too large"; return false; }
+    {   bool fam = false, e8 = false, near = false; for (const Op &p : D.ops) { fam |= p.op == OP_PREDICT; e8 |= p.op == OP_E8FRAME; near |= p.op == OP_NEAREST; }
+        if (fam && e8) { Err = "a family predicting through an E8 view (not yet: families parse the real bytes)"; return false; }
+        if ((e8 || near) && D.window > (1u << 25)) { Err = "a WINDOW over 32 MiB with E8 frames or NEAREST"; return false; } }
     for (const Op &p : D.ops)
-        if (((p.flags & kBounded) || p.op == OP_RAWBYTES) && D.isa < 7) { Err = "an op newer than the instruction set it names"; return false; }
+        if ((((p.flags & kBounded) || p.op == OP_RAWBYTES) && D.isa < 7) || ((p.op == OP_E8FRAME || p.op == OP_E8END || p.op == OP_NEAREST) && D.isa < 8)) { Err = "an op newer than the instruction set it names"; return false; }
     { size_t tt = 0, ta = 0; for (const auto &t : D.tables) tt += t.size(); for (const auto &a : D.arrays) ta += a.size();
       if (tt > (16u << 20) || ta > (4u << 20)) { Err = "a description too large"; return false; } }
     // what the ops name must exist
@@ -290,11 +295,83 @@ struct Spec {
 struct Huff { uint16_t code[kMaxSym], mcode[kMaxSym]; uint8_t len[kMaxSym]; int16_t count[17], sym[kMaxSym]; int nsym = 0; };   // code: bit-reversed (LSB-first coders); mcode: as is (BITS16M)
 
 // Content as the machine sees it: DECODE writes it; CODE reads it through a window over a ByteSource.
+// E8 (x86 CALL) translation of one frame (LZX's; not BCJ's, which also handles E9 and carries state): the encoder's forward transform (relative call targets made
+// absolute) and the decoder's inverse, over a frame of n bytes whose first byte is at stream position `cur`; the last 10
+// bytes are left as they are, and the 4 bytes after an E8 are skipped whether or not they changed. A bijection: the E8
+// positions are the same either way, and each operand maps [-cur, fs) onto itself.
+void E8Forward(uint8_t *b, uint32_t n, uint32_t cur, uint32_t fs) {     // (fs below 2^31: E8FRAME refuses more)
+    if (n <= 10) return;
+    for (uint32_t i = 0; i < n - 10; ++i) {
+        if (b[i] != 0xE8) continue;
+        const int64_t pos = (int64_t)cur + i, F = fs, rel = (int32_t)(b[i + 1] | b[i + 2] << 8 | b[i + 3] << 16 | (uint32_t)b[i + 4] << 24);
+        if (rel >= -pos && rel < F) {
+            const uint32_t abs = (uint32_t)(rel < F - pos ? rel + pos : rel - F);
+            b[i + 1] = (uint8_t)abs; b[i + 2] = (uint8_t)(abs >> 8); b[i + 3] = (uint8_t)(abs >> 16); b[i + 4] = (uint8_t)(abs >> 24);
+        }
+        i += 4;
+    }
+}
+void E8Inverse(uint8_t *b, uint32_t n, uint32_t cur, uint32_t fs) {
+    if (n <= 10) return;
+    for (uint32_t i = 0; i < n - 10; ++i) {
+        if (b[i] != 0xE8) continue;
+        const int64_t pos = (int64_t)cur + i, F = fs, abs = (int32_t)(b[i + 1] | b[i + 2] << 8 | b[i + 3] << 16 | (uint32_t)b[i + 4] << 24);
+        if (abs >= -pos && abs < F) {
+            const uint32_t rel = (uint32_t)(abs >= 0 ? abs - pos : abs + F);
+            b[i + 1] = (uint8_t)rel; b[i + 2] = (uint8_t)(rel >> 8); b[i + 3] = (uint8_t)(rel >> 16); b[i + 4] = (uint8_t)(rel >> 24);
+        }
+        i += 4;
+    }
+}
+struct ViewFrame { uint32_t n = 0, cur = 0, fs = 0; };
+
 struct Content {
     uint8_t *w = nullptr; size_t cap = 0;            // DECODE: the buffer written
     const uint8_t *mem = nullptr; uint64_t size = 0; // CODE: all in memory ...
     ByteSource *src = nullptr; std::vector<uint8_t> buf; uint64_t lo = 0, hi = 0; uint32_t window = 0, grow = 16u << 10; bool err = false;   // ... or windowed
+    //CODE (ISA 8): frames the format's code sees TRANSLATED (E8): what it reads there is the encoder's bytes, made from
+    //the content's frame by the forward transform (one frame cached); the content itself is the real bytes
+    std::map<uint64_t, ViewFrame> vframes; uint64_t wAt = UINT64_MAX, wEnd = 0; std::vector<uint8_t> *wcur = nullptr;
+    std::map<uint64_t, std::pair<uint64_t, std::vector<uint8_t>>> wcache;   // translated frames (start -> last use, bytes)
+    uint64_t wbytes = 0, wclock = 0, work = 0, workMark = 0;           // work: bytes translated (the machine's progress guard counts
+                                                                         // it; past 64 MiB between two of its checks, reads stop)
+    const ViewFrame *viewOf(uint64_t i, uint64_t &start) const {
+        auto it = vframes.upper_bound(i);
+        if (it == vframes.begin()) return nullptr;
+        --it;
+        if (i >= it->first + it->second.n) return nullptr;
+        start = it->first; return &it->second;
+    }
     uint8_t at(uint64_t i) {
+        if (__builtin_expect(!vframes.empty(), 0)) {
+            if (i >= wAt && i < wEnd) return (*wcur)[(size_t)(i - wAt)];   // the frame at hand (nearly every read)
+            uint64_t s0; const ViewFrame *f = viewOf(i, s0);
+            if (f) {
+                auto it = wcache.find(s0);
+                if (it == wcache.end() || it->second.second.size() != f->n) {
+                    if (it != wcache.end()) { wbytes -= it->second.second.size(); wcache.erase(it); }
+                    while (!wcache.empty() && wbytes + f->n > (8u << 20)) {   // 8 MiB of frames: an LZX window and more
+                        auto old = wcache.begin(); for (auto j = wcache.begin(); j != wcache.end(); ++j) if (j->second.first < old->second.first) old = j;
+                        wbytes -= old->second.second.size(); wcache.erase(old);
+                    }
+                    if (work - workMark > (64u << 20)) { err = true; return 0; }   // (a burst no check has seen: refused)
+                    std::vector<uint8_t> b(f->n); for (uint32_t k = 0; k < f->n; ++k) b[k] = rawAt(s0 + k); E8Forward(b.data(), f->n, f->cur, f->fs);
+                    work += f->n; wbytes += f->n; it = wcache.emplace(s0, std::make_pair(0, std::move(b))).first;
+                }
+                it->second.first = ++wclock; wcur = &it->second.second; wAt = s0; wEnd = s0 + f->n;
+                return (*wcur)[(size_t)(i - s0)];
+            }
+        }
+        return rawAt(i);
+    }
+    bool viewed(uint64_t i, uint64_t n) const {                       // does [i, i+n) touch a translated frame?
+        if (vframes.empty() || !n) return false;
+        auto it = vframes.upper_bound(i + n - 1);
+        if (it == vframes.begin()) return false;
+        --it;
+        return it->first + it->second.n > i;
+    }
+    uint8_t rawAt(uint64_t i) {
         if (mem) return i < size ? mem[i] : 0;
         if (i >= size) return 0;
         if (i < lo || i >= hi) { refill(i); if (err || i < lo || i >= hi) return 0; }
@@ -454,6 +531,61 @@ struct Machine {
     uint64_t fuel = 0, fuelBase = 0;
     uint64_t prog0 = 0;                            // progress at the start or the restore: budgets count what this run does
     bool zCatchUp = false; uint64_t zCaught = 0;   // the one zlib catch-up this run (since its start or restore) was granted
+    //DECODE (ISA 8): the frame opened by E8FRAME (its decision's slot, filled at E8END), and the translated frames, converted
+    //to the real bytes when the run ends (until then the buffer holds what the encoder's window held: copies read that)
+    struct E8Open { uint64_t at = 0; ViewFrame f; size_t slot = 0; bool open = false; } e8open;
+    //NEAREST's index: hash chains (3-byte and 2-byte keys, newest first) over the content from `lo` up to `upto`, the
+    //machine's own; positions the window no longer reaches are dropped by the ring
+    struct NIdx { uint64_t lo = UINT64_MAX, upto = 0; uint32_t mask = 0; std::vector<uint32_t> h3, h2, p3, p2; } nidx;
+    uint8_t cbyte(uint64_t i) { return mode == kDecode ? (i < X.cap ? X.w[i] : 0) : X.at(i); }
+    bool overBudget() const { return fuel + X.work > fuelBase + (1u << 22) + 512 * (progress() - std::min(prog0, progress())); }
+    uint32_t nearest(uint64_t at, uint32_t len, uint64_t lo, uint32_t maxd) {
+        if (len < 2 || at <= lo || maxd == 0) return kNoPrediction;
+        const uint64_t have = mode == kDecode ? X.cap : X.size;
+        if (at + len > have) return kNoPrediction;
+        uint64_t ring64 = 1; while (ring64 < (uint64_t)maxd + 1) ring64 <<= 1;   // (maxd <= WINDOW <= 2^25: Validate)
+        if (ring64 > (1u << 26)) return kNoPrediction;
+        const uint32_t ring = (uint32_t)ring64;
+        NIdx &n = nidx;
+        if (n.lo != lo || n.mask != ring - 1 || at < n.upto) {           // another stream, window or a step back: anew
+            if (n.mask != ring - 1 || n.p3.empty()) { n.p3.assign(ring, UINT32_MAX); n.p2.assign(ring, UINT32_MAX); n.h3.assign(1u << 16, UINT32_MAX); n.h2.assign(1u << 16, UINT32_MAX); }
+            else { std::fill(n.p3.begin(), n.p3.end(), UINT32_MAX); std::fill(n.p2.begin(), n.p2.end(), UINT32_MAX); std::fill(n.h3.begin(), n.h3.end(), UINT32_MAX); std::fill(n.h2.begin(), n.h2.end(), UINT32_MAX); }
+            fuel += 2ull * ring + (1u << 17);                             // (making the index is work too)
+            if (overBudget()) { fail("a description that works without making progress"); return kNoPrediction; }
+            n.lo = lo; n.mask = ring - 1;
+            n.upto = at - std::min<uint64_t>(at - lo, maxd);
+        }
+        if (at - n.upto > maxd) n.upto = at - maxd;                       // (what the window cannot reach is not indexed)
+        fuel += at - n.upto;                                              // (the indexing is work: the progress guard sees it)
+        if (overBudget()) { fail("a description that works without making progress"); return kNoPrediction; }
+        for (; n.upto < at; ++n.upto) {
+            const uint64_t q = n.upto; const uint8_t b0 = cbyte(q), b1 = cbyte(q + 1), b2 = cbyte(q + 2);
+            const uint32_t k2 = (uint32_t)b0 << 8 | b1, k3 = ((uint32_t)b0 << 16 | (uint32_t)b1 << 8 | b2) * 2654435761u >> 16;
+            n.p2[q & n.mask] = n.h2[k2]; n.h2[k2] = (uint32_t)(q - lo);
+            n.p3[q & n.mask] = n.h3[k3]; n.h3[k3] = (uint32_t)(q - lo);
+        }
+        const uint8_t a0 = cbyte(at), a1 = cbyte(at + 1), a2 = len >= 3 ? cbyte(at + 2) : 0;
+        const bool three = len >= 3;
+        uint32_t c = three ? n.h3[((uint32_t)a0 << 16 | (uint32_t)a1 << 8 | a2) * 2654435761u >> 16] : n.h2[(uint32_t)a0 << 8 | a1];
+        fuel += 128;
+        for (int steps = 0; c != UINT32_MAX && steps < 128; ++steps) {
+            const uint64_t cand = lo + c;
+            if (cand >= at || at - cand > maxd) break;
+            uint32_t k = 0; while (k < len && cbyte(cand + k) == cbyte(at + k)) ++k;
+            if (k == len) return (uint32_t)(at - cand);
+            c = three ? n.p3[cand & n.mask] : n.p2[cand & n.mask];
+            if (c != UINT32_MAX && lo + c >= cand) break;                // (a ring slot reused: older than the window)
+        }
+        return kNoPrediction;
+    }
+    std::vector<std::pair<uint64_t, ViewFrame>> e8done;
+    void e8finish() { for (const auto &[at, f] : e8done) if (at + f.n <= X.cap) E8Inverse(X.w + at, f.n, f.cur, f.fs); e8done.clear(); }
+    // CODE: what a reader restored here needs of the frame table (the frames its window can still read)
+    void e8prune() {
+        const uint64_t keep = place() > D.window ? place() - D.window : 0;
+        for (auto it = X.vframes.begin(); it != X.vframes.end();) { if (it->first + it->second.n <= keep) it = X.vframes.erase(it); else ++it; }
+        X.wAt = UINT64_MAX; X.wEnd = 0; X.wcur = nullptr; X.wcache.clear(); X.wbytes = 0;
+    }
     std::map<std::tuple<uint64_t, uint64_t, uint32_t>, std::unique_ptr<ZlibParser>> zown;   // this machine's zlib parses (2 at most)
     uint64_t progress() const { return (uint64_t)(out ? out->size() + copied : 0) + place() + ip + (bipos >> 3); }
     uint64_t stopAt = UINT64_MAX;                   // CODE: pause at a MARK once this much output exists
@@ -712,10 +844,10 @@ struct Machine {
         uint32_t tick = 0, val = 0; const Ins *op_ = nullptr;
         // DIRECT THREADING: every handler ends with its own jump to the next one (computed goto), so the branch predictor
         // learns per-instruction patterns instead of one shared switch. Table order = OpCode order, then the fused ones.
-        static const void *const J[] = { &&L_OP_BIT, &&L_OP_TREE, &&L_OP_RTREE, &&L_OP_DIRECT, &&L_OP_MLIT, &&L_OP_RAW, &&L_OP_HUFF, &&L_OP_BUILD, &&L_OP_STA, &&L_OP_SET, &&L_OP_DEC, &&L_OP_OUTLIT, &&L_OP_OUTCOPY, &&L_OP_HMTF, &&L_OP_HPUSH, &&L_OP_JZ, &&L_OP_JMP, &&L_OP_CALL, &&L_OP_RET, &&L_OP_ASSERT, &&L_OP_FLUSH, &&L_OP_MARK, &&L_OP_END, &&L_OP_HUFFRUN, &&L_OP_BYTERUN, &&L_OP_PREDICT, &&L_OP_RAWBYTES, &&L_F_BITJZ, &&L_F_SETBITJZ, &&L_F_DECN, &&L_F_OFFEND };
+        static const void *const J[] = { &&L_OP_BIT, &&L_OP_TREE, &&L_OP_RTREE, &&L_OP_DIRECT, &&L_OP_MLIT, &&L_OP_RAW, &&L_OP_HUFF, &&L_OP_BUILD, &&L_OP_STA, &&L_OP_SET, &&L_OP_DEC, &&L_OP_OUTLIT, &&L_OP_OUTCOPY, &&L_OP_HMTF, &&L_OP_HPUSH, &&L_OP_JZ, &&L_OP_JMP, &&L_OP_CALL, &&L_OP_RET, &&L_OP_ASSERT, &&L_OP_FLUSH, &&L_OP_MARK, &&L_OP_END, &&L_OP_HUFFRUN, &&L_OP_BYTERUN, &&L_OP_PREDICT, &&L_OP_RAWBYTES, &&L_OP_E8FRAME, &&L_OP_E8END, &&L_OP_NEAREST, &&L_F_BITJZ, &&L_F_SETBITJZ, &&L_F_DECN, &&L_F_OFFEND };
         static_assert(sizeof(J) / sizeof(J[0]) == F_OFFEND + 1, "dispatch table out of step with the opcodes");
         #define NEXT() do { if (__builtin_expect(!(++tick & 0xFFFF), 0)) { fuel += 0x10000; \
-                if (fuel > fuelBase + (1u << 22) + 512 * (progress() - std::min(prog0, progress()))) { fail("a description that works without making progress"); return 0; } } \
+                if (overBudget() || X.err) { fail(X.err ? "the content does not read" : "a description that works without making progress"); return 0; } X.workMark = X.work; } \
             op_ = &I0[ip_]; ip_ = op_->fall; val = 0; goto *J[op_->op]; } while (0)
         #define CHECK_NEXT() do { if (why) return 0; NEXT(); } while (0)
         // a coding op's value: the decision (CODE, FREE), else its expression; DECODE learns it from the stream
@@ -787,6 +919,9 @@ struct Machine {
                     else for (uint32_t i = 0; i < n; ++i) { X.w[p + i] = (uint8_t)bget(8); if (why) return 0; }
                     if (D.coder == kBits16M) bytesMode = true;
                 } else if (M == kPrice) price += n << 7;
+                else if (!bn && X.viewed(p, n)) {                               // through a translated frame: the encoder's
+                    for (uint32_t i = 0; i < n; ++i) out->push_back(X.at((uint64_t)p + i));   // bytes, as they are (either coder)
+                }
                 else if (!bn) {
                     if (runs && n >= kRunMin) {
                         if ((uint64_t)p + n > X.size) { fail("a copy run past the content"); return 0; }
@@ -807,6 +942,48 @@ struct Machine {
                 } else if (M == kPrice) price += n << 7;
                 else { if (bn) { fail("bytes off a byte boundary"); return 0; } for (uint32_t k = 0; k < n; ++k) out->push_back((uint8_t)(val >> (8 * k))); }
                 GIVE(); NEXT(); }
+            L_OP_E8FRAME: {                                              // ISA 8: frame [x, x+v), first byte at stream position m, filesize in tgt
+                const uint32_t at = opnd<M>(op_->x), n = opnd<M>(op_->v), cur = opnd<M>(op_->m), fs = v[op_->tgt];
+                if (!n || n > (1u << 20)) { fail("an E8 frame of no size, or over 1 MiB"); return 0; }
+                if ((uint64_t)at + n > (1ull << 32) || (uint64_t)cur + n > (1ull << 32) || fs > 0x7FFFFFFFu) { fail("an E8 frame out of range"); return 0; }
+                if (M == kDecode) {
+                    if (e8open.open) { fail("an E8 frame opened inside another"); return 0; }
+                    if (!e8done.empty() && at < e8done.back().first + e8done.back().second.n) { fail("E8 frames out of order"); return 0; }
+                    if ((uint64_t)at + n > X.cap) { fail("an E8 frame past the content"); return 0; }
+                    e8open.at = at; e8open.f = {n, cur, fs}; e8open.slot = decOut->size(); e8open.open = true; record(0);   // its decision: filled at E8END
+                } else if (M == kCode) {
+                    uint32_t t; if (!Dc.get(t)) { fail("out of decisions"); return 0; }
+                    if (t > 1) { fail("an E8 frame's decision is 0 or 1"); return 0; }
+                    if (t) {
+                        if (!X.vframes.empty() && at < X.vframes.rbegin()->first + X.vframes.rbegin()->second.n) { fail("E8 frames out of order"); return 0; }
+                        //what the window no longer reaches goes (the rule a checkpoint keeps), and at most 4096 frames stay
+                        const uint64_t keep = place() > D.window ? place() - D.window : 0;
+                        while (!X.vframes.empty() && X.vframes.begin()->first + X.vframes.begin()->second.n <= keep) {
+                            X.wcache.erase(X.vframes.begin()->first); X.vframes.erase(X.vframes.begin()); }
+                        X.wbytes = 0; for (const auto &kv : X.wcache) X.wbytes += kv.second.second.size();
+                        X.wAt = UINT64_MAX; X.wEnd = 0; X.wcur = nullptr;             // (the frame at hand may have gone)
+                        if (X.vframes.size() >= 4096) { fail("more than 4096 E8 frames in the window"); return 0; }
+                        X.vframes[at] = {n, cur, fs};                         // (frames never overlap: the cache stands)
+                    }
+                }
+                CHECK_NEXT(); }
+            L_OP_E8END: {                                                // ISA 8: the frame opened is translated or not (v)
+                if (M == kDecode) {
+                    if (!e8open.open) { fail("an E8 frame ended that was not opened"); return 0; }
+                    const uint32_t t = opnd<M>(op_->v) ? 1 : 0;
+                    (*decOut)[e8open.slot] = t; e8open.open = false;
+                    if (t) e8done.push_back({e8open.at, e8open.f});
+                }
+                CHECK_NEXT(); }
+            L_OP_NEAREST: {                                              // ISA 8
+                uint32_t d = kNoPrediction;
+                if (M != kPrice && !noPredict && (M != kDecode || wholeContent)) {
+                    const uint32_t maxd = opnd<M>(op_->m);
+                    if (maxd > D.window) { fail("NEAREST reaching past the description's WINDOW"); return 0; }
+                    d = nearest(place(), opnd<M>(op_->x), opnd<M>(op_->v), maxd);
+                    if (d != kNoPrediction) predictedAny = true;
+                }
+                v[op_->tgt] = d; CHECK_NEXT(); }
             L_OP_PREDICT: {
                 uint32_t t[3] = {0, kNoPrediction, 0};
                 if (M != kPrice && !noPredict && (M != kDecode || wholeContent)) {
@@ -866,6 +1043,20 @@ struct Machine {
         for (uint16_t s : slot) PutVar(o, s);
         for (const auto &a : arr) for (uint32_t x : a) PutVar(o, x);
         for (int t = 0; t < D.nhuff; ++t) { PutVar(o, hlens[t].size()); o.insert(o.end(), hlens[t].begin(), hlens[t].end()); }
+        if (UsesE8(D)) {                                                  // (ISA 8 only: other descriptions' records are unchanged)
+            //as RUNS: frames back to back, each as long as the first (the last may be shorter), stream positions advancing
+            //with them, one filesize — LZX's frames are, so a checkpoint carries a few numbers, not a table
+            std::vector<std::array<uint64_t, 6>> runs;                    // at, n, cur, fs, count, the last frame's n
+            for (const auto &[at, f] : X.vframes) {
+                if (!runs.empty()) {
+                    auto &r = runs.back(); const uint64_t end = r[0] + r[1] * (r[4] - 1) + r[5];
+                    if (r[5] == r[1] && at == end && f.cur == r[2] + (end - r[0]) && f.fs == r[3] && f.n <= r[1]) { ++r[4]; r[5] = f.n; continue; }
+                }
+                runs.push_back({at, f.n, f.cur, f.fs, 1, f.n});
+            }
+            PutVar(o, runs.size());
+            for (const auto &r : runs) for (uint64_t x : r) PutVar(o, x);
+        }
         return o;
     }
     bool restore(const uint8_t *p, size_t n) {
@@ -881,6 +1072,19 @@ struct Machine {
             std::vector<uint32_t> l(p + r.at, p + r.at + k); r.at += (size_t)k;
             if (k && !build(t, l.data(), (uint32_t)k)) return false;
             if (!k) hf[t].nsym = 0;
+        }
+        X.vframes.clear(); X.wAt = UINT64_MAX; X.wEnd = 0; X.wcur = nullptr; X.wcache.clear(); X.wbytes = 0;
+        if (UsesE8(D)) {
+            const uint64_t nr = r.var(); if (r.bad || nr > 4096) return fail("a malformed checkpoint");
+            uint64_t end = 0, frames = 0;
+            for (uint64_t k = 0; k < nr; ++k) {
+                const uint64_t at = r.var(), fn = r.var(), cur = r.var(), fs = r.var(), count = r.var(), last = r.var();
+                if (r.bad || !fn || fn > (1u << 20) || !last || last > fn || !count || (frames += count) > 4096 || at < end ||
+                    at + fn * (count - 1) + last > (1ull << 32) || cur + fn * (count - 1) + last > (1ull << 32) || fs > 0x7FFFFFFFu) return fail("a malformed checkpoint");
+                for (uint64_t j = 0; j < count; ++j)
+                    X.vframes[at + j * fn] = {(uint32_t)(j + 1 == count ? last : fn), (uint32_t)(cur + j * fn), (uint32_t)fs};
+                end = at + fn * (count - 1) + last;
+            }
         }
         if (r.bad || r.at != n || bn < 0 || bn > (D.coder == kBits16M ? 15 : 7) || cacheSize > maxCache) return fail("a malformed checkpoint");
         return true;
@@ -917,7 +1121,7 @@ uint64_t SuggestedSpacing(const Description &D, uint64_t Shipped, bool Plain) {
 // payload length (VGCQ: then a varint, the FNV-1a 64 of the segment's shipped bytes: a family that predicts otherwise
 // than at the mint, another reader's or a hostile record's, is refused per segment, never served) | payloads. A payload
 // is one zstd frame: varint snapshot length, snapshot, varint decision count, the segment's decisions as varints.
-bool UsesPrediction(const Description &D) { for (const Op &o : D.ops) if (o.op == OP_PREDICT) return true; return false; }
+bool UsesPrediction(const Description &D) { for (const Op &o : D.ops) if (o.op == OP_PREDICT || o.op == OP_NEAREST) return true; return false; }
 // The work a family's parse may take a byte: LZ4HC 128 (real archives take 4, 73 at worst); zlib twice its chain length and
 // a little (zlib itself walks up to its chain at a search, about twice a byte: level 9 takes thousands on degenerate data)
 uint64_t WorkPerByte(uint8_t Family, uint32_t Knob) {
@@ -943,6 +1147,9 @@ bool MintInto(const Description &D, const uint8_t *Shipped, size_t N, size_t Con
         m.X.cap = pass ? ContentLen : ContentSize ? ContentSize : ContentCap; m.noPredict = !pass; m.wholeContent = pass == 1;
         if (D.coder == kRange) { m.ip = 1; for (int i = 0; i < 4; ++i) m.code = (m.code << 8) | m.inByte(); }
         if (m.run(D.entryStream) != 1) { Err = std::string("decode: ") + (m.why ? m.why : "refused") + (m.failOp >= 0 ? " (op " + std::to_string(m.failOp) + ", content place " + std::to_string(m.place()) + ")" : std::string()); return false; }
+        if (m.e8open.open) { Err = "decode: an E8 frame left open"; return false; }
+        if (pass + 1 == (predicted ? 2 : 1)) m.e8finish();               // after the LAST decode only (a second one reads
+        else m.e8done.clear();                                            // ahead what the encoder saw): the real bytes
         if (ContentSize && m.place() != ContentSize) { Err = "decode: the content is not the size expected"; return false; }
         if (pass && m.place() != ContentLen) { Err = "decode: the content is not the size expected"; return false; }
         ContentLen = m.place();
@@ -965,10 +1172,12 @@ bool MintInto(const Description &D, const uint8_t *Shipped, size_t N, size_t Con
         if (m.copied + out.size() > N || (!out.empty() && memcmp(out.data(), Shipped + m.copied, out.size()) != 0)) { Err = "the stream does not code back to its own bytes"; return false; }
         m.copied += out.size(); out.clear();
         if (r == 1) break;
+        m.e8prune();                                                      // (as a reader restored here: what the checkpoint carries)
         cks.push_back({m.copied, m.Dc.consumed(), m.snapshot()});
         //from here on, as a reader restored at this checkpoint runs: its own parse budget and no parse at hand (a record
         //no reader could read is refused here, never minted)
-        m.prog0 = m.progress(); m.fuelBase = m.fuel; m.psteps = 0; m.pseqs.reset(); m.zCatchUp = false; m.zCaught = 0; m.zown.clear();
+        m.prog0 = m.progress(); m.fuelBase = m.fuel + m.X.work; m.psteps = 0; m.pseqs.reset(); m.zCatchUp = false; m.zCaught = 0; m.zown.clear();
+        m.nidx = Machine::NIdx();                                         // (a reader restored here builds its own NEAREST index)
         {   //a fresh parse cache (a reader there has none at hand), the stream's account carried over
             auto fresh = std::make_shared<PredictCache>(); fresh->steps = m.pcache->steps.load(); fresh->streamBudget = streamBudget;
             { std::lock_guard<std::mutex> l(m.pcache->mu); fresh->charged = m.pcache->charged; fresh->zfurthest = m.pcache->zfurthest; }

@@ -4478,6 +4478,178 @@ TEST(the_bits16m_coder_reads_lzx_order) {
         CHECK(coding::Mint(d9, s9.data(), s9.size(), 0, 64, 1 << 20, c9, r9, err)); }
 }
 
+// ISA 8: a translated view (LZX's E8). A toy LZ format: frame 0 stored, every later frame a COPY of the one before, all
+// as the encoder saw them (translated, "W"); the content must be the real bytes ("C" = the E8 inverse, frame by frame,
+// with each frame's own stream position), so copies read W while the content holds C. Checked against an inverse written
+// here, coded back, and read back through a reader restored at each frame. Teeth: copies reading the real bytes; the
+// content left translated; the code reading the content untranslated; checkpoints without the frame table; the last 10
+// bytes or the 4 after an E8 translated.
+TEST(an_e8_view_keeps_the_real_bytes_while_the_code_sees_the_encoders) {
+    const uint32_t fs = 100000, F = 64, K = 6;
+    std::vector<uint8_t> w0(F); std::mt19937 r(11); for (auto &x : w0) x = (uint8_t)(r() % 200);   // (no stray E8 bytes)
+    auto put = [&](uint32_t at, int32_t v) { w0[at] = 0xE8; for (int k = 0; k < 4; ++k) w0[at + 1 + k] = (uint8_t)((uint32_t)v >> (8 * k)); };
+    put(3, 70000); put(8, -10); put(20, 232); put(40, -300000); put(45, 777); put(56, 1234);   // in range, negative, an E8 in an operand, out of range, past the mid-frame checkpoint, the last 10 bytes
+    std::vector<uint8_t> shipped = {(uint8_t)fs, (uint8_t)(fs >> 8), (uint8_t)(fs >> 16), (uint8_t)(fs >> 24)};
+    shipped.insert(shipped.end(), w0.begin(), w0.end());
+    for (uint32_t k = 1; k < K; ++k) shipped.push_back(1);                    // "the frame before, again"
+    // the real bytes, by an inverse written here
+    auto inverse = [&](std::vector<uint8_t> b, uint32_t cur) {
+        for (uint32_t i = 0; i + 10 < b.size(); ++i) {
+            if (b[i] != 0xE8) continue;
+            const int64_t pos = cur + i; const int32_t a = (int32_t)(b[i + 1] | b[i + 2] << 8 | b[i + 3] << 16 | (uint32_t)b[i + 4] << 24);
+            if (a >= -pos && a < (int64_t)fs) { const int32_t rel = a >= 0 ? (int32_t)(a - pos) : (int32_t)(a + (int64_t)fs); for (int k = 0; k < 4; ++k) b[i + 1 + k] = (uint8_t)((uint32_t)rel >> (8 * k)); }
+            i += 4;
+        }
+        return b; };
+    std::vector<uint8_t> want; for (uint32_t k = 0; k < K; ++k) { const auto c = inverse(w0, k * F); want.insert(want.end(), c.begin(), c.end()); }
+    CHECK(want != std::vector<uint8_t>(want.size(), 0) && !std::equal(w0.begin(), w0.end(), want.begin()));   // (it does translate)
+    // (a WINDOW of 4 frames: checkpoints carry several frames as a run, and the oldest leave; NEAREST looks across frames)
+    const auto text = [&](const char *translated) { return std::string(R"J({"NAME": "e8 toy", "ISA": 8, "CODER": "BITS", "WINDOW": 256,
+        "REGISTERS": {"place": 0, "fs": 1, "i": 2, "f": 3, "pd": 4},
+        "ENTRY": "@s", "CODE": ["@s", "rawbytes free 4 fs", "set i 0",
+          "@frame", "mark", "jz (lt i 6) @done", "e8frame place 64 (mul i 64) fs", "jz i @first",
+          "raw free 8 f", "assert (eq f 1)", "mark", "nearest pd 64 0 256", "decode: assert (or (eq pd 0xFFFFFFFF) (eq pd 64))", "code: assert (eq pd 64)",
+          "outcopy 64 64", "jmp @fe",
+          "@first", "byterun 32", "mark", "byterun 32",
+          "@fe", "e8end )J") + translated + R"J(", "set i (add i 1)", "jmp @frame",
+          "@done", "end"]})J"; };
+    std::string err; coding::Description d; CHECK(coding::Read(text("1"), d, err));
+    if (!err.empty()) std::cerr << "  read: " << err << "\n";
+    std::vector<uint8_t> content, rec;
+    CHECK(coding::Mint(d, shipped.data(), shipped.size(), 0, 4096, 1, content, rec, err));
+    if (!err.empty()) std::cerr << "  mint: " << err << "\n";
+    CHECK(content == want);
+    auto src = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d)), std::make_shared<MemByteSource>(rec),
+                                               std::make_shared<MemByteSource>(content), shipped.size(), err);
+    CHECK(src != nullptr);
+    if (src) {
+        CHECK(src->checkpoints() >= K);
+        std::vector<uint8_t> got(shipped.size());
+        for (size_t k = src->checkpoints(); k-- > 0;) {                      // each frame's segment alone, from the back
+            const uint64_t at = shipped.size() * k / src->checkpoints(); CHECK(src->preadAll(got.data() + at, std::min<size_t>(5, shipped.size() - at), at)); }
+        CHECK(src->preadAll(got.data(), got.size(), 0)); CHECK(got == shipped);
+    }
+    // frames left untranslated: the content is what the stream holds
+    coding::Description d0; CHECK(coding::Read(text("0"), d0, err)); std::vector<uint8_t> c0, r0;
+    CHECK(coding::Mint(d0, shipped.data(), shipped.size(), 0, 4096, 1, c0, r0, err));
+    std::vector<uint8_t> plain; for (uint32_t k = 0; k < K; ++k) plain.insert(plain.end(), w0.begin(), w0.end());
+    CHECK(c0 == plain);
+    // under ISA 7: refused at read
+    std::string t7 = text("1"); t7.replace(t7.find("\"ISA\": 8"), 8, "\"ISA\": 7"); CHECK(!coding::Read(t7, d0, err));
+    // what is refused: frames out of order, overlapping, past the content, of no size or over 1 MiB, an end without a
+    // frame, a frame never ended, a filesize past 2^31, NEAREST reaching past the WINDOW, a family through a view
+    for (const char *body : {"\"e8frame 32 16 0 fs\", \"e8end 1\", \"e8frame 0 16 0 fs\", \"e8end 1\"",
+                             "\"e8frame 0 32 0 fs\", \"e8frame 16 16 0 fs\", \"e8end 1\"",
+                             "\"e8frame 60 100 0 fs\", \"e8end 1\"", "\"e8frame 0 0 0 fs\", \"e8end 1\"", "\"e8frame 0 2000000 0 fs\", \"e8end 1\"",
+                             "\"e8end 1\"", "\"e8frame 0 16 0 fs\"", "\"set fs 0x80000000\", \"e8frame 0 16 0 fs\", \"e8end 1\"",
+                             "\"nearest r5 4 0 300\""}) {
+        const std::string th = std::string(R"J({"NAME": "hostile", "ISA": 8, "CODER": "BITS", "WINDOW": 256, "REGISTERS": {"place": 0, "fs": 1},
+            "ENTRY": "@s", "CODE": ["@s", "rawbytes free 4 fs", "byterun 64", "set place 0", )J") + body + R"J(, "end"]})J";
+        coding::Description dh; CHECK(coding::Read(th, dh, err)); std::vector<uint8_t> ch, rh;
+        std::vector<uint8_t> sh = {(uint8_t)fs, (uint8_t)(fs >> 8), (uint8_t)(fs >> 16), 0}; sh.insert(sh.end(), w0.begin(), w0.end());
+        const bool ok = coding::Mint(dh, sh.data(), sh.size(), 0, 64, 1 << 20, ch, rh, err);
+        CHECK(!ok); if (ok) std::cerr << "  not refused: " << body << "\n"; }
+    {   coding::Description dp;
+        CHECK(!coding::Read(R"J({"NAME": "fam", "ISA": 8, "CODER": "BITS", "REGISTERS": {"fs": 1}, "ENTRY": "@s", "CODE": ["@s",
+            "predict zlib 0x0F0806 r10 0 0 1", "e8frame 0 16 0 fs", "e8end 1", "end"]})J", dp, err)); }
+    // a WINDOW over 32 MiB with E8 frames or NEAREST: refused at read (NEAREST's index and the frame table are sized by it)
+    {   coding::Description dw;
+        CHECK(!coding::Read(R"J({"NAME": "huge", "ISA": 8, "CODER": "BITS", "WINDOW": 4294967295, "ENTRY": "@s", "CODE": ["@s",
+            "nearest r5 3 0 4294967280", "end"]})J", dw, err)); }
+    // a frame read just after a newer frame's registration dropped it from the window (WINDOW 0): read as it is, never
+    // from a translation the drop freed (ASan: a use-after-free once)
+    {   const std::string tu = R"J({"NAME": "dropped", "ISA": 8, "CODER": "BITS", "REGISTERS": {"place": 0, "fs": 1, "x": 2},
+            "ENTRY": "@s", "CODE": ["@s", "rawbytes free 4 fs", "e8frame place 32 0 fs", "byterun 32", "e8end 1",
+            "e8frame place 32 32 fs", "set x (byte 7)", "byterun 32", "e8end 1", "end"]})J";
+        coding::Description du; CHECK(coding::Read(tu, du, err)); std::vector<uint8_t> cu, ru;
+        std::vector<uint8_t> su = {(uint8_t)fs, (uint8_t)(fs >> 8), (uint8_t)(fs >> 16), 0}; su.insert(su.end(), w0.begin(), w0.end());
+        coding::Mint(du, su.data(), su.size(), 0, 64, 1, cu, ru, err); }
+    // BITS16M (LZX's coder): a stored block of an ODD length inside a translated frame, then its pad byte — the encoder's
+    // bytes go out as they are, never packed into words (the AoK 1999 cab's last block)
+    {   std::vector<uint8_t> w(33); for (size_t k = 0; k < w.size(); ++k) w[k] = (uint8_t)(k * 7 % 200);
+        w[4] = 0xE8; w[5] = 0x10; w[6] = 0x27; w[7] = 0; w[8] = 0;              // a call to 10000: in range
+        std::vector<uint8_t> s2 = {(uint8_t)fs, (uint8_t)(fs >> 8), (uint8_t)(fs >> 16), (uint8_t)(fs >> 24)};
+        s2.insert(s2.end(), w.begin(), w.end()); s2.push_back(0);
+        const std::string t2 = R"J({"NAME": "odd stored block", "ISA": 8, "CODER": "BITS16M", "REGISTERS": {"place": 0, "fs": 1, "pad": 2},
+            "ENTRY": "@s", "CODE": ["@s", "rawbytes free 4 fs", "e8frame place 33 0 fs", "byterun 33", "rawbytes free 1 pad", "e8end 1", "end"]})J";
+        coding::Description d2; err.clear(); CHECK(coding::Read(t2, d2, err)); std::vector<uint8_t> c2, r2;
+        CHECK(coding::Mint(d2, s2.data(), s2.size(), 0, 64, 1 << 20, c2, r2, err));
+        if (!err.empty()) std::cerr << "  odd stored: " << err << "\n";
+        CHECK(c2 == inverse(w, 0) && c2 != w); }
+}
+
+// ISA 8's NEAREST: an LZ format storing every copy's distance explicitly, its encoder taking the nearest distance that
+// reaches the length (as match finders hand them out) except now and then. The description stores a flag where NEAREST
+// says the same, the distance where not: the predicted record is far smaller than the plain one, the content right, and
+// a reader restored at every token reads it back. Teeth: NEAREST answering a farther distance, a shorter match, or a
+// distance from before the stream; the predicted record no smaller than the plain one.
+TEST(nearest_predicts_an_lz_formats_distances) {
+    std::mt19937 r(21); std::vector<uint8_t> content, shipped = {0, 0};
+    struct T { bool copy; uint8_t lit; uint32_t len, dist; }; std::vector<T> toks;
+    auto naive = [&](size_t at, uint32_t len) -> uint32_t {               // the nearest d whose copy reproduces len bytes
+        for (uint32_t d = 1; d <= at && d <= 65535; ++d) { uint32_t k = 0; while (k < len && content[at - d + k] == content[at + k]) ++k; if (k == len) return d; }
+        return 0; };
+    // literals, and copies of earlier stretches (the encoder knows the content it is about to write)
+    while (content.size() < 20000) {
+        if (content.size() < 64 || r() % 3 == 0) { const uint8_t c = (uint8_t)(r() % 64); content.push_back(c); toks.push_back({false, c, 0, 0}); continue; }
+        const uint32_t len = 3 + r() % 30, from = (uint32_t)(r() % (content.size() - 1)); const uint32_t dist = (uint32_t)content.size() - from;
+        for (uint32_t k = 0; k < len; ++k) content.push_back(content[content.size() - dist]);
+        const uint32_t nd = naive(content.size() - len, len);
+        const bool farther = r() % 10 == 0 && nd != dist;                  // now and then the encoder does not take the nearest
+        toks.push_back({true, 0, len, farther ? dist : nd});
+    }
+    for (const T &t : toks) {
+        if (!t.copy) { shipped.push_back(0); shipped.push_back(t.lit); }
+        else { shipped.push_back(1); shipped.push_back((uint8_t)t.len); shipped.push_back((uint8_t)t.dist); shipped.push_back((uint8_t)(t.dist >> 8)); } }
+    shipped[0] = (uint8_t)toks.size(); shipped[1] = (uint8_t)(toks.size() >> 8);
+    const std::string text = R"J({"NAME": "lz with explicit distances", "ISA": 8, "CODER": "BITS", "WINDOW": 65536,
+      "REGISTERS": {"place": 0, "cnt": 1, "i": 2, "k": 3, "c": 4, "len": 5, "pd": 6, "dist": 7, "f": 8}, "ENTRY": "@s",
+      "CODE": ["@s", "raw free 16 cnt", "set i 0",
+        "@t", "mark", "jz (lt i cnt) @end", "set i (add i 1)", "raw free 8 k", "jz k @lit",
+        "raw free 8 len", "nearest pd len 0 65535",
+        "decode: raw 16 0 dist", "decode: set f (ne dist pd)", "dec f", "jz f @pred", "dec dist", "jmp @emit",
+        "@pred", "code: set dist pd",
+        "@emit", "code: raw 16 dist dist", "outcopy len dist", "jmp @t",
+        "@lit", "raw 8 (byte place) c", "outlit c", "jmp @t",
+        "@end", "end"]})J";
+    std::string err; coding::Description d; CHECK(coding::Read(text, d, err));
+    if (!err.empty()) std::cerr << "  read: " << err << "\n";
+    std::vector<uint8_t> c1, rq, c2, rp;
+    CHECK(coding::Mint(d, shipped.data(), shipped.size(), 0, 1 << 16, 64, c1, rq, err));
+    if (!err.empty()) std::cerr << "  mint: " << err << "\n";
+    CHECK(coding::Mint(d, shipped.data(), shipped.size(), 0, 1 << 16, 64, c2, rp, err, false));
+    CHECK(c1 == content && c2 == content);
+    CHECK(rq.size() > 3 && rq[3] == 'Q' && rp[3] == 'R');
+    CHECK(rq.size() * 10 < rp.size() * 9);                                // the distances, mostly flags now (a token's other
+    if (rq.size() * 10 >= rp.size() * 9) std::cerr << "  predicted " << rq.size() << " vs plain " << rp.size() << "\n";
+    auto src = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d)), std::make_shared<MemByteSource>(rq),
+                                               std::make_shared<MemByteSource>(c1), shipped.size(), err);
+    CHECK(src != nullptr);
+    if (src) {
+        std::vector<uint8_t> got(shipped.size());
+        for (size_t k = src->checkpoints(); k-- > 0;) { const uint64_t at = shipped.size() * k / src->checkpoints(); CHECK(src->preadAll(got.data() + at, std::min<size_t>(4, shipped.size() - at), at)); }
+        CHECK(src->preadAll(got.data(), got.size(), 0)); CHECK(got == shipped);
+    }
+    std::string t7 = text; t7.replace(t7.find("\"ISA\": 8"), 8, "\"ISA\": 7"); CHECK(!coding::Read(t7, d, err));
+    // exactly what it answers: an encoder that ALWAYS takes the nearest (within 300 bytes, else a farther one), and a
+    // description asserting, when NEAREST answers, that it is the encoder's distance and within the bound
+    {   std::vector<uint8_t> s2 = {0, 0}; size_t n2 = 0;
+        for (const T &t : toks) {
+            const size_t at = [&] { size_t a = 0; for (size_t q = 0; q < (size_t)(&t - &toks[0]); ++q) a += toks[q].copy ? toks[q].len : 1; return a; }();
+            if (!t.copy) { s2.push_back(0); s2.push_back(t.lit); ++n2; continue; }
+            const uint32_t nd = naive(at, t.len);
+            s2.push_back(1); s2.push_back((uint8_t)t.len); s2.push_back((uint8_t)nd); s2.push_back((uint8_t)(nd >> 8)); ++n2;
+            if (n2 > 400) break; }
+        s2[0] = (uint8_t)n2; s2[1] = (uint8_t)(n2 >> 8);
+        std::string t2 = text;
+        t2.replace(t2.find("\"nearest pd len 0 65535\""), 24, "\"nearest pd len 0 300\", \"decode: assert (or (eq pd 0xFFFFFFFF) (ge 300 pd))\"");
+        t2.replace(t2.find("\"decode: set f (ne dist pd)\""), 28,
+                   "\"decode: assert (or (eq pd 0xFFFFFFFF) (eq dist pd))\", \"decode: set f (ne dist pd)\"");
+        coding::Description d2; err.clear(); CHECK(coding::Read(t2, d2, err)); std::vector<uint8_t> c3, r3;
+        CHECK(coding::Mint(d2, s2.data(), s2.size(), 0, 1 << 16, 64, c3, r3, err));
+        if (!err.empty()) std::cerr << "  exact nearest: " << err << "\n"; }
+}
+
 TEST(a_description_newer_than_its_isa_is_refused) {
     auto d = coding::BsaDescription(0); auto bytes = coding::Serialize(d);
     coding::Description back; std::string err;

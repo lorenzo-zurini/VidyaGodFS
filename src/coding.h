@@ -28,8 +28,8 @@
 
 namespace coding {
 
-constexpr uint32_t kIsa = 7;          // the instruction set a description may use; newer is refused (3: HUFFRUN, BYTERUN; 4: STREAMPOS; 5: PREDICT; 6: U16 U32 U16BE U32BE;
-                                      // 7: the BITS16M coder, RAWBYTES, DIV MOD, a bounded HUFFRUN)
+constexpr uint32_t kIsa = 8;          // the instruction set a description may use; newer is refused (3: HUFFRUN, BYTERUN; 4: STREAMPOS; 5: PREDICT; 6: U16 U32 U16BE U32BE;
+                                      // 7: the BITS16M coder, RAWBYTES, DIV MOD, a bounded HUFFRUN; 8: E8FRAME E8END NEAREST)
 constexpr int kRegs = 64;
 constexpr int kRegPlace = 0;          // register 0: the place in the content
 constexpr uint32_t kNoSlot = 255;
@@ -94,6 +94,15 @@ enum OpCode : uint8_t {
     // ---- ISA 7
     OP_RAWBYTES, // x (1..4) stream bytes as a little-endian integer, at a byte boundary (BITS16M: a word boundary of the bits
                  // before it, or after bytes); a coding op (`free` makes it a decision)
+    // ---- ISA 8: a TRANSLATED VIEW (LZX's E8: the encoder translated x86 CALL operands before compressing). The format's code
+    // works on what the encoder saw; the content is the real bytes (so it dedups with the installed files)
+    OP_E8FRAME,  // frame [x, x+v) of the content, its first byte at stream position m, filesize in register tgt: if the frame
+                 // turns out translated (E8END), the code reads it translated (one decision: CODE learns it here)
+    OP_E8END,    // the frame opened is translated if v (DECODE decides; the content becomes the real bytes when the run ends)
+    OP_NEAREST,  // register tgt = the NEAREST distance d (1..m, never before content place v) at which the content repeats the x
+                 // bytes at the place (an LZ copy's distance as match finders hand it out; x >= 2), or 0xFFFFFFFF: none
+                 // found within 128 candidates, or no content ahead to look at (PRICE; the first, plain DECODE of a mint).
+                 // A predictor like PREDICT: what it says is checked when minted, never trusted
     OP_COUNT
 };
 constexpr uint8_t kFree = 1;          // op flag: its value is a decision

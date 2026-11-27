@@ -59,10 +59,13 @@ const std::vector<Sig> &Sigs() {
         {"byterun", {{kE, 'x'}}, false},
         {"predict", {{kF, 'n'}, {kK, 'i'}, {kR, 't'}, {kE, 'x'}, {kE, 'v'}, {kE, 'm'}}, false},
         {"rawbytes", {{kE, 'x'}, {kE, 'v'}, {kR, 't'}}, true},
+        {"e8frame", {{kE, 'x'}, {kE, 'v'}, {kE, 'm'}, {kR, 't'}}, false},
+        {"e8end", {{kE, 'v'}}, false},
+        {"nearest", {{kR, 't'}, {kE, 'x'}, {kE, 'v'}, {kE, 'm'}}, false},
     };
     return s;
 }
-static_assert(OP_COUNT == 27, "an op without a text form: add its signature");
+static_assert(OP_COUNT == 30, "an op without a text form: add its signature");
 
 struct ExName { const char *name; uint8_t op; int arity; };   // arity -1: (table|arr NAME value)
 const std::vector<ExName> &ExNames() {
