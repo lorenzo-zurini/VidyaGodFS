@@ -399,6 +399,9 @@ using Seqs = std::shared_ptr<const std::vector<Lz4Seq>>;
 struct PredictCache {
     struct E { Seqs seqs; bool ready = false; uint64_t used = 0; };
     std::mutex mu; std::condition_variable cv; std::map<std::tuple<uint32_t, uint32_t, uint32_t>, E> m; uint64_t clock = 0;
+    //the whole stream's parse work, every segment's together (a record of many tiny segments gets no allowance per
+    //segment): 128 steps a byte of the stream and its content, plus two of the largest blocks
+    std::atomic<uint64_t> steps{0}; uint64_t streamBudget = UINT64_MAX;
     // the block [Lo, Hi)'s parse, made by `Make` here if no machine has it or is making it
     template <class F> Seqs get(uint32_t Lo, uint32_t Hi, uint32_t Att, F &&Make) {
         const auto k = std::make_tuple(Lo, Hi, Att);
@@ -604,7 +607,11 @@ struct Machine {
                 if (mode == kDecode) b = X.w + Lo;
                 else if (X.mem) b = X.mem + Lo;
                 else { tmp.resize(Hi - Lo); if (!X.src->preadAll(tmp.data(), tmp.size(), Lo)) return false; b = tmp.data(); }
-                if (!P->parse(b, Hi - Lo, Att, V, psteps, budget)) { over = true; return false; }
+                const uint64_t before = psteps, shared = pcache->steps.load();
+                const uint64_t room = pcache->streamBudget > shared ? pcache->streamBudget - shared : 0;
+                const bool ok = P->parse(b, Hi - Lo, Att, V, psteps, std::min(budget, before + room));
+                pcache->steps += psteps - before;
+                if (!ok) { over = true; return false; }
                 return true;
             };
             if (!pcache) pcache = std::make_shared<PredictCache>();
@@ -851,6 +858,8 @@ bool MintInto(const Description &D, const uint8_t *Shipped, size_t N, size_t Con
     std::vector<C> cks;
     Machine m(D, S, kCode); m.out = &out; m.X.mem = Buf; m.X.size = ContentLen; m.Dc.setMem(dec.data(), dec.size()); m.Dc.total = dec.size();
     m.noPredict = !predicted; m.pc = D.entryStream;
+    const uint64_t streamBudget = 128 * ((uint64_t)N + ContentLen + 2 * kLz4hcMaxBlock);   // what a reader will allow the stream
+    m.pcache = std::make_shared<PredictCache>(); m.pcache->streamBudget = streamBudget;
     cks.push_back({0, 0, m.snapshot()});
     for (bool first = true;; first = false) {
         m.stopAt = cks.back().out + Spacing;                 // from the LAST checkpoint: a long run (one token) does not leave a burst of tiny segments behind it
@@ -860,6 +869,10 @@ bool MintInto(const Description &D, const uint8_t *Shipped, size_t N, size_t Con
         m.copied += out.size(); out.clear();
         if (r == 1) break;
         cks.push_back({m.copied, m.Dc.consumed(), m.snapshot()});
+        //from here on, as a reader restored at this checkpoint runs: its own parse budget and no parse at hand (a record
+        //no reader could read is refused here, never minted)
+        m.prog0 = m.progress(); m.fuelBase = m.fuel; m.psteps = 0; m.pseqs.reset();
+        { auto fresh = std::make_shared<PredictCache>(); fresh->steps = m.pcache->steps.load(); fresh->streamBudget = streamBudget; m.pcache = std::move(fresh); }
     }
     if (m.copied != N) { Err = "the stream does not code back to its own bytes"; return false; }
     if (m.Dc.consumed() != dec.size()) { Err = "decisions left over"; return false; }
@@ -1095,6 +1108,7 @@ std::shared_ptr<CodedByteSource> CodedByteSource::Create(std::shared_ptr<ByteSou
     }
     if (auto below = std::dynamic_pointer_cast<CodedByteSource>(Content)) S->I->depth = below->I->depth + 1;
     S->Rec = Record; S->Content = Content; S->Size = ShippedSize;
+    S->I->pcache->streamBudget = 128 * (ShippedSize + Content->size() + 2 * kLz4hcMaxBlock);
     S->I->cks = S->Cks; S->I->rec = std::move(Record); S->I->content = std::move(Content); S->I->size = ShippedSize;
     return S;
 }

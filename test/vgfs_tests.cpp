@@ -3951,6 +3951,28 @@ TEST(a_parse_that_would_crawl_is_refused_by_its_work) {
     CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));
 }
 
+// Whatever the mint accepts, every reader can read: the mint codes back as a reader restored at each checkpoint runs
+// (its own parse budget, no parse at hand), so a slow block after much easy content is refused at mint, never minted
+// into a record no reader can read (adversary 2026-11-27: minted, then EIO). Teeth: one budget for the whole mint.
+TEST(a_record_the_mint_accepts_every_reader_can_read) {
+    std::vector<uint8_t> easy(20u << 20), slow(4u << 20); std::mt19937 r(11);
+    for (auto &x : easy) x = (uint8_t)r();
+    for (auto &x : slow) x = (uint8_t)(r() & 1);
+    std::vector<uint8_t> want; const auto bsa = makeBsa({{"t", {{"easy.dds", easy}, {"slow.dds", slow}}}}, 0x7, want);
+    const auto famD = coding::BsaDescription(32768);
+    std::vector<uint8_t> content, rec; std::string err;
+    const bool minted = coding::Mint(famD, bsa.data(), bsa.size(), 0, want.size() + 4096, 1u << 20, content, rec, err);
+    if (minted) {
+        auto src = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(famD)), std::make_shared<MemByteSource>(rec),
+                                                   std::make_shared<MemByteSource>(content), bsa.size(), err);
+        CHECK(src != nullptr);
+        std::vector<uint8_t> all(bsa.size());
+        CHECK(src && src->preadAll(all.data(), all.size(), 0) && all == bsa);
+    } else CHECK(err.find("parses without making progress") != std::string::npos);
+    // the same archive minted plain always mints and reads (the fallback for such a stream)
+    CHECK(coding::Mint(famD, bsa.data(), bsa.size(), 0, want.size() + 4096, 1u << 20, content, rec, err, false));
+}
+
 // PREDICT is ISA 5 and bounded: an ISA-4 description naming it, a family the reader lacks, and a knob past the limit are
 // refused.
 TEST(a_predict_op_is_checked) {
