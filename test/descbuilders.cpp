@@ -1,6 +1,7 @@
-// Descriptions of the formats VidyaGod knows how to WRITE, built with a small assembler. The reader never runs any
-// of this: it parses whatever description data a package carries. These exist so the packer can mint.
-#include "coding.h"
+// TEST FIXTURES (descbuilders.h): descriptions built with a small assembler, for the tests. The engine never runs any of
+// this; packages carry their descriptions as node text.
+#include "descbuilders.h"
+#include "zfamily.h"
 
 #include <cstring>
 
@@ -99,7 +100,10 @@ enum { DR_K = 1, DR_L, DR_D, DR_BF, DR_BT, DR_SYM, DR_C, DR_E, DR_DC, DR_N, DR_I
 enum { DA_LENS, DA_CL, DA_FIXL, DA_FIXD };
 enum { DT_LBASE, DT_LEXT, DT_DBASE, DT_DEXT, DT_CLORDER, DT_LSYM };
 enum { G_STREAM, G_BLOCK, G_DYN, G_TOKENS, G_BEND, G_STORED, G_SLOOP, G_DYNHDR, G_CLCLR, G_CLGO, G_CLRD, G_CLB, G_LL, G_RLE, G_Z, G_Z18,
-       G_FILL, G_FL, G_LLDONE, G_TOK, G_TEOB, G_TLIT, G_TCODE, G_LIT, G_EOB };
+       G_FILL, G_FL, G_LLDONE, G_TOK, G_TEOB, G_TLIT, G_TCODE, G_LIT, G_EOB, G_PRED, G_GOT, G_RECD };
+enum { DR_A = 45, DR_PR, DR_PL, DR_PD, DR_F, DR_BLO, DR_BHI };      // with a family: the anchor, the predicted token, the flag, the bounds
+// A deflate stream's encoder family: zlib's parse of the content [lo, hi) (registers), knob as ZlibParser's.
+struct DeflateFamily { uint32_t knob; };
 
 // ---- LZ4
 enum { QR_LIT = 1, QR_ML, QR_OFF, QR_TK, QR_R, QR_B, QR_I };
@@ -184,31 +188,49 @@ Description LzmaDescription(int lc, int lp, int pb, uint32_t dict, bool hasEnd) 
     return d;
 }
 
-Description DeflateDescription() {
-    static const uint32_t LBASE[29] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
-    static const uint32_t LEXT[29] = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
-    static const uint32_t DBASE[30] = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
-    static const uint32_t DEXT[30] = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
-    static const uint32_t CLORDER[19] = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
-    std::vector<uint32_t> lsym(256), fixl(288), fixd(30, 5);
-    for (int v = 0; v < 256; ++v) { int s = 28; while ((uint32_t)(v + 3) < LBASE[s]) --s; lsym[(size_t)v] = (uint32_t)s; }
-    for (int k = 0; k < 288; ++k) fixl[(size_t)k] = k < 144 ? 8 : k < 256 ? 9 : k < 280 ? 7 : 8;
-    Asm a;
+// One deflate stream from G_STREAM: standalone (the description's whole stream: it ends the program) or inside a
+// container (it returns, byte-aligned, after the final block). With a family, each token's decisions are a flag: 0 the
+// family's token, else 1 and the token as it is.
+static void DeflateTables(Description &d);
+static void DeflateBody(Asm &a, const DeflateFamily *Fam, bool Standalone) {
     const uint16_t K = a.R(DR_K), L = a.R(DR_L), D = a.R(DR_D), BF = a.R(DR_BF), BT = a.R(DR_BT), SYM = a.R(DR_SYM), Cc = a.R(DR_C), E = a.R(DR_E), DC = a.R(DR_DC);
     const uint16_t N = a.R(DR_N), I = a.R(DR_I), HLIT = a.R(DR_HLIT), HDIST = a.R(DR_HDIST), HCLEN = a.R(DR_HCLEN), Rr = a.R(DR_R), T = a.R(DR_T), LEN = a.R(DR_LEN), NLEN = a.R(DR_NLEN);
     const uint16_t PAD = a.AND(a.SUB(a.C(8), a.X1(EX_BITPOS, 0)), a.C(7)), ONE = a.C(1);
-    a.Label(G_STREAM); a.Label(G_BLOCK); a.Mark();
+    a.Label(G_STREAM);
+    if (Fam) { a.Set(DR_BLO, a.R(kRegPlace)); a.Set(DR_BHI, a.ADD(a.R(kRegPlace), a.X1(EX_XLEFT, 0))); }   // the family parses from here on
+    a.Label(G_BLOCK); a.Mark();
     a.RawF(a.C(1), DR_BF); a.RawF(a.C(2), DR_BT); a.Assert(a.NE(BT, a.C(3)));
     a.Jz(BT, G_STORED); a.Jz(a.EQ(BT, a.C(1)), G_DYN);
     a.Build(0, DA_FIXL, a.C(0), a.C(288)); a.Build(1, DA_FIXD, a.C(0), a.C(30)); a.Jmp(G_TOKENS);
     a.Label(G_DYN); a.Call(G_DYNHDR);
     a.Label(G_TOKENS); a.Mark();
-    a.Mode(kCode); a.Dec(DR_RUN); a.Dec(DR_K); a.Dec(DR_L); a.Dec(DR_D); a.Mode(0);
+    const auto predict = [&] { a.Predict(kFamilyZlib, Fam->knob, DR_PR, a.R(DR_A), a.R(DR_BLO), a.R(DR_BHI)); };
+    const uint16_t PK = Fam ? a.ADD(ONE, a.EQ(a.R(DR_PL), a.C(0))) : 0;                // the family's kind: a copy, or the end
+    if (Fam) a.Set(DR_A, a.R(kRegPlace));
+    a.Mode(kCode);
+    if (!Fam) { a.Dec(DR_RUN); a.Dec(DR_K); a.Dec(DR_L); a.Dec(DR_D); }
+    else {
+        a.Dec(DR_F); a.Jz(a.R(DR_F), G_PRED); a.Dec(DR_RUN); a.Dec(DR_K); a.Dec(DR_L); a.Dec(DR_D); a.Jmp(G_GOT);
+        a.Label(G_PRED); predict(); a.Assert(a.NE(a.R(DR_PL), a.C(kNoPrediction)));   // a flag the family cannot back
+        a.Set(DR_RUN, a.R(DR_PR)); a.Set(DR_L, a.R(DR_PL)); a.Set(DR_D, a.R(DR_PD)); a.Set(DR_K, PK);
+        a.Label(G_GOT);
+    }
+    a.Mode(0);
     a.Call(G_TOK);
-    a.Mode(kDecode); a.Dec(DR_RUN); a.Dec(DR_K); a.Dec(DR_L); a.Dec(DR_D); a.Mode(0);
+    a.Mode(kDecode);
+    if (!Fam) { a.Dec(DR_RUN); a.Dec(DR_K); a.Dec(DR_L); a.Dec(DR_D); }
+    else {
+        predict();
+        a.Set(DR_F, a.OR(a.OR(a.NE(a.R(DR_RUN), a.R(DR_PR)), a.NE(K, PK)), a.OR(a.NE(L, a.R(DR_PL)), a.NE(D, a.R(DR_PD)))));
+        a.Dec(DR_F); a.Jz(a.R(DR_F), G_RECD); a.Dec(DR_RUN); a.Dec(DR_K); a.Dec(DR_L); a.Dec(DR_D);
+    }
+    a.Mode(0);
+    if (Fam) a.Label(G_RECD);
     a.Jz(a.EQ(K, a.C(2)), G_TOKENS);
     a.Label(G_BEND); a.Jz(BF, G_BLOCK);
-    a.Set(DR_N, PAD); a.RawF(N, DR_T); a.Mode(kDecode); a.Assert(a.EQ(a.X1(EX_INLEFT, 0), a.C(0))); a.Mode(0); a.Flush(); a.End();
+    a.Set(DR_N, PAD); a.RawF(N, DR_T);
+    if (Standalone) { a.Mode(kDecode); a.Assert(a.EQ(a.X1(EX_INLEFT, 0), a.C(0))); a.Mode(0); a.Flush(); a.End(); }
+    else a.Ret();                                                         // byte-aligned: the container goes on
     a.Label(G_STORED);
     a.Set(DR_N, PAD); a.RawF(N, DR_T); a.RawF(a.C(16), DR_LEN);
     a.Mode(kCodePrice); a.Set(DR_NLEN, a.XOR(LEN, a.C(0xFFFF))); a.Mode(0); a.Raw(a.C(16), NLEN, DR_NLEN); a.Assert(a.EQ(NLEN, a.XOR(LEN, a.C(0xFFFF))));
@@ -254,14 +276,130 @@ Description DeflateDescription() {
     a.Mode(kDecode); a.Set(DR_D, a.ADD(a.TB(DT_DBASE, DC), E)); a.Set(DR_K, a.ADD(ONE, a.MUL(a.C(2), a.AND(a.EQ(Cc, a.C(27)), a.EQ(L, a.C(258)))))); a.Mode(0);
     a.OutCopy(L, D); a.Ret();
     a.Label(G_EOB); a.Mode(kDecode); a.Set(DR_K, a.C(2)); a.Set(DR_L, a.C(0)); a.Set(DR_D, a.C(0)); a.Mode(0); a.Ret();
-    a.link();
-    Description d = std::move(a.d);
-    d.name = "deflate"; d.coder = kBits;
+}
+
+static void DeflateTables(Description &d) {
+    static const uint32_t LBASE[29] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
+    static const uint32_t LEXT[29] = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
+    static const uint32_t DBASE[30] = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
+    static const uint32_t DEXT[30] = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
+    static const uint32_t CLORDER[19] = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
+    std::vector<uint32_t> lsym(256), fixl(288), fixd(30, 5);
+    for (int v = 0; v < 256; ++v) { int s = 28; while ((uint32_t)(v + 3) < LBASE[s]) --s; lsym[(size_t)v] = (uint32_t)s; }
+    for (int k = 0; k < 288; ++k) fixl[(size_t)k] = k < 144 ? 8 : k < 256 ? 9 : k < 280 ? 7 : 8;
     d.tables = {std::vector<uint32_t>(LBASE, LBASE + 29), std::vector<uint32_t>(LEXT, LEXT + 29), std::vector<uint32_t>(DBASE, DBASE + 30),
                 std::vector<uint32_t>(DEXT, DEXT + 30), std::vector<uint32_t>(CLORDER, CLORDER + 19), lsym};
     d.arrays = {std::vector<uint32_t>(320), std::vector<uint32_t>(19), fixl, fixd};
-    d.nhuff = 3; d.entryStream = (uint16_t)a.lab[G_STREAM]; d.entryToken = a.lab[G_TOK];
+    d.nhuff = 3;
+}
+
+Description DeflateDescription(uint32_t Knob) {
+    Asm a;
+    const DeflateFamily fam{Knob};
+    DeflateBody(a, Knob ? &fam : nullptr, true);
+    a.link();
+    Description d = std::move(a.d);
+    if (Knob) d.isa = 5;
+    d.name = Knob ? "deflate, zlib level " + std::to_string(Knob & 0xFF) : "deflate"; d.coder = kBits;
+    DeflateTables(d);
+    d.entryStream = (uint16_t)a.lab[G_STREAM]; d.entryToken = a.lab[G_TOK];
     d.window = 32768; d.maxlen = 258; d.tokK = DR_K; d.tokL = DR_L; d.tokSL = DR_T; d.tokD = DR_D;
+    return d;
+}
+
+// ---- Inno Setup (5.1.5 and later): the loader stub and everything outside the chunks as it is, each zlib
+// chunk ("zlb\x1a", a zlib header, a deflate stream, its Adler-32) through the deflate body with the zlib family, each LZMA2
+// chunk walked by its chunk headers (inside as it is). The
+// loader table (found by its magic) says where the chunks begin; they follow one another until something else does.
+enum { IR_N = 52, IR_DOFF, IR_X, IR_G, IR_H, IR_C, IR_S };
+enum { I_STREAM = 60, I_SCAN, I_NEXT, I_FOUND, I_LOOP, I_REST, I_CHK, I_GAP, I_LZ2, I_L2, I_L2U, I_L2C };
+Description InnoDescription(uint32_t Knob) {
+    Asm a;
+    const uint16_t PLACE = a.R(kRegPlace);
+    auto BYTE = [&](uint16_t at) { return a.X1(EX_BYTE, at); };
+    auto U32 = [&](uint16_t at) { return a.OR(a.OR(BYTE(at), a.SHL(BYTE(a.ADD(at, a.C(1))), a.C(8))),
+                                              a.OR(a.SHL(BYTE(a.ADD(at, a.C(2))), a.C(16)), a.SHL(BYTE(a.ADD(at, a.C(3))), a.C(24)))); };
+    // what is left of the stream: read so far (DECODE: the shipped bits left), or of the content (CODE)
+    const auto Left = [&](int reg) {
+        a.Mode(kDecode); a.Set(reg, a.SHR(a.X1(EX_INLEFT, 0), a.C(3)));
+        a.Mode(kCode); a.Set(reg, a.X1(EX_XLEFT, 0)); a.Mode(0);
+    };
+    a.Label(I_STREAM);
+    // the stub, as it is, through the loader table's magic ("rDlPtS" and six more bytes: Inno 5.1.5 and later)
+    a.ByteRun(a.C(12));
+    a.Label(I_SCAN);
+    a.Jz(a.AND(a.AND(a.EQ(U32(a.SUB(PLACE, a.C(12))), a.C(0x506C4472u)), a.EQ(U32(a.SUB(PLACE, a.C(8))), a.C(0xE6CD5374u))),
+               a.EQ(U32(a.SUB(PLACE, a.C(4))), a.C(0x2A0B7BD7u))), I_NEXT);
+    a.Jmp(I_FOUND);
+    a.Label(I_NEXT);
+    Left(IR_N); a.Assert(a.GE(a.R(IR_N), a.C(1)));                       // no loader table: not an Inno installer
+    a.ByteRun(a.C(1)); a.Jmp(I_SCAN);
+    // its revision, two words, the setup exe's offset, size and CRC, the setup header's offset, the data's offset
+    a.Label(I_FOUND);
+    a.ByteRun(a.C(28));
+    a.Set(IR_DOFF, U32(a.SUB(PLACE, a.C(4))));
+    a.Assert(a.GE(a.R(IR_DOFF), PLACE));
+    a.ByteRun(a.SUB(a.R(IR_DOFF), PLACE));
+    // the chunks, one after another. Every chunk starts "zlb\x1a" whatever its compression; a few bytes may sit between
+    // two (LZMA2 chunks are followed by an empty LZMA2 stream, "0c 00"), so the magic is looked for up to 16 bytes on.
+    // Anything not found, or not understood, ends the walk: the rest as it is (never a refusal).
+    const auto Need = [&](uint32_t n) { Left(IR_N); a.Jz(a.GE(a.R(IR_N), a.C(n)), I_REST); };
+    a.Label(I_LOOP); a.Mark();
+    a.Set(IR_G, a.C(0));
+    Need(4); a.ByteRun(a.C(4));
+    a.Label(I_CHK);
+    a.Jz(a.EQ(U32(a.SUB(PLACE, a.C(4))), a.C(0x1A626C7Au)), I_GAP);         // "zlb\x1a"
+    Need(2); a.ByteRun(a.C(2));
+    a.Set(IR_H, a.OR(a.SHL(BYTE(a.SUB(PLACE, a.C(2))), a.C(8)), BYTE(a.SUB(PLACE, a.C(1)))));
+    // zlib: deflate (method 8, window up to 32 KiB), no dictionary, the check bits (header % 31 == 0, by 31 << k steps)
+    a.Set(IR_X, a.R(IR_H));
+    for (int k = 11; k >= 0; --k)
+        a.Set(IR_X, a.SUB(a.R(IR_X), a.MUL(a.GE(a.R(IR_X), a.C(31u << k)), a.C(31u << k))));
+    a.Jz(a.AND(a.AND(a.EQ(a.AND(a.SHR(a.R(IR_H), a.C(8)), a.C(0x0F)), a.C(8)), a.LT(a.SHR(a.R(IR_H), a.C(12)), a.C(8))),
+               a.AND(a.EQ(a.AND(a.R(IR_H), a.C(0x20)), a.C(0)), a.EQ(a.R(IR_X), a.C(0)))), I_LZ2);
+    a.Call(G_STREAM);
+    Need(4); a.ByteRun(a.C(4));                                             // its Adler-32 (of the chunk's content: kept)
+    a.Jmp(I_LOOP);
+    // LZMA2: a properties byte (the dictionary, 0..40), then chunks, each led by a control byte, to a 0: their sizes are
+    // in their headers, so the walk needs no decoding (the chunks' insides as they are)
+    a.Label(I_LZ2);
+    a.Jz(a.LT(a.SHR(a.R(IR_H), a.C(8)), a.C(41)), I_REST);
+    a.Set(IR_C, a.AND(a.R(IR_H), a.C(0xFF)));
+    a.Label(I_L2);
+    a.Jz(a.R(IR_C), I_LOOP);                                                // the end of the stream
+    a.Jz(a.GE(a.R(IR_C), a.C(0x80)), I_L2U);
+    Need(4); a.ByteRun(a.C(4));                                             // unpacked size (16 bits), packed size (16 bits)
+    a.Set(IR_S, a.ADD(a.OR(a.SHL(BYTE(a.SUB(PLACE, a.C(2))), a.C(8)), BYTE(a.SUB(PLACE, a.C(1)))), a.C(1)));
+    a.Set(IR_S, a.ADD(a.R(IR_S), a.GE(a.R(IR_C), a.C(0xC0))));               // a properties byte with a state reset
+    a.Jmp(I_L2C);
+    a.Label(I_L2U);                                                         // an uncompressed chunk (1 or 2): its size
+    a.Jz(a.LT(a.R(IR_C), a.C(3)), I_REST);
+    Need(2); a.ByteRun(a.C(2));
+    a.Set(IR_S, a.ADD(a.OR(a.SHL(BYTE(a.SUB(PLACE, a.C(2))), a.C(8)), BYTE(a.SUB(PLACE, a.C(1)))), a.C(1)));
+    a.Label(I_L2C);
+    Left(IR_N); a.Jz(a.GE(a.R(IR_N), a.ADD(a.R(IR_S), a.C(1))), I_REST);
+    a.ByteRun(a.R(IR_S));
+    a.ByteRun(a.C(1)); a.Set(IR_C, BYTE(a.SUB(PLACE, a.C(1))));
+    a.Jmp(I_L2);
+    // no magic yet: one byte on, up to 16
+    a.Label(I_GAP);
+    a.Jz(a.LT(a.R(IR_G), a.C(16)), I_REST);
+    Need(1); a.ByteRun(a.C(1)); a.Set(IR_G, a.ADD(a.R(IR_G), a.C(1)));
+    a.Jmp(I_CHK);
+    // the rest (the setup header, the setup exe, anything after the chunks), as it is
+    a.Label(I_REST);
+    Left(IR_N); a.ByteRun(a.R(IR_N));
+    a.Mode(kDecode); a.Assert(a.EQ(a.X1(EX_INLEFT, 0), a.C(0))); a.Mode(0);
+    a.End();
+    const DeflateFamily fam{Knob};
+    DeflateBody(a, Knob ? &fam : nullptr, false);
+    a.link();
+    Description d = std::move(a.d);
+    if (Knob) d.isa = 5;
+    d.name = Knob ? "Inno Setup, zlib level " + std::to_string(Knob & 0xFF) : "Inno Setup"; d.coder = kBits;
+    DeflateTables(d);
+    d.entryStream = (uint16_t)a.lab[I_STREAM]; d.entryToken = -1;
+    d.window = 32768; d.maxlen = 258;
     return d;
 }
 

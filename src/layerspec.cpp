@@ -112,12 +112,17 @@ bool ParseSpecText(const std::string &Text, Spec &Out, std::string &Err)
             if (LS.type == LayerType::Coded)
             {
                 if (LS.bases.size() != 1) return Bad("a coded stream names exactly one base: its content");
-                if (!L.contains("description") || !L["description"].is_string() || L["description"].get<std::string>().empty()) return Bad("a coded stream needs its description");
+                //its description: the DESCRIPTION its node holds, or null when the launch has no such node (the plan then
+                //refuses this layer alone, saying so: one missing description never takes the rest of a launch down)
+                if (!L.contains("description") || !(L["description"].is_null() || (L["description"].is_object() && !L["description"].empty())))
+                    return Bad("a coded stream needs its description (the DESCRIPTION its node holds, or null)");
+                if (!L.contains("descriptionCid") || !L["descriptionCid"].is_string() || L["descriptionCid"].get<std::string>().empty()) return Bad("a coded stream needs its description node's CID");
                 if (!L.contains("name") || !L["name"].is_string() || NormalizeVPath(L["name"].get<std::string>()).empty()) return Bad("a coded stream needs the name it appears by");
-                LS.description = L["description"].get<std::string>();
+                LS.description = L["description"].is_null() ? std::string() : L["description"].dump();
+                LS.descriptionCid = L["descriptionCid"].get<std::string>();
                 LS.name = NormalizeVPath(L["name"].get<std::string>());
             }
-            else if (L.contains("description") || L.contains("name")) return Bad("only a coded stream has a description and a name");
+            else if (L.contains("description") || L.contains("descriptionCid") || L.contains("name")) return Bad("only a coded stream has a description and a name");
             LS.rw      = L.value("rw", false);
             LS.bytesOnly = L.value("bytesOnly", false);
             LS.fixed   = L.value("fixed", false);

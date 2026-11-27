@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -27,7 +28,7 @@
 
 namespace coding {
 
-constexpr uint32_t kIsa = 5;          // the instruction set a description may use; newer is refused (3: HUFFRUN, BYTERUN; 4: STREAMPOS; 5: PREDICT)
+constexpr uint32_t kIsa = 6;          // the instruction set a description may use; newer is refused (3: HUFFRUN, BYTERUN; 4: STREAMPOS; 5: PREDICT; 6: U16 U32 U16BE U32BE)
 constexpr int kRegs = 64;
 constexpr int kRegPlace = 0;          // register 0: the place in the content
 constexpr uint32_t kNoSlot = 255;
@@ -48,6 +49,11 @@ enum ExOp : uint8_t {
     EX_XLEFT,     // content bytes after the place
     EX_INLEFT,    // DECODE: shipped bits not yet read by the bit coder
     EX_STREAMPOS, // ISA 4: the shipped stream's byte position: read so far (DECODE), written so far (CODE); 0 in PRICE
+    // ---- ISA 6: integers in the content, as containers store them (one value, not four byte reads and their shifts)
+    EX_U16,       // the little-endian 16-bit integer at content place a (bytes outside what exists read as 0, as EX_BYTE)
+    EX_U32,       // the little-endian 32-bit integer at a
+    EX_U16BE,     // big-endian 16 bits at a
+    EX_U32BE,     // big-endian 32 bits at a
     EX_COUNT
 };
 enum OpCode : uint8_t {
@@ -102,18 +108,25 @@ struct Description {
     uint8_t histbase = 0, histlen = 0, tokK = 0, tokL = 0, tokSL = 0, tokD = 0;
 };
 
+// A description is KEPT as readable data in a node (chapter 22 §22.16: JSON, one instruction a string; codingtext.cpp),
+// never as a binary. False (Err says why) for anything that is not a valid description this engine can run.
+bool Validate(const Description &D, std::string &Err);
+// Names a printed description uses for what it numbers (registers, labels at op indices, tables, arrays, codes);
+// anything unnamed prints as r5, L12, t0, a0, h0.
+struct TextNames {
+    std::map<int, std::string> regs, labels;
+    std::vector<std::string> tables, arrays, huffs;
+};
+// Print: the description's text (canonical: Read(Print(D)) runs as D does, and prints the same). False if it is not
+// valid, or sets a field its text form cannot say.
+bool Print(const Description &D, std::string &Out, std::string &Err, const TextNames *Names = nullptr);
+// Read: a description's text, or a node holding one in its DESCRIPTION; validated. Names: what the text called things
+// (Print(D, …, Names) gives the text back in canonical form with them).
+bool Read(const std::string &Text, Description &D, std::string &Err, TextNames *Names = nullptr);
+// The same as bytes (the text, UTF-8): what a ByteSource of a description holds. Serialize is empty if Print fails.
 std::vector<uint8_t> Serialize(const Description &D);
-// False (Err says why) for anything that is not a valid description this engine can run.
 bool Parse(const uint8_t *Data, size_t N, Description &D, std::string &Err);
 
-// Descriptions of the formats this repository knows how to WRITE (the reader never needs these: it reads any
-// description).
-Description LzmaDescription(int Lc, int Lp, int Pb, uint32_t Dict, bool EndMarker);
-Description DeflateDescription();
-Description Lz4BlockDescription();
-// Bethesda archive v105 (Skyrim SE): header region + members, LZ4 frames. Attempts: the LZ4 high-compression family that
-// predicts the frames' blocks (32768: Bethesda's own packer, lz4 1.7 level 16), 0 none (every sequence a decision).
-Description BsaDescription(uint32_t Attempts = 32768);
 
 // The checkpoint spacing a description suits: a coder without adaptive state (static codes, raw bytes) checkpoints
 // cheaply, so often (every block or so: a read starts at most that far back, and segments decode in parallel); one

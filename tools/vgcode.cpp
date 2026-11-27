@@ -1,6 +1,7 @@
 // vgcode: the coding algebra from the command line (authoring and verification; the mount reads coded layers itself).
-//   vgcode describe <lz4|deflate|bsa[:attempts]|lzma:lc,lp,pb,dict[,end]> <out.vgcd>
-//       bsa: with Bethesda's packer as its family (LZ4HC, 32768 attempts); bsa:0 without a family
+// A <description> is a node holding one in its DESCRIPTION, or the description's own JSON (chapter 22 §22.16).
+//   vgcode check <description> [canonical-out]
+//       read and validate a description; write its canonical text (the same names, values laid out canonically)
 //   vgcode mint [--plain] <description> <shipped> <content-out> <record-out> [spacing]
 //       decode the shipped file into its content and a record, code it back and refuse unless every byte matches
 //       (a description with a family mints a PREDICTED record, small; --plain mints every decision: larger, fast to read)
@@ -44,19 +45,14 @@ static std::shared_ptr<coding::CodedByteSource> Open(char **a) {
 
 int main(int argc, char **argv) {
     const std::string cmd = argc > 1 ? argv[1] : "";
-    if (cmd == "describe" && argc == 4) {
-        const std::string n = argv[2]; coding::Description d;
-        if (n == "lz4") d = coding::Lz4BlockDescription();
-        else if (n == "deflate") d = coding::DeflateDescription();
-        else if (n == "bsa") d = coding::BsaDescription();
-        else if (n.rfind("bsa:", 0) == 0) d = coding::BsaDescription((uint32_t)std::stoul(n.substr(4)));
-        else if (n.rfind("lzma:", 0) == 0) {
-            unsigned lc, lp, pb, end = 1; unsigned long dict;
-            if (std::sscanf(n.c_str() + 5, "%u,%u,%u,%lu,%u", &lc, &lp, &pb, &dict, &end) < 4) { std::cerr << "lzma:lc,lp,pb,dict[,end]\n"; return 2; }
-            d = coding::LzmaDescription((int)lc, (int)lp, (int)pb, (uint32_t)dict, end != 0);
-        } else { std::cerr << "no description named " << n << "\n"; return 2; }
-        const auto b = coding::Serialize(d);
-        return Spit(argv[3], b.data(), b.size()) ? 0 : 1;
+    if (cmd == "check" && (argc == 3 || argc == 4)) {
+        std::vector<uint8_t> db; std::string err, text; coding::Description d;
+        if (!Slurp(argv[2], db)) { std::cerr << "cannot read " << argv[2] << "\n"; return 1; }
+        coding::TextNames names;
+        if (!coding::Read(std::string(db.begin(), db.end()), d, err, &names) || !coding::Print(d, text, err, &names)) { std::cerr << "refused: " << err << "\n"; return 1; }
+        if (argc == 4 && !Spit(argv[3], (const uint8_t *)text.data(), text.size())) { std::cerr << "cannot write\n"; return 1; }
+        std::cout << "valid: " << d.name << " (ISA " << d.isa << ", " << d.ops.size() << " instructions, " << d.ex.size() << " values)\n";
+        return 0;
     }
     bool plain = false;
     if (cmd == "mint" && argc > 2 && std::string(argv[2]) == "--plain") { plain = true; for (int i = 2; i + 1 < argc; ++i) argv[i] = argv[i + 1]; --argc; }
@@ -111,7 +107,7 @@ int main(int argc, char **argv) {
                   << src->segmentsDecoded() << "/" << src->checkpoints() << " segments)\n";
         return 0;
     }
-    std::cerr << "usage:\n  vgcode describe <lz4|deflate|bsa[:attempts]|lzma:lc,lp,pb,dict[,end]> <out>\n  vgcode mint [--plain] <description> <shipped> <content-out> <record-out> [spacing]\n"
+    std::cerr << "usage:\n  vgcode check <description> [canonical-out]\n  vgcode mint [--plain] <description> <shipped> <content-out> <record-out> [spacing]\n"
                  "  vgcode expand <description> <record> <content> <plain-record-out> [spacing]\n"
                  "  vgcode verify <description> <record> <content> <shipped>\n  vgcode cat <description> <record> <content> <out>\n";
     return 2;

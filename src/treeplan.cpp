@@ -56,6 +56,8 @@ TreePlan PlanTree(const Spec &S, const std::vector<bool> &Failed)
         //a delta over NO base is its own bytes, zstd-compressed with random access (content at rest); a coded stream
         //always has its content
         if ((S.layers[D].type == LayerType::Coded ? S.layers[D].bases.empty() : !S.layers[D].basesNamed) && Why.empty()) Why = "it names no base";
+        if (S.layers[D].type == LayerType::Coded && S.layers[D].description.empty() && Why.empty())
+            Why = "its description node " + S.layers[D].descriptionCid + " is not in this launch";
         for (const std::string &C : S.layers[D].bases)
         {
             const auto It = Carrier.find(C);
@@ -143,11 +145,7 @@ std::shared_ptr<ByteSource> LayerBytes::Get(size_t I, std::string *Err)
         std::string Why;
         auto Content = Get(P.bases[I][0], &Why);
         if (!Content) return Fail("its content " + L.bases[0] + " has no bytes (" + Why + ")");
-        HostIO::Fd Dfd = HostIO::Open(L.description, O_RDONLY);
-        if (Dfd < 0) return Fail("cannot open its description " + L.description);
-        HostIO::Stat Ds;
-        if (HostIO::Fstat(Dfd, Ds) != 0) { HostIO::Close(Dfd); return Fail("cannot stat its description " + L.description); }
-        auto Desc = std::make_shared<FdByteSource>(Dfd, Ds.size, true);
+        auto Desc = std::make_shared<MemByteSource>(std::vector<uint8_t>(L.description.begin(), L.description.end()));
         Src = coding::CodedByteSource::Create(Desc, Src, Content, 0, Why);
         if (!Src) return Fail("bad coded stream " + L.source + ": " + Why);
         for (size_t B : P.bases[I])                          // the stream reads its content through its own reference

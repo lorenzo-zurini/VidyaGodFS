@@ -1,5 +1,6 @@
 #include "coding.h"
 #include "lz4family.h"
+#include "zfamily.h"
 
 #include <zstd.h>
 
@@ -41,74 +42,36 @@ struct Rd {
 constexpr size_t kMaxEx = 65535, kMaxOps = 65535, kMaxTable = 1u << 20, kMaxTables = 16, kMaxArrays = 16, kMaxSlots = 1u << 22,
                  kMaxHuff = 4, kMaxSym = 320, kMaxStack = 64;
 bool BinaryEx(uint8_t op) { return op >= EX_ADD && op <= EX_GE; }
-bool UnaryEx(uint8_t op) { return op == EX_BYTE || op == EX_TABLE || op == EX_ARR || op == EX_LOG2SLOT; }
+bool UnaryEx(uint8_t op) { return op == EX_BYTE || op == EX_TABLE || op == EX_ARR || op == EX_LOG2SLOT || (op >= EX_U16 && op <= EX_U32BE); }
 bool CodingOp(uint8_t op) { return op <= OP_HUFF; }
 
 } // namespace
 
 // ================================================================================================ the description format
-std::vector<uint8_t> Serialize(const Description &D) {
-    std::vector<uint8_t> o = {'V', 'G', 'C', 'D'};
-    PutVar(o, D.isa); o.push_back(D.coder); o.push_back(D.shift);
-    PutVar(o, D.name.size()); o.insert(o.end(), D.name.begin(), D.name.end());
-    PutVar(o, D.nslots); o.push_back(D.nhuff); PutVar(o, D.entryStream); PutVar(o, (uint64_t)(D.entryToken + 1));
-    PutVar(o, D.window); PutVar(o, D.maxlen); o.push_back((uint8_t)(D.len1slot + 1));
-    for (uint8_t b : {D.histbase, D.histlen, D.tokK, D.tokL, D.tokSL, D.tokD}) o.push_back(b);
-    PutVar(o, D.ex.size());
-    for (const Ex &e : D.ex) { o.push_back(e.op); PutVar(o, e.a); PutVar(o, e.b); PutVar(o, e.imm); }
-    PutVar(o, D.ops.size());
-    for (const Op &p : D.ops) { for (uint8_t b : {p.op, p.modes, p.flags, p.nb, p.tgt}) o.push_back(b); for (uint16_t w : {p.x, p.v, p.m, p.target}) PutVar(o, w); PutVar(o, p.imm); }
-    PutVar(o, D.tables.size());
-    for (const auto &t : D.tables) { PutVar(o, t.size()); for (uint32_t v : t) PutVar(o, v); }
-    PutVar(o, D.arrays.size());
-    for (const auto &a : D.arrays) { size_t init = a.size(); while (init && !a[init - 1]) --init; PutVar(o, a.size()); PutVar(o, init); for (size_t i = 0; i < init; ++i) PutVar(o, a[i]); }
-    return o;
-}
-
-bool Parse(const uint8_t *Data, size_t N, Description &D, std::string &Err) {
-    D = Description();
-    Rd r{Data, N};
-    if (N < 4 || memcmp(Data, "VGCD", 4) != 0) { Err = "not a coding description"; return false; }
-    r.at = 4;
-    D.isa = (uint32_t)r.var(); D.coder = r.u8(); D.shift = r.u8();
+bool Validate(const Description &D, std::string &Err) {
     if (D.isa == 0 || D.isa > kIsa) { Err = "a description for a newer instruction set"; return false; }
     if (D.coder > kBits || D.shift < 1 || D.shift > 15) { Err = "a description with an unknown coder"; return false; }
-    const uint64_t nl = r.var(); if (r.bad || nl > 256 || r.at + nl > N) { Err = "a malformed description name"; return false; }
-    D.name.assign((const char *)Data + r.at, (size_t)nl); r.at += (size_t)nl;
-    D.nslots = (uint32_t)r.var(); D.nhuff = r.u8(); D.entryStream = (uint16_t)r.var(); D.entryToken = (int32_t)r.var() - 1;
-    D.window = (uint32_t)r.var(); D.maxlen = (uint32_t)r.var(); D.len1slot = (int8_t)((int)r.u8() - 1);
-    D.histbase = r.u8(); D.histlen = r.u8(); D.tokK = r.u8(); D.tokL = r.u8(); D.tokSL = r.u8(); D.tokD = r.u8();
-    if (r.bad || D.nslots > kMaxSlots || D.nhuff > kMaxHuff || D.histbase + D.histlen > kRegs || D.tokK >= kRegs || D.tokL >= kRegs || D.tokSL >= kRegs || D.tokD >= kRegs)
+    if (D.name.size() > 256) { Err = "a malformed description name"; return false; }
+    if (D.nslots > kMaxSlots || D.nhuff > kMaxHuff || D.histbase + D.histlen > kRegs || D.tokK >= kRegs || D.tokL >= kRegs || D.tokSL >= kRegs || D.tokD >= kRegs)
     { Err = "a description whose header is out of range"; return false; }
-    const uint64_t nex = r.var(); if (r.bad || nex == 0 || nex > kMaxEx) { Err = "a description without expressions"; return false; }
-    D.ex.resize((size_t)nex);
+    const size_t nex = D.ex.size(); if (nex == 0 || nex > kMaxEx) { Err = "a description without expressions"; return false; }
     for (size_t i = 0; i < nex; ++i) {
-        Ex &e = D.ex[i]; e.op = r.u8(); const uint64_t a = r.var(), b = r.var(), imm = r.var();
-        if (r.bad || e.op >= EX_COUNT || a > 0xFFFF || b > 0xFFFF || imm > 0xFFFFFFFFu) { Err = "a malformed expression"; return false; }
-        e.a = (uint16_t)a; e.b = (uint16_t)b; e.imm = (uint32_t)imm;
+        const Ex &e = D.ex[i];
+        if (e.op >= EX_COUNT) { Err = "a malformed expression"; return false; }
         // an expression refers only to EARLIER expressions: no cycles, evaluation in index order
         if ((BinaryEx(e.op) && (e.a >= i || e.b >= i)) || (UnaryEx(e.op) && e.a >= i)) { Err = "an expression that refers forward"; return false; }
         if (e.op == EX_REG && e.imm >= (uint32_t)kRegs) { Err = "an expression naming no register"; return false; }
     }
-    const uint64_t nops = r.var(); if (r.bad || nops == 0 || nops > kMaxOps) { Err = "a description without ops"; return false; }
-    D.ops.resize((size_t)nops);
-    for (Op &p : D.ops) {
-        p.op = r.u8(); p.modes = r.u8(); p.flags = r.u8(); p.nb = r.u8(); p.tgt = r.u8();
-        const uint64_t x = r.var(), v = r.var(), m = r.var(), t = r.var(), imm = r.var();
-        if (r.bad || p.op >= OP_COUNT || p.modes > kAll || p.flags > kFree || (p.flags && !CodingOp(p.op)) || p.tgt >= kRegs ||
-            x >= nex || v >= nex || m >= nex || t >= nops || imm > 0xFFFFFFFFu) { Err = "a malformed op"; return false; }
-        p.x = (uint16_t)x; p.v = (uint16_t)v; p.m = (uint16_t)m; p.target = (uint16_t)t; p.imm = (uint32_t)imm;
-    }
-    if (D.entryStream >= nops || D.entryToken >= (int32_t)nops) { Err = "an entry past the ops"; return false; }
-    const uint64_t nt = r.var(); if (r.bad || nt > kMaxTables) { Err = "too many tables"; return false; }
-    D.tables.resize((size_t)nt);
-    for (auto &t : D.tables) { const uint64_t n = r.var(); if (r.bad || n > kMaxTable) { Err = "a table too large"; return false; } t.resize((size_t)n);
-        for (auto &v : t) { const uint64_t x = r.var(); if (r.bad || x > 0xFFFFFFFFu) { Err = "a malformed table"; return false; } v = (uint32_t)x; } }
-    const uint64_t na = r.var(); if (r.bad || na > kMaxArrays) { Err = "too many arrays"; return false; }
-    D.arrays.resize((size_t)na);
-    for (auto &a : D.arrays) { const uint64_t n = r.var(), init = r.var(); if (r.bad || n > kMaxTable || init > n) { Err = "an array too large"; return false; }
-        a.assign((size_t)n, 0); for (uint64_t i = 0; i < init; ++i) { const uint64_t x = r.var(); if (r.bad || x > 0xFFFFFFFFu) { Err = "a malformed array"; return false; } a[(size_t)i] = (uint32_t)x; } }
-    if (r.at != N) { Err = "bytes after the description"; return false; }
+    const size_t nops = D.ops.size(); if (nops == 0 || nops > kMaxOps) { Err = "a description without ops"; return false; }
+    for (const Op &p : D.ops)
+        if (p.op >= OP_COUNT || p.modes > kAll || p.flags > kFree || (p.flags && !CodingOp(p.op)) || p.tgt >= kRegs ||
+            p.x >= nex || p.v >= nex || p.m >= nex || p.target >= nops) { Err = "a malformed op"; return false; }
+    if (D.entryStream >= nops || D.entryToken < -1 || D.entryToken >= (int32_t)nops) { Err = "an entry past the ops"; return false; }
+    const size_t nt = D.tables.size(), na = D.arrays.size();
+    if (nt > kMaxTables) { Err = "too many tables"; return false; }
+    for (const auto &t : D.tables) if (t.size() > kMaxTable) { Err = "a table too large"; return false; }
+    if (na > kMaxArrays) { Err = "too many arrays"; return false; }
+    for (const auto &a : D.arrays) if (a.size() > kMaxTable) { Err = "an array too large"; return false; }
     { size_t tt = 0, ta = 0; for (const auto &t : D.tables) tt += t.size(); for (const auto &a : D.arrays) ta += a.size();
       if (tt > (16u << 20) || ta > (4u << 20)) { Err = "a description too large"; return false; } }
     // what the ops name must exist
@@ -120,17 +83,20 @@ bool Parse(const uint8_t *Data, size_t N, Description &D, std::string &Err) {
             ((p.op == OP_HMTF || p.op == OP_HPUSH) && (p.nb == 0 || p.tgt + p.nb > kRegs)) ||
             (p.op >= OP_HUFFRUN && D.isa < 3) ||
             (p.op == OP_HUFFRUN && (p.imm >= D.nhuff || p.nb >= kRegs)) ||
-            (p.op == OP_PREDICT && (D.isa < 5 || p.nb != kFamilyLz4hc || p.imm == 0 || p.imm > kLz4hcMaxAttempts || p.tgt + 3 > kRegs));
+            (p.op == OP_PREDICT && (D.isa < 5 || p.tgt + 3 > kRegs ||
+                                    !((p.nb == kFamilyLz4hc && p.imm != 0 && p.imm <= kLz4hcMaxAttempts) || (p.nb == kFamilyZlib && ZlibParser::ValidKnob(p.imm)))));
         if (bad) { Err = "an op naming something the description lacks"; return false; }
     }
     for (const Ex &e : D.ex) {
         if ((e.op == EX_TABLE && e.imm >= nt) || (e.op == EX_ARR && e.imm >= na)) { Err = "an expression naming something the description lacks"; return false; }
-        if (e.op == EX_STREAMPOS && D.isa < 4) { Err = "an expression newer than the instruction set it names"; return false; }
+        if ((e.op == EX_STREAMPOS && D.isa < 4) || (e.op >= EX_U16 && e.op <= EX_U32BE && D.isa < 6)) { Err = "an expression newer than the instruction set it names"; return false; }
     }
     return true;
 }
 
 // ================================================================================================ the machine
+uint64_t WorkPerByte(uint8_t Family, uint32_t Knob);
+uint64_t MaxWorkPerByte(const Description &D);
 namespace {
 
 uint32_t gPrice[128];
@@ -140,7 +106,7 @@ struct PriceInit { PriceInit() { for (uint32_t i = 8; i < 2048; i += 16) { uint3
 // folded, register and constant operands read in place, evaluation in index order. No recursion, no cycles.
 enum : uint8_t { M_ADD, M_ADDI, M_SUB, M_SUBI, M_RSUBI, M_MUL, M_MULI, M_SHL, M_SHLI, M_SHR, M_SHRI, M_AND, M_ANDI, M_OR, M_ORI, M_XOR, M_XORI,
                  M_LT, M_LTI, M_EQ, M_EQI, M_NE, M_NEI, M_GE, M_GEI, M_LDI, M_COPY,
-                 M_BYTE, M_TABLE, M_ARR, M_LOG2, M_BITPOS, M_DLEFT, M_XLEFT, M_INLEFT, M_SPOS };
+                 M_BYTE, M_TABLE, M_ARR, M_LOG2, M_BITPOS, M_DLEFT, M_XLEFT, M_INLEFT, M_SPOS, M_U16, M_U32, M_U16BE, M_U32BE };
 struct Mu { uint8_t c; uint16_t d, a, b; uint32_t imm; };
 // An operand resolved once: a constant, a register, an AFFINE form (a constant plus up to four terms, each
 // ((src >> rs) & mask) << ls times mul, src a register or the content byte at a register + offset: what nearly every
@@ -199,7 +165,8 @@ struct Spec {
                     uint16_t a = 0;
                     if (UnaryEx(e.op)) { if (isConst[e.a]) { mu.push_back({M_LDI, d, 0, 0, cval[e.a]}); a = d; } else a = loc(e.a); }
                     const uint8_t c = e.op == EX_BYTE ? M_BYTE : e.op == EX_TABLE ? M_TABLE : e.op == EX_ARR ? M_ARR : e.op == EX_LOG2SLOT ? M_LOG2 :
-                                      e.op == EX_BITPOS ? M_BITPOS : e.op == EX_DLEFT ? M_DLEFT : e.op == EX_XLEFT ? M_XLEFT : e.op == EX_INLEFT ? M_INLEFT : M_SPOS;
+                                      e.op == EX_BITPOS ? M_BITPOS : e.op == EX_DLEFT ? M_DLEFT : e.op == EX_XLEFT ? M_XLEFT : e.op == EX_INLEFT ? M_INLEFT :
+                                      e.op == EX_U16 ? M_U16 : e.op == EX_U32 ? M_U32 : e.op == EX_U16BE ? M_U16BE : e.op == EX_U32BE ? M_U32BE : M_SPOS;
                     mu.push_back({c, d, a, 0, e.imm}); continue;
                 }
                 static const uint8_t RR[] = {0, 0, M_ADD, M_SUB, M_MUL, M_SHL, M_SHR, M_AND, M_OR, M_XOR, M_LT, M_EQ, M_NE, M_GE};
@@ -404,6 +371,17 @@ struct PredictCache {
     //charged once, by its first parse: parsing it again (its parse evicted, a segment decoded again) is reading, which
     //a mount does for as long as it lives, never a reason to refuse it
     std::atomic<uint64_t> steps{0}; uint64_t streamBudget = UINT64_MAX;
+    //zlib-family parses are each machine's own (a reader's segments decode in parallel: one shared incremental parse,
+    //which keeps only a window of tokens behind it, was dragged back and forth between them and re-parsed from the
+    //stream's start over and over). Shared: how far each stream has been parsed, so only NEW ground is charged to the
+    //stream's account (a million streams remembered at most; past that, parses are charged again)
+    std::map<std::tuple<uint64_t, uint64_t, uint32_t>, uint64_t> zfurthest;   // (guarded by mu)
+    uint64_t zFurthest(uint64_t Lo, uint64_t Hi, uint32_t K) { std::lock_guard<std::mutex> l(mu); auto it = zfurthest.find({Lo, Hi, K}); return it == zfurthest.end() ? 0 : it->second; }
+    void zReached(uint64_t Lo, uint64_t Hi, uint32_t K, uint64_t R) {
+        std::lock_guard<std::mutex> l(mu);
+        auto it = zfurthest.find({Lo, Hi, K});
+        if (it != zfurthest.end()) it->second = std::max(it->second, R); else if (zfurthest.size() < (1u << 20)) zfurthest[{Lo, Hi, K}] = R;
+    }
     std::set<std::tuple<uint32_t, uint32_t, uint32_t>> charged;     // (guarded by mu)
     bool isCharged(uint32_t Lo, uint32_t Hi, uint32_t Att) { std::lock_guard<std::mutex> l(mu); return charged.count({Lo, Hi, Att}) > 0; }
     //(a million blocks at most are remembered: a real stream has thousands; past that every parse is charged again)
@@ -442,6 +420,7 @@ constexpr uint32_t kRunMin = 256;                                          // sh
 struct Machine {
     const Description &D; const Spec &S; int mode;
     const char *why = nullptr;
+    int failOp = -1;                               // the description's op that refused (an assert), for the message
     std::vector<uint32_t> v;                       // registers, then one value per expression
     std::vector<uint16_t> slot;
     std::vector<std::vector<uint32_t>> arr;
@@ -461,6 +440,8 @@ struct Machine {
     int pc = 0; std::vector<int> stk;
     uint64_t fuel = 0, fuelBase = 0;
     uint64_t prog0 = 0;                            // progress at the start or the restore: budgets count what this run does
+    bool zCatchUp = false; uint64_t zCaught = 0;   // the one zlib catch-up this run (since its start or restore) was granted
+    std::map<std::tuple<uint64_t, uint64_t, uint32_t>, std::unique_ptr<ZlibParser>> zown;   // this machine's zlib parses (2 at most)
     uint64_t progress() const { return (uint64_t)(out ? out->size() + copied : 0) + place() + ip + (bipos >> 3); }
     uint64_t stopAt = UINT64_MAX;                   // CODE: pause at a MARK once this much output exists
     uint64_t maxCache = UINT64_MAX;                 // a restored range coder may hold back at most this many bytes
@@ -523,6 +504,15 @@ struct Machine {
             case M_LDI: o = m->imm; break;
             case M_COPY: o = x[m->a]; break;
             case M_BYTE: { const uint32_t a = x[m->a]; o = M == kDecode ? (a < place() && a < X.cap ? X.w[a] : 0) : X.at(a); break; }
+            case M_U16: case M_U32: case M_U16BE: case M_U32BE: {        // (each byte read as M_BYTE reads one)
+                const uint32_t a = x[m->a]; const int n = m->c == M_U16 || m->c == M_U16BE ? 2 : 4; const bool be = m->c == M_U16BE || m->c == M_U32BE;
+                o = 0;
+                for (int k = 0; k < n; ++k) {
+                    const uint64_t q = (uint64_t)a + (uint64_t)k; uint32_t b = 0;
+                    if (q <= 0xFFFFFFFFu) b = M == kDecode ? (q < place() && q < X.cap ? X.w[q] : 0) : X.at(q);
+                    o |= b << (be ? 8 * (n - 1 - k) : 8 * k);
+                }
+                break; }
             case M_TABLE: { const uint32_t a = x[m->a]; const auto &t = D.tables[m->imm]; if (a >= t.size()) { fail("a table read out of range"); o = 0; } else o = t[a]; break; }
             case M_ARR: { const uint32_t a = x[m->a]; const auto &t = arr[m->imm]; if (a >= t.size()) { fail("an array read out of range"); o = 0; } else o = t[a]; break; }
             case M_LOG2: { const uint32_t a = x[m->a]; if (a < 4) o = a; else { const uint32_t z = 31 - (uint32_t)__builtin_clz(a); o = 2 * z + ((a >> (z - 1)) & 1); } break; }
@@ -610,7 +600,7 @@ struct Machine {
             // 128 a byte of its progress, plus one largest block's (real archives take about 4 a byte, 73 in Skyrim SE's
             // worst block). A description asking for parse after parse, or content built to make a parse crawl (393 a byte),
             // is refused within seconds a block; a real one never.
-            const uint64_t budget = 128 * (progress() - std::min(prog0, progress()) + kLz4hcMaxBlock);
+            const uint64_t budget = WorkPerByte(kFamilyLz4hc, Att) * (progress() - std::min(prog0, progress()) + kLz4hcMaxBlock);
             bool over = false;
             auto make = [&](std::vector<Lz4Seq> &V) {
                 static thread_local std::unique_ptr<Lz4hcParser> P; if (!P) P = std::make_unique<Lz4hcParser>();
@@ -634,6 +624,45 @@ struct Machine {
         const uint32_t a = At - Lo; const auto &V = *pseqs;
         auto it = std::lower_bound(V.begin(), V.end(), a, [](const Lz4Seq &q, uint32_t x) { return q.anchor < x; });
         if (it != V.end() && it->anchor == a) { T[0] = it->lit; T[1] = it->ml; T[2] = it->off; predictedAny = true; }
+        return true;
+    }
+    // zlib's token at At (the literals left to its copy, the copy; copy 0: the stream's last literals), from the stream's
+    // incremental parse of [Lo, Hi). Its work: WorkPerByte a byte of this run's progress and of the stream up to At (a
+    // run restored deep in a stream parses it from its start), and the stream's account for new ground only.
+    bool predictZ(uint64_t At, uint64_t Lo, uint64_t Hi, uint32_t Knob, uint32_t *T) {
+        T[0] = 0; T[1] = kNoPrediction; T[2] = 0;
+        const uint64_t have = mode == kDecode ? X.cap : X.size;
+        if (Hi < Lo || Hi > have) return fail("a predicted stream past the content");
+        if (At < Lo || At >= Hi) return true;
+        if (!pcache) pcache = std::make_shared<PredictCache>();
+        const auto key = std::make_tuple(Lo, Hi, Knob);
+        auto zit = zown.find(key);
+        if (zit == zown.end()) {
+            if (zown.size() >= 2) zown.erase(zown.begin());                // (a stream at a time, and one more)
+            zit = zown.emplace(key, nullptr).first;
+        }
+        std::unique_ptr<ZlibParser> &zp = zit->second;
+        uint32_t run = 0, len = 0, dist = 0;
+        if (zp && zp->at(At, run, len, dist)) { T[0] = run; T[1] = len; T[2] = dist; predictedAny = true; return true; }
+        if (!zp || At < zp->kept()) {                                      // none yet, or At behind what it keeps: from the start
+            const uint8_t *mem = mode == kDecode ? X.w : X.mem; ByteSource *src = X.src;
+            zp = std::make_unique<ZlibParser>(Knob, Lo, Hi, [mem, src](uint64_t P, uint8_t *B, size_t N) {
+                if (mem) { memcpy(B, mem + P, N); return true; }
+                return src && src->preadAll(B, N, P); });
+        }
+        const uint64_t from = zp->reached(), before = psteps;
+        //what this run may spend: its own progress, plus ONE catch-up from the stream's start (a reader restored mid-stream
+        //parses up to where it stands, once; any other parse is paid by progress or, on new ground, by the stream's account)
+        if (!zCatchUp) { zCatchUp = true; zCaught = At - Lo; }           // granted once, and kept for the rest of the run
+        const uint64_t budget = WorkPerByte(kFamilyZlib, Knob) * (progress() - std::min(prog0, progress()) + zCaught + kLz4hcMaxBlock);
+        const bool fresh = from >= pcache->zFurthest(Lo, Hi, Knob);       // new ground: the stream's account pays
+        const uint64_t shared = pcache->steps.load();
+        const uint64_t room = fresh ? (pcache->streamBudget > shared ? pcache->streamBudget - shared : 0) : UINT64_MAX;
+        const bool ok = zp->ensure(At, psteps, room == UINT64_MAX ? budget : std::min(budget, before + room));
+        if (fresh) pcache->steps += psteps - before;
+        pcache->zReached(Lo, Hi, Knob, zp->reached());
+        if (!ok) { zp.reset(); return fail("a description that parses without making progress"); }
+        if (zp->at(At, run, len, dist)) { T[0] = run; T[1] = len; T[2] = dist; predictedAny = true; }
         return true;
     }
     void record(uint32_t val) { decOut->push_back(val); }
@@ -734,8 +763,10 @@ struct Machine {
                 v[kRegPlace] = p + n; CHECK_NEXT(); }
             L_OP_PREDICT: {
                 uint32_t t[3] = {0, kNoPrediction, 0};
-                if (M != kPrice && !noPredict && (M != kDecode || wholeContent))
-                    if (!predict(opnd<M>(op_->x), opnd<M>(op_->v), opnd<M>(op_->m), op_->imm, t)) return 0;
+                if (M != kPrice && !noPredict && (M != kDecode || wholeContent)) {
+                    if (op_->nb == kFamilyZlib) { if (!predictZ(opnd<M>(op_->x), opnd<M>(op_->v), opnd<M>(op_->m), op_->imm, t)) return 0; }
+                    else if (!predict(opnd<M>(op_->x), opnd<M>(op_->v), opnd<M>(op_->m), op_->imm, t)) return 0;
+                }
                 v[op_->tgt] = t[0]; v[op_->tgt + 1u] = t[1]; v[op_->tgt + 2u] = t[2]; CHECK_NEXT(); }
             L_OP_BUILD: {
                 const uint32_t a = opnd<M>(op_->x), n = opnd<M>(op_->v); const auto &t = arr[op_->nb];
@@ -768,7 +799,7 @@ struct Machine {
             L_OP_JMP: if (why) return 0; ip_ = op_->target; NEXT();
             L_OP_CALL: if (why) return 0; if (stk.size() >= kMaxStack) { fail("calls too deep"); return 0; } stk.push_back((int)ip_); ip_ = op_->target; NEXT();
             L_OP_RET: if (why) return 0; if (stk.size() == depth0) return leave(1); ip_ = (uint32_t)stk.back(); stk.pop_back(); NEXT();
-            L_OP_ASSERT: if (!opnd<M>(op_->v)) { fail("the stream breaks a rule of its format"); return 0; } CHECK_NEXT();
+            L_OP_ASSERT: if (!opnd<M>(op_->v)) { failOp = (int)op_->orig; fail("the stream breaks a rule of its format"); return 0; } CHECK_NEXT();
             L_OP_FLUSH: if (M == kCode) { if (D.coder == kRange) for (int i = 0; i < 5; ++i) rcShift(); else if (bn) bput(0, 8 - bn); } CHECK_NEXT();
             L_OP_MARK: if (why) return 0; if (M == kCode && out && out->size() + copied >= stopAt) return leave(2); NEXT();
             L_OP_END: if (why) return 0; return leave(1);
@@ -841,6 +872,14 @@ uint64_t SuggestedSpacing(const Description &D, uint64_t Shipped, bool Plain) {
 // than at the mint, another reader's or a hostile record's, is refused per segment, never served) | payloads. A payload
 // is one zstd frame: varint snapshot length, snapshot, varint decision count, the segment's decisions as varints.
 bool UsesPrediction(const Description &D) { for (const Op &o : D.ops) if (o.op == OP_PREDICT) return true; return false; }
+// The work a family's parse may take a byte: LZ4HC 128 (real archives take 4, 73 at worst); zlib twice its chain length and
+// a little (zlib itself walks up to its chain at a search, about twice a byte: level 9 takes thousands on degenerate data)
+uint64_t WorkPerByte(uint8_t Family, uint32_t Knob) {
+    static const uint32_t kChain[10] = {0, 4, 8, 32, 16, 32, 128, 256, 1024, 4096};
+    if (Family == kFamilyZlib) return 2ull * kChain[(Knob & 0xFF) < 10 ? (Knob & 0xFF) : 9] + 64;
+    return 128;
+}
+uint64_t MaxWorkPerByte(const Description &D) { uint64_t w = 128; for (const Op &o : D.ops) if (o.op == OP_PREDICT) w = std::max(w, WorkPerByte(o.nb, o.imm)); return w; }
 namespace { uint64_t SegmentHash(const uint8_t *p, size_t n, uint64_t h = 1469598103934665603ull) { for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; } return h; } }
 
 bool MintInto(const Description &D, const uint8_t *Shipped, size_t N, size_t ContentSize, uint8_t *Buf, size_t ContentCap, uint64_t Spacing,
@@ -857,7 +896,7 @@ bool MintInto(const Description &D, const uint8_t *Shipped, size_t N, size_t Con
         Machine m(D, S, kDecode); m.in = Shipped; m.inn = N; m.X.w = Buf; m.decOut = &dec;
         m.X.cap = pass ? ContentLen : ContentSize ? ContentSize : ContentCap; m.noPredict = !pass; m.wholeContent = pass == 1;
         if (D.coder == kRange) { m.ip = 1; for (int i = 0; i < 4; ++i) m.code = (m.code << 8) | m.inByte(); }
-        if (m.run(D.entryStream) != 1) { Err = std::string("decode: ") + (m.why ? m.why : "refused"); return false; }
+        if (m.run(D.entryStream) != 1) { Err = std::string("decode: ") + (m.why ? m.why : "refused") + (m.failOp >= 0 ? " (op " + std::to_string(m.failOp) + ", content place " + std::to_string(m.place()) + ")" : std::string()); return false; }
         if (ContentSize && m.place() != ContentSize) { Err = "decode: the content is not the size expected"; return false; }
         if (pass && m.place() != ContentLen) { Err = "decode: the content is not the size expected"; return false; }
         ContentLen = m.place();
@@ -870,7 +909,7 @@ bool MintInto(const Description &D, const uint8_t *Shipped, size_t N, size_t Con
     std::vector<C> cks;
     Machine m(D, S, kCode); m.out = &out; m.X.mem = Buf; m.X.size = ContentLen; m.Dc.setMem(dec.data(), dec.size()); m.Dc.total = dec.size();
     m.noPredict = !predicted; m.pc = D.entryStream;
-    const uint64_t streamBudget = 128 * ((uint64_t)N + ContentLen + 2 * kLz4hcMaxBlock);   // what a reader will allow the stream
+    const uint64_t streamBudget = MaxWorkPerByte(D) * ((uint64_t)N + ContentLen + 2 * kLz4hcMaxBlock);   // what a reader will allow the stream
     m.pcache = std::make_shared<PredictCache>(); m.pcache->streamBudget = streamBudget;
     cks.push_back({0, 0, m.snapshot()});
     for (bool first = true;; first = false) {
@@ -883,10 +922,10 @@ bool MintInto(const Description &D, const uint8_t *Shipped, size_t N, size_t Con
         cks.push_back({m.copied, m.Dc.consumed(), m.snapshot()});
         //from here on, as a reader restored at this checkpoint runs: its own parse budget and no parse at hand (a record
         //no reader could read is refused here, never minted)
-        m.prog0 = m.progress(); m.fuelBase = m.fuel; m.psteps = 0; m.pseqs.reset();
+        m.prog0 = m.progress(); m.fuelBase = m.fuel; m.psteps = 0; m.pseqs.reset(); m.zCatchUp = false; m.zCaught = 0; m.zown.clear();
         {   //a fresh parse cache (a reader there has none at hand), the stream's account carried over
             auto fresh = std::make_shared<PredictCache>(); fresh->steps = m.pcache->steps.load(); fresh->streamBudget = streamBudget;
-            { std::lock_guard<std::mutex> l(m.pcache->mu); fresh->charged = m.pcache->charged; }
+            { std::lock_guard<std::mutex> l(m.pcache->mu); fresh->charged = m.pcache->charged; fresh->zfurthest = m.pcache->zfurthest; }
             m.pcache = std::move(fresh); }
     }
     if (m.copied != N) { Err = "the stream does not code back to its own bytes"; return false; }
@@ -1123,7 +1162,7 @@ std::shared_ptr<CodedByteSource> CodedByteSource::Create(std::shared_ptr<ByteSou
     }
     if (auto below = std::dynamic_pointer_cast<CodedByteSource>(Content)) S->I->depth = below->I->depth + 1;
     S->Rec = Record; S->Content = Content; S->Size = ShippedSize;
-    S->I->pcache->streamBudget = 128 * (ShippedSize + Content->size() + 2 * kLz4hcMaxBlock);
+    S->I->pcache->streamBudget = MaxWorkPerByte(S->I->D) * (ShippedSize + Content->size() + 2 * kLz4hcMaxBlock);
     S->I->cks = S->Cks; S->I->rec = std::move(Record); S->I->content = std::move(Content); S->I->size = ShippedSize;
     return S;
 }

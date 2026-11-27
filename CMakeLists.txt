@@ -44,8 +44,9 @@ set(VGFS_CORE_SRC
     src/vgdelta.cpp
     src/deflatelayer.cpp
     src/coding.cpp
-    src/codingdescs.cpp
+    src/codingtext.cpp
     src/lz4family.cpp
+    src/zfamily.cpp
     src/zipscan.cpp
 )
 if(WIN32)
@@ -73,6 +74,11 @@ if(WIN32)
 else()
     set(VGFS_BACKEND src/fuseops.cpp src/mountsession_fuse.cpp)
 endif()
+
+# Test fixtures: descriptions built by code (the engine carries none; packages carry theirs as node text)
+add_library(vgfs_descbuilders STATIC test/descbuilders.cpp)
+target_include_directories(vgfs_descbuilders PUBLIC test src)
+target_link_libraries(vgfs_descbuilders PUBLIC vgfs_core)
 
 add_executable(vidyagodfs src/main.cpp ${VGFS_BACKEND})
 set_target_properties(vidyagodfs PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
@@ -115,6 +121,7 @@ endif()
 if(VGFS_BUILD_TESTS AND NOT WIN32)
     enable_testing()
     add_executable(vgfs_tests test/vgfs_tests.cpp)
+    target_link_libraries(vgfs_tests PRIVATE vgfs_descbuilders)
     set_target_properties(vgfs_tests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
     find_package(ZLIB REQUIRED)   # the tests make real deflate streams to rebuild (the core needs no zlib)
     # liblzma and liblz4 are the tests' reference encoders for the coding algebra (the core needs neither)

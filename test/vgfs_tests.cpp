@@ -18,6 +18,8 @@
 #include "bytesource.h"
 #include "deflatelayer.h"
 #include "coding.h"
+#include "descbuilders.h"
+#include <nlohmann/json.hpp>
 #include "lz4family.h"
 #include <lzma.h>
 #include <lz4.h>
@@ -3559,10 +3561,32 @@ TEST(a_hostile_description_is_refused) {
     std::string err; coding::Description d; int ran = 0;
     const auto sample = rawDeflate(sampleContent(3, 20000, 4), 6, 15, 8, Z_DEFAULT_STRATEGY);
     std::mt19937 r(9);
-    for (int i = 0; i < 300; ++i) {                                       // noise, and real descriptions with bytes broken
-        auto b = coding::Serialize(coding::DeflateDescription());
+    // noise, and real descriptions with their text broken where it means something: a number changed, a line dropped
+    // or doubled, two lines swapped (what a hostile peer would send is text that still reads)
+    const auto deflateText = coding::Serialize(coding::DeflateDescription());
+    const auto textOf = nlohmann::ordered_json::parse(deflateText.begin(), deflateText.end());
+    for (int i = 0; i < 300; ++i) {
+        std::vector<uint8_t> b;
         if (i % 3 == 0) { b.resize(64 + r() % 512); for (auto &x : b) x = (uint8_t)r(); }
-        else for (int k = 0; k < 4; ++k) b[r() % b.size()] ^= (uint8_t)(1u << (r() % 8));
+        else {
+            auto j = textOf; auto &code = j["CODE"];
+            for (int k = 0; k < 3; ++k) {
+                const size_t at = r() % code.size(); std::string line = code[at].get<std::string>();
+                switch (r() % 4) {
+                    case 0: { std::vector<size_t> nums;
+                              for (size_t q = 0; q < line.size(); ++q) { if (isdigit((unsigned char)line[q]) && (q == 0 || !isalnum((unsigned char)line[q - 1]))) nums.push_back(q); }
+                              if (nums.empty()) break;
+                              const size_t q = nums[r() % nums.size()]; size_t e = q;
+                              while (e < line.size() && isalnum((unsigned char)line[e])) ++e;
+                              const uint32_t pick[] = {0, 1, 2, 7, 255, 65535, 0xFFFFFFFFu, (uint32_t)r()}; line = line.substr(0, q) + std::to_string(pick[r() % 8]) + line.substr(e);
+                              code[at] = line; break; }
+                    case 1: code.erase(at); break;
+                    case 2: code.insert(code.begin() + (long)at, line); break;
+                    default: { const size_t o = r() % code.size(); std::swap(code[at], code[o]); break; }
+                }
+            }
+            const std::string t = j.dump(); b.assign(t.begin(), t.end());
+        }
         if (coding::Parse(b.data(), b.size(), d, err) && i % 3) {        // what still parses must RUN safely on a real stream
             std::vector<uint8_t> c2, r2; coding::Mint(d, sample.data(), sample.size(), 0, 1 << 18, 256, c2, r2, err); ++ran; }
     }
@@ -3686,9 +3710,11 @@ TEST(a_hostile_record_or_oversized_description_is_refused) {
     for (uint16_t i = 1; i < 60000; ++i) bomb.ex.push_back(coding::Ex{coding::EX_ADD, (uint16_t)(i - 1), 0, 0});
     for (uint16_t i = 0; i < 60000; i += 2) { coding::Op o; o.op = coding::OP_SET; o.tgt = 2; o.v = i; bomb.ops.push_back(o); }
     coding::Op e; e.op = coding::OP_END; bomb.ops.push_back(e);
-    const auto bb = coding::Serialize(bomb); coding::Description parsed; CHECK(coding::Parse(bb.data(), bb.size(), parsed, err));
+    // as text it cannot even be said (its values nest past what a description may; printed, it would take gigabytes),
+    // and held in memory it is refused when it runs
+    CHECK(coding::Serialize(bomb).empty()); std::string why; CHECK(coding::Validate(bomb, why));
     const auto t0 = std::chrono::steady_clock::now(); std::vector<uint8_t> c, rr; const uint8_t one[1] = {0};
-    CHECK(!coding::Mint(parsed, one, 1, 0, 16, 4096, c, rr, err)); CHECK(err.find("complex") != std::string::npos);
+    CHECK(!coding::Mint(bomb, one, 1, 0, 16, 4096, c, rr, err)); CHECK(err.find("complex") != std::string::npos);
     CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));                     // (sanitizer builds run slow)
     CHECK(!coding::Mint(coding::DeflateDescription(), one, 1, 0, (size_t)5 << 30, 4096, c, rr, err)); CHECK(err.find("4 GiB") != std::string::npos);
 }
@@ -4160,13 +4186,172 @@ TEST(a_reader_never_loses_the_segment_it_waits_for) {
 }
 
 // ISA 4: a description using STREAMPOS is refused by a parser that claims an older instruction set.
+// 22.16: a description is DATA in a node — readable text. A hand-written one runs; every built one reads back to what
+// it was (the same text, the same records); the names an author gave survive a round trip; a node holding one reads as
+// it; and text that is not a description is refused, saying where. Teeth: drop a name; misread a mode; accept a table
+// by number; let labels repeat; let values nest without bound.
+TEST(a_description_is_readable_text_in_a_node) {
+    std::string err;
+    const std::string copy = R"J({
+  "NAME": "a file as it is",
+  "ISA": 4,
+  "CODER": "BITS",
+  "REGISTERS": { "left": 1 },
+  "ENTRY": "@start",
+  "CODE": [
+    "# every byte through, then the end",
+    "@start",
+    "decode: set left (shr (inleft) 3)",
+    "code: set left (xleft)",
+    "byterun left",
+    "end"
+  ]
+})J";
+    coding::Description d; coding::TextNames names;
+    CHECK(coding::Read(copy, d, err, &names));
+    if (!err.empty()) std::cerr << "  read: " << err << "\n";
+    std::vector<uint8_t> shipped(5000); for (size_t i = 0; i < shipped.size(); ++i) shipped[i] = (uint8_t)(i * 31 + (i >> 4));
+    std::vector<uint8_t> content, rec;
+    CHECK(coding::Mint(d, shipped.data(), shipped.size(), 0, 1 << 16, 1024, content, rec, err));
+    CHECK(content == shipped);
+    CHECK(d.ops.size() == 4 && d.ops[0].modes == coding::kDecode && d.ops[1].modes == coding::kCode);
+    std::string back; CHECK(coding::Print(d, back, err, &names));
+    CHECK(back.find("\"left\": 1") != std::string::npos && back.find("byterun left") != std::string::npos && back.find("@start") != std::string::npos);
+    coding::Description d2; CHECK(coding::Read(back, d2, err)); CHECK(coding::Serialize(d2) == coding::Serialize(d));
+    // a node holding it
+    const std::string node = std::string(R"J({"LABEL": "copy v1", "DESCRIPTION": )J") + copy + R"J(, "LAYERS": []})J";
+    CHECK(coding::Read(node, d2, err)); CHECK(coding::Serialize(d2) == coding::Serialize(d));
+    // ...but only a node is unwrapped: a description that merely holds a DESCRIPTION key is no description
+    CHECK(!coding::Read(std::string(R"J({"DESCRIPTION": )J") + copy + R"J(, "junk": 1})J", d2, err));
+    // every built description: printed, read, printed again is the same text, and mints the same record
+    const auto sample = rawDeflate(sampleContent(5, 30000, 3), 6, 15, 8, Z_DEFAULT_STRATEGY);
+    for (const coding::Description &b : {coding::DeflateDescription(), coding::DeflateDescription(6 | 8 << 8 | 15 << 16), coding::InnoDescription(),
+                                         coding::Lz4BlockDescription(), coding::BsaDescription(), coding::BsaDescription(0),
+                                         coding::LzmaDescription(3, 0, 2, 1u << 20, true)}) {
+        const auto t1 = coding::Serialize(b); coding::Description r1;
+        CHECK(!t1.empty() && coding::Parse(t1.data(), t1.size(), r1, err));
+        CHECK(coding::Serialize(r1) == t1);
+        if (b.name.rfind("deflate", 0) == 0) {
+            std::vector<uint8_t> c1, q1, c2, q2;
+            CHECK(coding::Mint(b, sample.data(), sample.size(), 0, 1 << 20, 4096, c1, q1, err));
+            CHECK(coding::Mint(r1, sample.data(), sample.size(), 0, 1 << 20, 4096, c2, q2, err));
+            CHECK(c1 == c2 && q1 == q2 && !q1.empty());
+        }
+    }
+    // refused, and why
+    const auto refuses = [&](const std::string &patch, const std::string &from, const std::string &to, const char *why) {
+        std::string t = patch.empty() ? copy : patch; const size_t at = t.find(from);
+        if (at == std::string::npos) { CHECK(!"the test's text moved"); return; }
+        t.replace(at, from.size(), to); coding::Description x;
+        const bool ok = coding::Read(t, x, err);
+        CHECK(!ok); CHECK(err.find(why) != std::string::npos);
+        if (ok || err.find(why) == std::string::npos) std::cerr << "  expected '" << why << "', got '" << err << "'\n";
+    };
+    refuses("", "\"ISA\": 4,", "\"ISA\": 4, \"COLOUR\": 1,", "unknown description field");
+    refuses("", "\"byterun left\"", "\"bytesrun left\"", "no such instruction");
+    refuses("", "\"byterun left\"", "\"byterun lft\"", "not a value");
+    refuses("", "\"byterun left\"", "\"byterun left 3\"", "more than byterun takes");
+    refuses("", "\"end\"", "\"jmp @nowhere\"", "no instruction at label @nowhere");
+    refuses("", "\"end\"", "\"@start\", \"end\"", "label @start twice");
+    refuses("", "\"decode: set", "\"decodes: set", "no such mode");
+    refuses("", "\"ENTRY\": \"@start\"", "\"ENTRY\": \"@later\"", "no instruction at @later");
+    refuses("", "\"left\": 1", "\"and\": 1", "not a register name");
+    refuses("", "\"left\": 1", "\"left\": 64", "names no register");
+    refuses("", "(shr (inleft) 3)", "(shr (inleft))", "an unexpected )");
+    refuses("", "(shr (inleft) 3)", "(shr (inleft) 3 4)", "takes 2 values");
+    refuses("", "(xleft)", "(table t0 0)", "no such table");
+    std::string deep = "0"; for (int i = 0; i < 300; ++i) deep = "(add " + deep + " 1)";
+    refuses("", "(xleft)", deep, "nested too deep");
+    // ISA 6: integers as containers store them, read in place (the content so far: the bytes this run has made)
+    const std::string ints = R"J({"NAME": "ints", "ISA": 6, "CODER": "BITS", "ENTRY": "@s", "CODE": ["@s", "byterun 8",
+        "assert (eq (u32 0) 0x5D3E1F00)", "assert (eq (u16 2) 0x5D3E)", "assert (eq (u16be 1) 0x1F3E)", "assert (eq (u32be 0) 0x001F3E5D)",
+        "decode: set r1 (shr (inleft) 3)", "code: set r1 (xleft)", "byterun r1", "end"]})J";
+    err.clear(); CHECK(coding::Read(ints, d, err));
+    if (!err.empty()) std::cerr << "  ints: " << err << "\n";
+    CHECK(coding::Mint(d, shipped.data(), shipped.size(), 0, 1 << 16, 1024, content, rec, err));
+    if (!err.empty()) std::cerr << "  ints mint: " << err << "\n";
+    CHECK(content == shipped);
+    refuses(ints, "\"ISA\": 6", "\"ISA\": 5", "newer than the instruction set");
+    {   std::string wrong = ints; wrong.replace(wrong.find("(u16 2) 0x5D3E"), 14, "(u16 2) 0x5D3F");   // a wrong value: refused at mint
+        coding::Description w; CHECK(coding::Read(wrong, w, err)); std::vector<uint8_t> c3, r3;
+        CHECK(!coding::Mint(w, shipped.data(), shipped.size(), 0, 1 << 16, 1024, c3, r3, err)); }
+    // a read across the place: DECODE has only the bytes before it (the rest read as 0), CODE the whole content
+    // (shipped[6..9] = 186, 217, 248, 23: (u32 6) at place 8 reads 186, 217, then 0, 0 in DECODE)
+    const std::string across = R"J({"NAME": "across", "ISA": 6, "CODER": "BITS", "ENTRY": "@s", "CODE": ["@s", "byterun 8",
+        "decode: assert (eq (u32 6) 0xD9BA)", "code: assert (eq (u32 6) 0x17F8D9BA)",
+        "decode: set r1 (shr (inleft) 3)", "code: set r1 (xleft)", "byterun r1", "end"]})J";
+    err.clear(); CHECK(coding::Read(across, d, err));
+    CHECK(coding::Mint(d, shipped.data(), shipped.size(), 0, 1 << 16, 1024, content, rec, err));
+    if (!err.empty()) std::cerr << "  across: " << err << "\n";
+    // arrays and tables are numbered by NAME: the text's key order changes nothing (a mount reads the description back
+    // from its spec with sorted keys; records hold arrays by number). Teeth: number them in text order.
+    {   const std::string a = R"J({"NAME": "x", "ISA": 4, "CODER": "BITS", "ARRAYS": {"zk": {"SIZE": 1, "INIT": [90]}, "ak": {"SIZE": 1, "INIT": [3]}},
+            "TABLES": {"zt": [5], "at": [6]}, "ENTRY": "@s", "CODE": ["@s", "@loop", "mark", "decode: set r1 (shr (inleft) 3)", "code: set r1 (xleft)",
+            "jz r1 @done", "raw 8 (xor (byte r0) (and (arr zk 0) 255)) r2", "outlit (xor r2 (and (arr zk 0) 255))",
+            "sta zk 0 (add (arr zk 0) (table zt 0))", "sta ak 0 (add (arr ak 0) (table at 0))", "jmp @loop", "@done", "end"]})J";
+        std::string b = a;
+        b.replace(b.find(R"J("zk": {"SIZE": 1, "INIT": [90]}, "ak": {"SIZE": 1, "INIT": [3]})J"), 63, R"J("ak": {"SIZE": 1, "INIT": [3]}, "zk": {"SIZE": 1, "INIT": [90]})J");
+        b.replace(b.find(R"J("zt": [5], "at": [6])J"), 20, R"J("at": [6], "zt": [5])J");
+        coding::Description da, db; CHECK(coding::Read(a, da, err)); CHECK(coding::Read(b, db, err));
+        CHECK(coding::Serialize(da) == coding::Serialize(db));
+        std::vector<uint8_t> ca, ra; CHECK(coding::Mint(da, shipped.data(), 4096, 4096, 4096, 256, ca, ra, err, false));
+        auto src = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(db)), std::make_shared<MemByteSource>(ra),
+                                                   std::make_shared<MemByteSource>(ca), 4096, err);
+        std::vector<uint8_t> got(4096); CHECK(src && src->preadAll(got.data(), got.size(), 0));
+        CHECK(std::equal(got.begin(), got.end(), shipped.begin()));
+    }
+    // a zlib family asked about 300 streams, the newest always first in the cache's order: the cache stays bounded and
+    // never frees what it hands out (a use-after-free once). Teeth: evict the entry just made.
+    {   const std::string many = R"J({"NAME": "zlib entries, lowest first", "ISA": 5, "CODER": "BITS", "ENTRY": "@s",
+            "CODE": ["@s", "decode: set r1 (shr (inleft) 3)", "code: set r1 (xleft)", "byterun r1", "set r2 300", "@loop",
+            "predict zlib 0xF0806 r10 r2 r2 r0", "jz r2 @done", "set r2 (sub r2 1)", "jmp @loop", "@done", "end"]})J";
+        coding::Description dz; CHECK(coding::Read(many, dz, err));
+        std::vector<uint8_t> cz, rz; coding::Mint(dz, shipped.data(), shipped.size(), 0, 1 << 16, 1024, cz, rz, err);
+    }
+    // tables, arrays and codes by name only (an object's keys may come back in another order)
+    const std::string withTable = R"J({"NAME": "t", "ISA": 4, "CODER": "BITS", "TABLES": {"b": [7], "a": [9]}, "ENTRY": "@s",
+        "CODE": ["@s", "set r1 (table a 0)", "assert (eq r1 9)", "end"]})J";
+    CHECK(coding::Read(withTable, d, err));
+    refuses(withTable, "(table a 0)", "(table 1 0)", "no such table");
+}
+
+// A zlib-family record of a stream with more tokens than a parse keeps behind it, read back through segments decoding
+// in parallel (as a mount's read-ahead and an expansion do): every segment reads. Once one parse was shared by all of a
+// stream's segments; dragged back and forth between them it re-parsed from the stream's start until refused, so the
+// mint passed and the reader failed. Teeth: share one parser between machines again.
+TEST(a_zlib_family_record_reads_through_parallel_segments) {
+    std::vector<uint8_t> in(6u << 20); std::mt19937 r(5);
+    for (size_t i = 0; i < in.size(); i += 4) { in[i] = 'a'; in[i + 1] = 'b'; in[i + 2] = 'c'; in[i + 3] = (uint8_t)r(); }
+    const auto shipped = rawDeflate(in, 6, 15, 8, Z_DEFAULT_STRATEGY);
+    const auto d = coding::DeflateDescription(6 | 8 << 8 | 15 << 16);
+    std::vector<uint8_t> content, rec; std::string err;
+    CHECK(coding::Mint(d, shipped.data(), shipped.size(), in.size(), in.size(), 512u << 10, content, rec, err));
+    if (!err.empty()) std::cerr << "  mint: " << err << "\n";
+    CHECK(content == in && rec.size() > 3 && rec[3] == 'Q');
+    auto src = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d)), std::make_shared<MemByteSource>(rec),
+                                               std::make_shared<MemByteSource>(content), shipped.size(), err);
+    CHECK(src != nullptr);
+    if (!src) return;
+    CHECK(src->checkpoints() > 4);
+    // from the back first (each segment restored on its own), then front to back with read-ahead
+    std::vector<uint8_t> got(shipped.size());
+    for (size_t k = src->checkpoints(); k-- > 0;) {
+        const uint64_t a = shipped.size() * k / src->checkpoints(); const size_t n = (size_t)std::min<uint64_t>(4096, shipped.size() - a);
+        CHECK(src->preadAll(got.data() + a, n, a));
+    }
+    CHECK(src->preadAll(got.data(), got.size(), 0));
+    CHECK(got == shipped);
+}
+
 TEST(a_description_newer_than_its_isa_is_refused) {
     auto d = coding::BsaDescription(0); auto bytes = coding::Serialize(d);
     coding::Description back; std::string err;
     CHECK(coding::Parse(bytes.data(), bytes.size(), back, err));
-    // the ISA field follows the magic; claim ISA 3
-    CHECK(bytes.size() > 8 && bytes[4] == 4);
-    bytes[4] = 3; CHECK(!coding::Parse(bytes.data(), bytes.size(), back, err));
+    // claim ISA 3
+    std::string t(bytes.begin(), bytes.end()); const size_t at = t.find("\"ISA\": 4,");
+    CHECK(at != std::string::npos);
+    if (at != std::string::npos) t[at + 7] = '3';
+    CHECK(!coding::Read(t, back, err)); CHECK(err.find("newer") != std::string::npos);
 }
 
 TEST(a_coded_stream_mounts_as_a_file) {
@@ -4176,11 +4361,11 @@ TEST(a_coded_stream_mounts_as_a_file) {
     CHECK(coding::Mint(d, alone.data() + 13, alone.size() - 13, in.size(), in.size(), 4096, content, record, err));
     const auto desc = coding::Serialize(d);
     auto put = [&](const std::string &n, const std::vector<uint8_t> &b) { std::ofstream(t / n, std::ios::binary).write((const char *)b.data(), (std::streamsize)b.size()); };
-    put("content.bin", content); put("stream.vgcr", record); put("lzma.vgcd", desc);
+    put("content.bin", content); put("stream.vgcr", record);
     const std::string spec = std::string(R"({"mountpoint":"/m","readonly":true,"layers":[)")
         + R"({"type":"file","source":")" + t.str("content.bin") + R"(","target":"","cid":"bafycontent","bytesOnly":true},)"
-        + R"({"type":"coded","source":")" + t.str("stream.vgcr") + R"(","description":")" + t.str("lzma.vgcd")
-        + R"(","bases":["bafycontent"],"name":"data/level1.bundle","target":"game","cid":"bafystream"}]})";
+        + R"({"type":"coded","source":")" + t.str("stream.vgcr") + R"(","description":)" + std::string(desc.begin(), desc.end())
+        + R"(,"descriptionCid":"bafydesc","bases":["bafycontent"],"name":"data/level1.bundle","target":"game","cid":"bafystream"}]})";
     Spec sp; CHECK(ParseSpecText(spec, sp, err)); CHECK(sp.layers.size() == 2 && sp.layers[1].type == LayerType::Coded);
     VfsState S; CHECK(S.Init(sp, err));
     VfsAttr a; CHECK_EQ(VfsGetattr(S, "game/data/level1.bundle", a), 0); CHECK_EQ(a.size, (uint64_t)(alone.size() - 13));
@@ -4203,6 +4388,9 @@ TEST(a_coded_stream_mounts_as_a_file) {
     // a coded layer must name exactly one content, a description and a name
     CHECK(!ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"coded","source":"/r","bases":["a","b"],"description":"/d","name":"x"}]})", bad, err));
     CHECK(!ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"coded","source":"/r","bases":["a"],"name":"x"}]})", bad, err));
+    // the description is the node's text, carried whole, with that node's CID: a path to a file is not one
+    CHECK(!ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"coded","source":"/r","bases":["a"],"description":"/d","descriptionCid":"q","name":"x"}]})", bad, err));
+    CHECK(!ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"coded","source":"/r","bases":["a"],"description":{"NAME":"d"},"name":"x"}]})", bad, err));
     CHECK(!ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"zip","source":"/r","name":"x"}]})", bad, err));
 }
 
@@ -4481,9 +4669,9 @@ TEST(a_deep_stack_of_mixed_encodings_reads_through_every_layer) {
     put("c0.bin", S[0]);
     std::string layers = R"({"type":"file","source":")" + t.str("c0.bin") + R"(","target":"","cid":"c0","bytesOnly":true})";
     for (int k = 1; k <= depth; ++k) {
-        put("r" + std::to_string(k), rec[(size_t)k - 1]); put("d" + std::to_string(k), coding::Serialize(D[(size_t)k - 1]));
-        layers += R"(,{"type":"coded","source":")" + t.str("r" + std::to_string(k)) + R"(","description":")" + t.str("d" + std::to_string(k))
-                + R"(","bases":["c)" + std::to_string(k - 1) + R"("],"name":"top.bin","target":"","cid":"c)" + std::to_string(k) + R"(")" + (k < depth ? R"(,"bytesOnly":true)" : "") + "}";
+        put("r" + std::to_string(k), rec[(size_t)k - 1]); const auto dk = coding::Serialize(D[(size_t)k - 1]);
+        layers += R"(,{"type":"coded","source":")" + t.str("r" + std::to_string(k)) + R"(","description":)" + std::string(dk.begin(), dk.end())
+                + R"(,"descriptionCid":"desc)" + std::to_string(k) + R"(","bases":["c)" + std::to_string(k - 1) + R"("],"name":"top.bin","target":"","cid":"c)" + std::to_string(k) + R"(")" + (k < depth ? R"(,"bytesOnly":true)" : "") + "}";
     }
     Spec sp; CHECK(ParseSpecText(R"({"mountpoint":"/m","readonly":true,"layers":[)" + layers + "]}", sp, err));
     CHECK(PlanTree(sp).problems.empty());
