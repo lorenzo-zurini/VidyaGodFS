@@ -276,12 +276,13 @@ static void Lz4Body(Asm &a, uint16_t atEnd, const Lz4Family *Fam = nullptr) {
     auto MIN255 = [&](uint16_t x) { return a.SUB(x, a.MUL(a.GE(x, a.C(256)), a.SUB(x, B255))); };
     auto predict = [&] { a.Predict(kFamilyLz4hc, Fam->attempts, QR_PL, a.R(QR_A), a.R(Fam->lo), a.R(Fam->hi)); };
     // DECODE, a sequence read: its decisions (with a family: whether it is the family's, and if not, itself)
-    auto record = [&](int next) {
+    // (falls: `next` is the label right after it: no jump, so a description without a family is op for op what it was)
+    auto record = [&](int next, bool falls = false) {
         a.Mode(kDecode);
-        if (!Fam) { a.Dec(QR_LIT); a.Dec(QR_ML); a.Dec(QR_OFF); a.Mode(0); a.Jmp(next); return; }
+        if (!Fam) { a.Dec(QR_LIT); a.Dec(QR_ML); a.Dec(QR_OFF); a.Mode(0); if (!falls) a.Jmp(next); return; }
         predict();
         a.Set(QR_F, a.OR(a.OR(a.NE(LIT, a.R(QR_PL)), a.NE(ML, a.R(QR_PM))), a.NE(OFF, a.R(QR_PO))));
-        a.Dec(QR_F); a.Jz(a.R(QR_F), next); a.Dec(QR_LIT); a.Dec(QR_ML); a.Dec(QR_OFF); a.Mode(0); a.Jmp(next);
+        a.Dec(QR_F); a.Jz(a.R(QR_F), next); a.Dec(QR_LIT); a.Dec(QR_ML); a.Dec(QR_OFF); a.Mode(0); if (!falls) a.Jmp(next);
     };
     a.Label(Q_SEQ); a.Mark();
     if (Fam) a.Set(QR_A, a.R(kRegPlace));
@@ -319,7 +320,7 @@ static void Lz4Body(Asm &a, uint16_t atEnd, const Lz4Family *Fam = nullptr) {
     a.Label(Q_COPY); a.OutCopy(ML, OFF);
     record(Q_SEQ);
     a.Label(Q_LAST); a.Mode(kDecode); a.Set(QR_ML, a.C(0)); a.Set(QR_OFF, a.C(0)); a.Mode(0);
-    record(Q_ENDC);
+    record(Q_ENDC, true);
     a.Label(Q_ENDC);
 }
 

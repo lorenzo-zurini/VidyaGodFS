@@ -160,7 +160,7 @@ public:
     void     debugHoldWaiter(uint64_t Off, bool On);
     bool     debugCached(uint64_t Off) const;
     void     debugDropOnNextWake();
-    struct Ck { uint64_t out = 0, rec = 0, recLen = 0, dec = 0; };
+    struct Ck { uint64_t out = 0, rec = 0, recLen = 0, dec = 0, hash = 0; };   // hash: a predicted record's, of the segment's shipped bytes
     struct Impl;
 private:
     static void remember(Impl &M, uint64_t Off, size_t N);   // where a read ended (read-ahead for readers going front to back)

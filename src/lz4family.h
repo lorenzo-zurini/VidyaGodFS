@@ -29,8 +29,10 @@ class Lz4hcParser {
 public:
     Lz4hcParser();
     ~Lz4hcParser();
-    // The sequences of one block, in order. N at most kLz4hcMaxBlock, Attempts 1..kLz4hcMaxAttempts.
-    void parse(const uint8_t *Src, size_t N, uint32_t Attempts, std::vector<Lz4Seq> &Out);
+    // The sequences of one block, in order. N at most kLz4hcMaxBlock, Attempts 1..kLz4hcMaxAttempts. A parse's work is its
+    // chain steps (real archives: about 4 per byte, at most ~75 in a block of Skyrim SE's): false, with Out partial, once
+    // Steps would pass MaxSteps (Steps counts on across calls).
+    bool parse(const uint8_t *Src, size_t N, uint32_t Attempts, std::vector<Lz4Seq> &Out, uint64_t &Steps, uint64_t MaxSteps = UINT64_MAX);
 private:
     struct Ctx;
     std::unique_ptr<Ctx> C;

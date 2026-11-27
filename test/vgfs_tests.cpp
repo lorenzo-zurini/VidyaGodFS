@@ -3787,7 +3787,7 @@ static std::vector<uint8_t> familyFrame(const std::vector<uint8_t> &in, uint32_t
     coding::Lz4hcParser P; std::vector<coding::Lz4Seq> seqs;
     auto len = [](std::vector<uint8_t> &o, size_t n) { for (; n >= 255; n -= 255) o.push_back(255); o.push_back((uint8_t)n); };
     for (size_t o = 0; o < in.size(); o += bmax) {
-        const size_t n = std::min(bmax, in.size() - o); P.parse(in.data() + o, n, attempts, seqs);
+        const size_t n = std::min(bmax, in.size() - o); { uint64_t st = 0; P.parse(in.data() + o, n, attempts, seqs, st); }
         std::vector<uint8_t> b;
         for (const auto &q : seqs) {
             const size_t ml = q.ml ? q.ml - 4 : 0;
@@ -3837,19 +3837,35 @@ TEST(a_bsa_family_predicts_its_frames) {
     CHECK(plain == recP);
     // a predicted record passed off as plain: its flags name predictions a plain run does not make
     auto fake = recQ; fake[3] = 'R';
-    auto bad = mk(famD, fake); CHECK(bad != nullptr);
+    auto bad = mk(famD, fake);                                           // (refused at its index, or on the first read)
     if (bad) { std::vector<uint8_t> all(bsa.size()); CHECK(!bad->preadAll(all.data(), all.size(), 0)); }
-    // the family's knob is part of the description: another one predicts other tokens (a record minted under 512 attempts
-    // served under 1 either reads back exactly or is refused, never other bytes)
-    auto other = mk(coding::BsaDescription(1), recQ);
-    if (other) { std::vector<uint8_t> all(bsa.size()); if (other->preadAll(all.data(), all.size(), 0)) CHECK(all == bsa); }
+    // the family's knob is part of the description: another one predicts other tokens, and a record served under it is
+    // refused segment by segment (each carries its bytes' hash), never other bytes, and never expanded into a twin
+    // (adversary 2026-11-27: on sparse noise, 512 vs 500 attempts served 5,810 other bytes). Teeth: skip the hash.
+    {
+        std::vector<uint8_t> noise(400000); std::mt19937 rr(77);
+        for (auto &x : noise) x = (rr() % 7) ? 0 : (uint8_t)(1 + rr() % 3);
+        std::vector<uint8_t> w2; const auto nb = makeBsa({{"n", {{"noise.dds", noise, false, 64}}}}, 0x7, w2);
+        std::vector<uint8_t> c2, q2;
+        CHECK(coding::Mint(famD, nb.data(), nb.size(), 0, w2.size() * 2, 4096, c2, q2, err));
+        auto under = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(coding::BsaDescription(500))),
+                                                     std::make_shared<MemByteSource>(q2), std::make_shared<MemByteSource>(c2), nb.size(), err);
+        CHECK(under != nullptr);
+        if (under) { std::vector<uint8_t> all(nb.size()); CHECK(!under->preadAll(all.data(), all.size(), 0)); }
+        std::vector<uint8_t> sb2(nb.size()), cb2(c2.size()), pl2;
+        CHECK(!coding::ExpandInto(std::make_shared<MemByteSource>(coding::Serialize(coding::BsaDescription(500))), std::make_shared<MemByteSource>(q2),
+                                  std::make_shared<MemByteSource>(c2), sb2.data(), sb2.size(), cb2.data(), cb2.size(), 4096, pl2, err));
+        auto right = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(famD)), std::make_shared<MemByteSource>(q2),
+                                                     std::make_shared<MemByteSource>(c2), nb.size(), err);
+        CHECK(right && readsBack(*right, nb, 53, 20));
+    }
 }
 
 // The family parses as lz4 1.7 did (the parse verified against Skyrim SE's archives: Meshes1 3000/3000 blocks): its
 // output over a fixed set of inputs is pinned, and today's liblz4 at level 9 (the same parser, later revised) agrees on
 // most of them. Teeth: any change to the parse (the lookahead, a correction, the window, the chain) moves the digest.
 static std::vector<uint8_t> familyBlock(const std::vector<uint8_t> &in, uint32_t att) {
-    coding::Lz4hcParser P; std::vector<coding::Lz4Seq> seqs; P.parse(in.data(), in.size(), att, seqs); std::vector<uint8_t> b;
+    coding::Lz4hcParser P; std::vector<coding::Lz4Seq> seqs; uint64_t st = 0; P.parse(in.data(), in.size(), att, seqs, st); std::vector<uint8_t> b;
     auto len = [](std::vector<uint8_t> &o, size_t n) { for (; n >= 255; n -= 255) o.push_back(255); o.push_back((uint8_t)n); };
     for (const auto &q : seqs) { const size_t ml = q.ml ? q.ml - 4 : 0;
         b.push_back((uint8_t)((std::min<size_t>(q.lit, 15) << 4) | (q.ml ? std::min<size_t>(ml, 15) : 0)));
@@ -3874,10 +3890,19 @@ TEST(the_lz4_family_parses_as_lz4_1_7_did) {
     }
     CHECK(decodes);
     CHECK_EQ(h, 4403846504761238684ull);
+    {   // the window's far end: a run whose only earlier copy lies 65,000 bytes back is found there
+        std::vector<uint8_t> in(80000); std::mt19937 r(123); for (auto &x : in) x = (uint8_t)r();
+        std::copy(in.begin() + 1000, in.begin() + 1400, in.begin() + 66000);
+        coding::Lz4hcParser P; std::vector<coding::Lz4Seq> q; uint64_t st = 0;
+        CHECK(P.parse(in.data(), in.size(), 256, q, st));
+        bool far = false; for (const auto &x : q) far = far || (x.ml >= 300 && x.off == 65000);
+        CHECK(far);
+    }
     CHECK(same >= 350 && same < all);                                    // 357/500: the revisions show, rarely
 }
 
-// A description asking for parse after parse of a big block while making no progress is refused, and quickly.
+// A description asking for parse after parse of big blocks (a new one each time: the cache holds what it has parsed) while
+// making no progress is refused by the work budget, and quickly.
 TEST(a_description_that_parses_without_progress_is_refused) {
     coding::Description d; d.name = "parse bomb"; d.isa = 5; d.coder = coding::kBits;
     auto ex = [&](uint8_t op, uint16_t a, uint16_t b, uint32_t imm) { d.ex.push_back(coding::Ex{op, a, b, imm}); return (uint16_t)(d.ex.size() - 1); };
@@ -3886,8 +3911,8 @@ TEST(a_description_that_parses_without_progress_is_refused) {
     auto op = [&](uint8_t o, uint8_t tgt, uint16_t x, uint16_t v, uint16_t m, uint32_t imm, uint8_t nb = 0, uint16_t target = 0) {
         coding::Op p; p.op = o; p.tgt = tgt; p.x = x; p.v = v; p.m = m; p.imm = imm; p.nb = nb; p.target = target; d.ops.push_back(p); };
     op(coding::OP_SET, 20, c0, lim, c0, 0);                                           // 0: 200 rounds
-    op(coding::OP_PREDICT, 30, c0, c0, big, 1, coding::kFamilyLz4hc);              // 1: the block [0, 4 MiB)
-    op(coding::OP_PREDICT, 30, c0, c1, big, 1, coding::kFamilyLz4hc);              // 2: and [1, 4 MiB): another block
+    op(coding::OP_PREDICT, 30, c0, cnt, big, 1, coding::kFamilyLz4hc);             // 1: the block [round, 4 MiB): a new one each round
+    op(coding::OP_PREDICT, 30, c0, cnt, big, 1, coding::kFamilyLz4hc);             // 2: (the same: the cache holds it)
     op(coding::OP_SET, 20, c0, dec, c0, 0);                                           // 3
     op(coding::OP_JZ, 0, c0, cnt, c0, 0, 0, 6);                                       // 4: done
     op(coding::OP_JMP, 0, c0, c0, c0, 0, 0, 1);                                       // 5
@@ -3895,14 +3920,35 @@ TEST(a_description_that_parses_without_progress_is_refused) {
     op(coding::OP_END, 0, c0, c0, c0, 0);
     const auto bytes = coding::Serialize(d); coding::Description back; std::string err;
     CHECK(coding::Parse(bytes.data(), bytes.size(), back, err));
-    std::vector<uint8_t> shipped(4u << 20); for (size_t i = 0; i < shipped.size(); ++i) shipped[i] = (uint8_t)(i * 31 ^ (i >> 9));
+    std::vector<uint8_t> shipped(4u << 20); std::mt19937 rr(9); for (auto &x : shipped) x = (uint8_t)rr();   // every position searched
     std::vector<uint8_t> content, rec;
     const auto t0 = std::chrono::steady_clock::now();
     CHECK(!coding::Mint(back, shipped.data(), shipped.size(), shipped.size(), shipped.size(), 1u << 20, content, rec, err));
+    if (err.find("parses without making progress") == std::string::npos) std::fprintf(stderr, "  parse bomb: %s\n", err.c_str());
     CHECK(err.find("parses without making progress") != std::string::npos);
     CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(60));
     // the same program minted plain never parses: it is only a byte run
     CHECK(coding::Mint(back, shipped.data(), shipped.size(), shipped.size(), shipped.size(), 1u << 20, content, rec, err, false));
+}
+
+// Content built to make the family's parse crawl (two symbols at random: every chain is long) is refused by the parse's
+// WORK budget, in seconds, where the parse itself would take minutes (adversary 2026-11-27: 18 s a 4 MiB block at 65536
+// attempts). Teeth: budget bytes, not steps.
+TEST(a_parse_that_would_crawl_is_refused_by_its_work) {
+    coding::Description d; d.name = "crawl"; d.isa = 5; d.coder = coding::kBits;
+    auto ex = [&](uint8_t op, uint32_t imm) { d.ex.push_back(coding::Ex{op, 0, 0, imm}); return (uint16_t)(d.ex.size() - 1); };
+    const uint16_t c0 = ex(coding::EX_CONST, 0), big = ex(coding::EX_CONST, 4u << 20);
+    auto op = [&](uint8_t o, uint8_t tgt, uint16_t x, uint16_t v, uint16_t m, uint32_t imm, uint8_t nb = 0) {
+        coding::Op p; p.op = o; p.tgt = tgt; p.x = x; p.v = v; p.m = m; p.imm = imm; p.nb = nb; d.ops.push_back(p); };
+    op(coding::OP_PREDICT, 30, c0, c0, big, coding::kLz4hcMaxAttempts, coding::kFamilyLz4hc);   // (a mint's second pass has the content)
+    op(coding::OP_BYTERUN, 0, big, c0, c0, 0);
+    op(coding::OP_END, 0, c0, c0, c0, 0);
+    std::vector<uint8_t> shipped(4u << 20); std::mt19937 r(5); for (auto &x : shipped) x = (uint8_t)(r() & 1);
+    std::vector<uint8_t> content, rec; std::string err;
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(!coding::Mint(d, shipped.data(), shipped.size(), shipped.size(), shipped.size(), 1u << 20, content, rec, err));
+    CHECK(err.find("parses without making progress") != std::string::npos);
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));
 }
 
 // PREDICT is ISA 5 and bounded: an ISA-4 description naming it, a family the reader lacks, and a knob past the limit are

@@ -18,6 +18,7 @@ struct Lz4hcParser::Ctx {
     uint32_t ht[1u << kHashLog];
     uint16_t ct[kDictSize];
     const uint8_t *src = nullptr; uint32_t next = 0;
+    uint64_t steps = 0, maxSteps = UINT64_MAX; bool over = false;
     const uint8_t *at(uint32_t i) const { return src + i - kDictSize; }
     uint32_t idx(const uint8_t *p) const { return (uint32_t)(p - src) + kDictSize; }
     uint32_t lowLimit(const uint8_t *ip) const { const uint32_t x = idx(ip); return kDictSize + kDictSize > x ? kDictSize : x - (kDictSize - 1); }
@@ -28,14 +29,14 @@ struct Lz4hcParser::Ctx {
     }
     int best(const uint8_t *ip, const uint8_t *lim, const uint8_t *&mp, uint32_t att) {
         const uint32_t lo = lowLimit(ip); insert(ip); uint32_t mi = ht[HashOf(ip)]; int ml = 0;
-        while (mi >= lo && att) { --att; const uint8_t *m = at(mi);
+        while (mi >= lo && att) { --att; if (++steps > maxSteps) { over = true; return 0; } const uint8_t *m = at(mi);
             if (m[ml] == ip[ml] && Rd32(m) == Rd32(ip)) { const int t = Count(ip + kMinMatch, m + kMinMatch, lim) + kMinMatch; if (t > ml) { ml = t; mp = m; } }
             mi -= ct[(uint16_t)mi]; }
         return ml;
     }
     int wider(const uint8_t *ip, const uint8_t *ilow, const uint8_t *ihigh, int longest, const uint8_t *&mp, const uint8_t *&sp, uint32_t att) {
         const uint32_t lo = lowLimit(ip); insert(ip); uint32_t mi = ht[HashOf(ip)]; const int delta = (int)(ip - ilow);
-        while (mi >= lo && att) { --att; const uint8_t *m = at(mi);
+        while (mi >= lo && att) { --att; if (++steps > maxSteps) { over = true; return longest; } const uint8_t *m = at(mi);
             if (ilow[longest] == (m - delta)[longest] && Rd32(m) == Rd32(ip)) {
                 int t = kMinMatch + Count(ip + kMinMatch, m + kMinMatch, ihigh), back = 0;
                 while (ip + back > ilow && m + back > src && ip[back - 1] == m[back - 1]) --back;
@@ -49,9 +50,10 @@ struct Lz4hcParser::Ctx {
 Lz4hcParser::Lz4hcParser() : C(new Ctx) {}
 Lz4hcParser::~Lz4hcParser() = default;
 
-void Lz4hcParser::parse(const uint8_t *Src, size_t N, uint32_t Att, std::vector<Lz4Seq> &Out) {
+bool Lz4hcParser::parse(const uint8_t *Src, size_t N, uint32_t Att, std::vector<Lz4Seq> &Out, uint64_t &Steps, uint64_t MaxSteps) {
     Out.clear();
     Ctx &c = *C;
+    c.steps = Steps; c.maxSteps = MaxSteps; c.over = false;
     memset(c.ht, 0, sizeof c.ht); memset(c.ct, 0xFF, sizeof c.ct);
     c.src = Src; c.next = kDictSize;
     const uint8_t *ip = Src, *anchor = ip, *const iend = ip + N;
@@ -64,6 +66,7 @@ void Lz4hcParser::parse(const uint8_t *Src, size_t N, uint32_t Att, std::vector<
         int ml, ml2, ml3, ml0; const uint8_t *ref = nullptr, *s2 = nullptr, *r2 = nullptr, *s3 = nullptr, *r3 = nullptr, *s0, *r0;
         ++ip;
         while (ip < mflimit) {
+            if (c.over) break;
             ml = c.best(ip, mlimit, ref, Att);
             if (!ml) { ++ip; continue; }
             s0 = ip; r0 = ref; ml0 = ml;
@@ -101,7 +104,10 @@ void Lz4hcParser::parse(const uint8_t *Src, size_t N, uint32_t Att, std::vector<
             ip = s2; ref = r2; ml = ml2; s2 = s3; r2 = r3; ml2 = ml3; goto search3;
         }
     }
+    Steps = c.steps;
+    if (c.over) return false;
     Out.push_back({(uint32_t)(anchor - Src), (uint32_t)(iend - anchor), 0, 0});
+    return true;
 }
 
 } // namespace coding

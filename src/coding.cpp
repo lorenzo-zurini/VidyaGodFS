@@ -414,7 +414,8 @@ struct PredictCache {
         l.lock();
         if (!ok) { m.erase(k); cv.notify_all(); return nullptr; }
         E &e = m[k]; e.seqs = v; e.ready = true; e.used = ++clock;
-        while (m.size() > 64) {                                          // a few blocks per decoding thread
+        auto held = [&] { size_t b = 0; for (const auto &x : m) if (x.second.seqs) b += x.second.seqs->size() * sizeof(Lz4Seq); return b; };
+        while (m.size() > 64 || (m.size() > 1 && held() > (64u << 20))) { // a few blocks per decoding thread, 64 MiB at most
             auto victim = m.end(); for (auto j = m.begin(); j != m.end(); ++j) if (j->second.ready && j->first != k && (victim == m.end() || j->second.used < victim->second.used)) victim = j;
             if (victim == m.end()) break;
             m.erase(victim);
@@ -445,12 +446,14 @@ struct Machine {
     uint32_t price = 0;
     int pc = 0; std::vector<int> stk;
     uint64_t fuel = 0, fuelBase = 0;
+    uint64_t prog0 = 0;                            // progress at the start or the restore: budgets count what this run does
+    uint64_t progress() const { return (uint64_t)(out ? out->size() + copied : 0) + place() + ip + (bipos >> 3); }
     uint64_t stopAt = UINT64_MAX;                   // CODE: pause at a MARK once this much output exists
     uint64_t maxCache = UINT64_MAX;                 // a restored range coder may hold back at most this many bytes
     // PREDICT (ISA 5): off in a PLAIN run (its record never takes a prediction) and in PRICE; DECODE predicts only once
     // the whole content is there (a mint's second pass: the parse of a block reads all of it)
     bool noPredict = false, wholeContent = false;
-    std::shared_ptr<PredictCache> pcache; Seqs pseqs; uint32_t plo = 0, phi = 0, patt = 0; uint64_t pfuel = 0;
+    std::shared_ptr<PredictCache> pcache; Seqs pseqs; uint32_t plo = 0, phi = 0, patt = 0; uint64_t psteps = 0;
     bool predictedAny = false;                     // a token was predicted (a mint whose family never predicts mints plain)
 
     Machine(const Description &d, const Spec &s, int m) : D(d), S(s), mode(m) {
@@ -589,22 +592,24 @@ struct Machine {
         const uint64_t have = mode == kDecode ? X.cap : X.size;
         if (Hi > have) return fail("a predicted block past the content");
         if (!pseqs || Lo != plo || Hi != phi || Att != patt) {
-            // parses have their own budget: about one per block, so never more bytes parsed than twice the progress (plus two of
-            // the largest blocks): a description asking for parse after parse is refused, a real one never is
-            pfuel += Hi - Lo;
-            if (pfuel > 2 * ((uint64_t)(out ? out->size() + copied : 0) + place() + ip + (bipos >> 3)) + 2 * kLz4hcMaxBlock)
-                return fail("a description that parses without making progress");
+            // parses have their own budget, in WORK (chain steps, ~12 ns each at worst) since this run started or was restored:
+            // 128 a byte of its progress, plus one largest block's (real archives take about 4 a byte, 73 in Skyrim SE's
+            // worst block). A description asking for parse after parse, or content built to make a parse crawl (393 a byte),
+            // is refused within seconds a block; a real one never.
+            const uint64_t budget = 128 * (progress() - std::min(prog0, progress()) + kLz4hcMaxBlock);
+            bool over = false;
             auto make = [&](std::vector<Lz4Seq> &V) {
                 static thread_local std::unique_ptr<Lz4hcParser> P; if (!P) P = std::make_unique<Lz4hcParser>();
                 const uint8_t *b = nullptr; std::vector<uint8_t> tmp;
                 if (mode == kDecode) b = X.w + Lo;
                 else if (X.mem) b = X.mem + Lo;
                 else { tmp.resize(Hi - Lo); if (!X.src->preadAll(tmp.data(), tmp.size(), Lo)) return false; b = tmp.data(); }
-                P->parse(b, Hi - Lo, Att, V); return true;
+                if (!P->parse(b, Hi - Lo, Att, V, psteps, budget)) { over = true; return false; }
+                return true;
             };
             if (!pcache) pcache = std::make_shared<PredictCache>();
             pseqs = pcache->get(Lo, Hi, Att, make); plo = Lo; phi = Hi; patt = Att;
-            if (!pseqs) return fail("the content does not read");
+            if (!pseqs) return fail(over ? "a description that parses without making progress" : "the content does not read");
         }
         if (At < Lo || At > Hi) return true;
         const uint32_t a = At - Lo; const auto &V = *pseqs;
@@ -632,7 +637,7 @@ struct Machine {
         static const void *const J[] = { &&L_OP_BIT, &&L_OP_TREE, &&L_OP_RTREE, &&L_OP_DIRECT, &&L_OP_MLIT, &&L_OP_RAW, &&L_OP_HUFF, &&L_OP_BUILD, &&L_OP_STA, &&L_OP_SET, &&L_OP_DEC, &&L_OP_OUTLIT, &&L_OP_OUTCOPY, &&L_OP_HMTF, &&L_OP_HPUSH, &&L_OP_JZ, &&L_OP_JMP, &&L_OP_CALL, &&L_OP_RET, &&L_OP_ASSERT, &&L_OP_FLUSH, &&L_OP_MARK, &&L_OP_END, &&L_OP_HUFFRUN, &&L_OP_BYTERUN, &&L_OP_PREDICT, &&L_F_BITJZ, &&L_F_SETBITJZ, &&L_F_DECN, &&L_F_OFFEND };
         static_assert(sizeof(J) / sizeof(J[0]) == F_OFFEND + 1, "dispatch table out of step with the opcodes");
         #define NEXT() do { if (__builtin_expect(!(++tick & 0xFFFF), 0)) { fuel += 0x10000; \
-                if (fuel > fuelBase + (1u << 22) + 512 * ((uint64_t)(out ? out->size() + copied : 0) + place() + ip + (bipos >> 3))) { fail("a description that works without making progress"); return 0; } } \
+                if (fuel > fuelBase + (1u << 22) + 512 * (progress() - std::min(prog0, progress()))) { fail("a description that works without making progress"); return 0; } } \
             op_ = &I0[ip_]; ip_ = op_->fall; val = 0; goto *J[op_->op]; } while (0)
         #define CHECK_NEXT() do { if (why) return 0; NEXT(); } while (0)
         // a coding op's value: the decision (CODE, FREE), else its expression; DECODE learns it from the stream
@@ -813,9 +818,11 @@ uint64_t SuggestedSpacing(const Description &D, uint64_t Shipped, bool Plain) {
 
 // Record: "VGCR" (plain) or "VGCQ" (it takes predictions: a run needs the description's families) | varint shipped size |
 // varint total decisions | varint checkpoints | per checkpoint: varint shipped offset, varint decisions before it, varint
-// payload length | payloads. A payload is one zstd frame: varint snapshot length, snapshot, varint decision count, the
-// segment's decisions as varints.
+// payload length (VGCQ: then a varint, the FNV-1a 64 of the segment's shipped bytes: a family that predicts otherwise
+// than at the mint, another reader's or a hostile record's, is refused per segment, never served) | payloads. A payload
+// is one zstd frame: varint snapshot length, snapshot, varint decision count, the segment's decisions as varints.
 bool UsesPrediction(const Description &D) { for (const Op &o : D.ops) if (o.op == OP_PREDICT) return true; return false; }
+namespace { uint64_t SegmentHash(const uint8_t *p, size_t n, uint64_t h = 1469598103934665603ull) { for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; } return h; } }
 
 bool MintInto(const Description &D, const uint8_t *Shipped, size_t N, size_t ContentSize, uint8_t *Buf, size_t ContentCap, uint64_t Spacing,
               size_t &ContentLen, std::vector<uint8_t> &Record, std::string &Err, bool Predict) {
@@ -865,7 +872,10 @@ bool MintInto(const Description &D, const uint8_t *Shipped, size_t N, size_t Con
         pay.push_back(Zstd(p));
     }
     Record = {'V', 'G', 'C', (uint8_t)(predicted ? 'Q' : 'R')}; PutVar(Record, N); PutVar(Record, dec.size()); PutVar(Record, cks.size());
-    for (size_t k = 0; k < cks.size(); ++k) { PutVar(Record, cks[k].out); PutVar(Record, cks[k].dec); PutVar(Record, pay[k].size()); }
+    for (size_t k = 0; k < cks.size(); ++k) {
+        PutVar(Record, cks[k].out); PutVar(Record, cks[k].dec); PutVar(Record, pay[k].size());
+        if (predicted) { const uint64_t e = k + 1 < cks.size() ? cks[k + 1].out : N; PutVar(Record, SegmentHash(Shipped + cks[k].out, (size_t)(e - cks[k].out))); }
+    }
     for (const auto &p : pay) Record.insert(Record.end(), p.begin(), p.end());
     return true;
 }
@@ -949,7 +959,7 @@ struct CodedByteSource::Impl : std::enable_shared_from_this<CodedByteSource::Imp
         c->m = std::make_unique<Machine>(D, *S, kCode); Machine &m = *c->m; m.out = &c->out; m.maxCache = size + 1; m.outBase = cks[k].out;
         if (!m.restore(p.data() + r.at, (size_t)sn)) return nullptr;
         m.X.src = content.get(); m.X.size = content->size(); m.X.window = D.window;
-        m.noPredict = !predicted; m.pcache = pcache;
+        m.noPredict = !predicted; m.pcache = pcache; m.prog0 = m.progress();
         if (!chunk(k, p, r.at + (size_t)sn, m.Dc.chunk, m.Dc.base)) return nullptr;
         m.Dc.setChunk(); m.Dc.total = total;
         Cursor *cp = c.get();
@@ -975,6 +985,16 @@ struct CodedByteSource::Impl : std::enable_shared_from_this<CodedByteSource::Imp
         if (!R.empty() && R.back().at + R.back().n > len) R.back().n = (uint32_t)(len - R.back().at);
         for (const auto &r : R) kept += r.n;
         c->out.resize((size_t)(len - kept)); g->pool = std::move(c->out); g->len = len;
+        if (predicted) {                                                  // the segment's bytes, against the mint's
+            uint64_t h = 1469598103934665603ull, pos = 0, pool = 0; std::vector<uint8_t> b;
+            for (const auto &r : g->runs) {
+                h = SegmentHash(g->pool.data() + pool, (size_t)(r.at - pos), h); pool += r.at - pos;
+                b.resize(r.n); if (!content->preadAll(b.data(), b.size(), r.from)) return nullptr;
+                h = SegmentHash(b.data(), b.size(), h); pos = r.at + r.n;
+            }
+            h = SegmentHash(g->pool.data() + pool, g->pool.size() - pool, h);
+            if (h != cks[k].hash) return nullptr;
+        }
         return g;
     }
     // the pieces of [from, from+n) of segment g, for dst (caller holds a reference to g while they are used)
@@ -1060,6 +1080,7 @@ std::shared_ptr<CodedByteSource> CodedByteSource::Create(std::shared_ptr<ByteSou
         bool ok = !r.bad && nck >= 1 && nck <= (1u << 24);
         for (uint64_t k = 0; ok && k < nck; ++k) {
             Ck c; c.out = r.var(); c.dec = r.var(); c.recLen = r.var(); c.rec = off;
+            if (S->I->predicted) c.hash = r.var();
             if (r.bad) break;
             if (c.recLen > rn || off + c.recLen > rn) { ok = false; break; }
             off += c.recLen;
@@ -1087,6 +1108,8 @@ bool ExpandInto(std::shared_ptr<ByteSource> Desc, std::shared_ptr<ByteSource> Re
     auto C = CodedByteSource::Create(Desc, Record, Content, 0, Err);
     if (!C) return false;
     const uint64_t n = C->size(), cn = Content->size();
+    //what a record says the stream's size is, the content must account for (a stream is its content coded, plus framing)
+    if (n > cn + cn / 8 + Record->size() + (64u << 20)) { Err = "the record claims a stream far bigger than its content"; return false; }
     if (n > ShippedCap || cn > ContentCap) { Err = "the buffers are too small for this stream"; return false; }
     // the shipped bytes, through the predicted record (read front to back: segments decode ahead in the pool)
     for (uint64_t at = 0; at < n;) {
