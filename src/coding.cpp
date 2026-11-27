@@ -1,6 +1,7 @@
 #include "coding.h"
 #include "lz4family.h"
 #include "zfamily.h"
+#include "lzxmakecab.h"
 
 #include <zstd.h>
 
@@ -45,6 +46,8 @@ constexpr size_t kMaxEx = 65535, kMaxOps = 65535, kMaxTable = 1u << 20, kMaxTabl
 bool BinaryEx(uint8_t op) { return (op >= EX_ADD && op <= EX_GE) || op == EX_DIV || op == EX_MOD; }
 bool DivEx(uint8_t op) { return op == EX_DIV || op == EX_MOD; }
 bool UsesE8(const Description &D) { for (const Op &o : D.ops) if (o.op == OP_E8FRAME) return true; return false; }
+bool UsesLzx(const Description &D) { for (const Op &o : D.ops) if (o.op == OP_LZXFOLDER) return true; return false; }
+bool LzxKnob(uint32_t k) { const uint32_t w = k & 0xFF, sp = (k >> 8) & 0xFF; return w >= 15 && w <= 21 && sp >= 1 && sp <= 32 && (k >> 16) == 0; }
 bool UnaryEx(uint8_t op) { return op == EX_BYTE || op == EX_TABLE || op == EX_ARR || op == EX_LOG2SLOT || (op >= EX_U16 && op <= EX_U32BE); }
 bool CodingOp(uint8_t op) { return op <= OP_HUFF || op == OP_RAWBYTES; }
 
@@ -80,7 +83,8 @@ bool Validate(const Description &D, std::string &Err) {
         if (fam && e8) { Err = "a family predicting through an E8 view (not yet: families parse the real bytes)"; return false; }
         if ((e8 || near) && D.window > (1u << 25)) { Err = "a WINDOW over 32 MiB with E8 frames or NEAREST"; return false; } }
     for (const Op &p : D.ops)
-        if ((((p.flags & kBounded) || p.op == OP_RAWBYTES) && D.isa < 7) || ((p.op == OP_E8FRAME || p.op == OP_E8END || p.op == OP_NEAREST) && D.isa < 8)) { Err = "an op newer than the instruction set it names"; return false; }
+        if ((((p.flags & kBounded) || p.op == OP_RAWBYTES) && D.isa < 7) || ((p.op == OP_E8FRAME || p.op == OP_E8END || p.op == OP_NEAREST) && D.isa < 8) || (p.op >= OP_LZXFOLDER && p.op <= OP_LZXEMIT && D.isa < 9)) { Err = "an op newer than the instruction set it names"; return false; }
+    for (const Op &p : D.ops) if (p.op == OP_LZXFOLDER && !LzxKnob(p.imm)) { Err = "an LZX folder's knob is window bits 15..21 | second partition (1..32 x 32 KiB) << 8"; return false; }
     { size_t tt = 0, ta = 0; for (const auto &t : D.tables) tt += t.size(); for (const auto &a : D.arrays) ta += a.size();
       if (tt > (16u << 20) || ta > (4u << 20)) { Err = "a description too large"; return false; } }
     // what the ops name must exist
@@ -463,6 +467,18 @@ struct PredictCache {
     //stream's start over and over). Shared: how far each stream has been parsed, so only NEW ground is charged to the
     //stream's account (a million streams remembered at most; past that, parses are charged again)
     std::map<std::tuple<uint64_t, uint64_t, uint32_t>, uint64_t> zfurthest;   // (guarded by mu)
+    //the LZX family (ISA 9): one compressor for the stream's folders, in order, fed 32 KiB at a time and only as far as a
+    //frame asked for; the frames it made: past lzxKept bytes the oldest a CODE run has written go (segments decode out of
+    //order: a frame no run has written yet is kept, up to 8 x lzxKept); one asked for again is made again from the
+    //stream's start, paid once. Shared by a stream's segments; a mint carries it from its second decode to its coding.
+    struct LzxFolder { uint64_t at = 0, n = 0, fed = 0, base = 0, steps0 = 0; uint32_t e8 = 0, knob = 0; bool started = false, flushed = false;
+                       struct Fr { std::vector<uint8_t> b; bool used = false; };
+                       std::deque<Fr> frames; };   // (frames: [base, base + size) of the folder's)
+    struct LzxFamily { std::mutex m; LzxMakecab *ctx = nullptr; uint32_t ctxKnob = 0; bool dead = false; std::atomic<bool> over{false};
+                       std::deque<LzxFolder> folders; uint64_t kept = 0, total = 0, paid = 0, rework = 0;   // frame bytes held; steps this build, ever paid, made again
+                       ~LzxFamily() { LzxMakecabFree(ctx); } };
+    std::shared_ptr<LzxFamily> lzx; uint64_t lzxKept = 64ull << 20;   // (frame bytes a family keeps; tests lower it)                                      // (made under mu)
+    std::shared_ptr<LzxFamily> lzxFamily() { std::lock_guard<std::mutex> l(mu); if (!lzx) lzx = std::make_shared<LzxFamily>(); return lzx; }
     uint64_t zFurthest(uint64_t Lo, uint64_t Hi, uint32_t K) { std::lock_guard<std::mutex> l(mu); auto it = zfurthest.find({Lo, Hi, K}); return it == zfurthest.end() ? 0 : it->second; }
     void zReached(uint64_t Lo, uint64_t Hi, uint32_t K, uint64_t R) {
         std::lock_guard<std::mutex> l(mu);
@@ -534,6 +550,108 @@ struct Machine {
     //DECODE (ISA 8): the frame opened by E8FRAME (its decision's slot, filled at E8END), and the translated frames, converted
     //to the real bytes when the run ends (until then the buffer holds what the encoder's window held: copies read that)
     struct E8Open { uint64_t at = 0; ViewFrame f; size_t slot = 0; bool open = false; } e8open;
+    //the LZX family (ISA 9): the folders this stream has opened, in order (CODE: a checkpoint carries them, so a restored
+    //reader can bring the compressor to the open one); the open one; DECODE: its decision's slot; CODE: the family's?
+    struct LzxRef { uint64_t at = 0, n = 0; uint32_t e8 = 0, knob = 0; };
+    std::vector<LzxRef> lzxList; int lzxCur = -1; size_t lzxSlot = 0; bool lzxOpen = false, lzxAvail = false, lzxBad = false; uint32_t lzxUse = 0;
+    const std::vector<std::pair<uint64_t, ViewFrame>> *e8prev = nullptr;   // DECODE, a mint's second pass: the first's frames
+    //the real bytes [a, b) of folder [fa, fb): CODE reads the content; DECODE has what the encoder saw, made real again
+    //with the first pass's translated frames (each undone whole: a frame may reach past the piece asked for)
+    bool lzxReal(uint64_t a, uint64_t b, uint64_t fa, uint64_t fb, uint8_t *o) {
+        if (mode != kDecode) {
+            if (b > X.size) return fail("an LZX folder past the content"), false;
+            if (X.mem) { memcpy(o, X.mem + a, (size_t)(b - a)); return true; }
+            if (!X.src || !X.src->preadAll(o, (size_t)(b - a), a)) return fail("the content does not read"), false;
+            return true;
+        }
+        if (b > X.cap) return fail("an LZX folder past the content"), false;
+        if (!e8prev) { memcpy(o, X.w + a, (size_t)(b - a)); return true; }
+        const auto &V = *e8prev;
+        auto it = std::partition_point(V.begin(), V.end(), [&](const auto &f) { return f.first + f.second.n <= a; });
+        uint64_t lo = a, hi = b; auto e = it;
+        for (; e != V.end() && e->first < b; ++e) {
+            if (e->first < fa || e->first + e->second.n > fb) return fail("an E8 frame across an LZX folder's edge"), false;
+            lo = std::min<uint64_t>(lo, e->first); hi = std::max<uint64_t>(hi, e->first + e->second.n);
+        }
+        if (it == e) { memcpy(o, X.w + a, (size_t)(b - a)); return true; }
+        std::vector<uint8_t> t(X.w + lo, X.w + hi);
+        for (auto f = it; f != e; ++f) E8Inverse(t.data() + (f->first - lo), f->second.n, f->second.cur, f->second.fs);
+        memcpy(o, t.data() + (a - lo), (size_t)(b - a)); return true;
+    }
+    //one step of the family toward folder `idx`: the first folder not yet flushed is started, fed 32 KiB, or flushed.
+    //Its work is the stream's account (new ground only: a build made again after frames were dropped is paid already),
+    //and at most 64 steps a folder byte (real data: 7-35)
+    bool lzxStep(PredictCache::LzxFamily &f, size_t want, uint64_t wantK) {
+        size_t j = 0; while (j < f.folders.size() && f.folders[j].flushed) ++j;
+        if (j == f.folders.size()) return false;
+        auto &T = f.folders[j];
+        if (!T.started) {
+            const uint32_t wbits = T.knob & 0xFF, second = ((T.knob >> 8) & 0xFF) << 15;
+            const int r0 = !f.ctx ? ((f.ctx = LzxMakecabNew(wbits, second)) ? LZXMK_OK : LZXMK_ERROR)
+                         : f.ctxKnob == T.knob ? LzxMakecabNextFolder(f.ctx) : LzxMakecabNextFolderWindow(f.ctx, wbits, second);   // (another window: MAKECAB's new compressor)
+            f.ctxKnob = T.knob;
+            if (r0 != LZXMK_OK) { f.dead = true; return false; }
+            T.started = true; T.steps0 = f.total;
+        }
+        struct Sink { static int put(void *a, const uint8_t *p, uint32_t n, uint32_t) {
+            auto *x = static_cast<std::pair<PredictCache::LzxFolder *, uint64_t *> *>(a); x->first->frames.push_back({std::vector<uint8_t>(p, p + n), false}); *x->second += n; return 0; } };
+        std::pair<PredictCache::LzxFolder *, uint64_t *> arg{&T, &f.kept};
+        const uint64_t had = LzxMakecabSteps(f.ctx), spent = pcache->steps.load();
+        //(ground made again after its frames were dropped is paid, but not free: 8 x the stream's account at most, so
+        //readers far apart, or a description asking back and forth, cannot rebuild without end)
+        const uint64_t budget = pcache->streamBudget, reworkCap = budget > UINT64_MAX / 8 ? UINT64_MAX : budget * 8;
+        const uint64_t paidLeft = std::min(f.paid - std::min(f.paid, f.total), reworkCap - std::min(reworkCap, f.rework));
+        const uint64_t room = paidLeft + (budget > spent ? budget - spent : 0);
+        const uint64_t cap = T.steps0 + 64 * T.n + (1u << 20);
+        LzxMakecabLimit(f.ctx, had + std::min(room, cap > f.total ? cap - f.total : 0));
+        int r;
+        if (T.fed < T.n) {
+            const uint32_t len = (uint32_t)std::min<uint64_t>(0x8000, T.n - T.fed);
+            uint8_t buf[0x8000];
+            if (!lzxReal(T.at + T.fed, T.at + T.fed + len, T.at, T.at + T.n, buf)) return false;
+            r = LzxMakecabCompress(f.ctx, buf, len, T.e8, 1, &Sink::put, &arg); T.fed += len;
+        } else { r = LzxMakecabFlush(f.ctx, &Sink::put, &arg); T.flushed = true; }
+        const uint64_t did = LzxMakecabSteps(f.ctx) - had;
+        f.rework += std::min(did, f.paid - std::min(f.paid, f.total));   // (the part on ground already paid)
+        f.total += did;
+        if (f.total > f.paid) { pcache->steps += f.total - f.paid; f.paid = f.total; }
+        if (r != LZXMK_OK) { f.dead = true; if (r == LZXMK_OVER) f.over = true; return false; }
+        //(past the bound the oldest written frames go, past 8 x the bound any; the frame asked for, and its folder's after
+        //it, stay)
+        const uint64_t keep = pcache->lzxKept, hard = keep * 8;
+        for (size_t q = 0; q < f.folders.size() && f.kept > keep; ++q)
+            while (f.kept > keep && !f.folders[q].frames.empty() && !(q == want && f.folders[q].base >= wantK)
+                   && (f.folders[q].frames.front().used || f.kept > hard)) {
+                f.kept -= f.folders[q].frames.front().b.size(); f.folders[q].frames.pop_front(); ++f.folders[q].base; }
+        return true;
+    }
+    //frame k of folder idx, handed to `use` under the family's lock: 1 done, 0 the folder has no frame k, -1 the family
+    //does not make it (not this encoder, or past the account), -2 refused (`why` says)
+    template <class U> int lzxFrame(int idx, uint64_t k, U &&use, bool written = false) {
+        if (idx < 0 || idx >= (int)lzxList.size()) return -1;
+        if (!pcache) pcache = std::make_shared<PredictCache>();
+        auto fam = pcache->lzxFamily();
+        std::lock_guard<std::mutex> g(fam->m);
+        PredictCache::LzxFamily &f = *fam;
+        for (int i = 0; i <= idx; ++i) {                                  // the folders as this stream opens them
+            const LzxRef &L = lzxList[(size_t)i];
+            if (i < (int)f.folders.size()) {
+                const auto &F = f.folders[(size_t)i];
+                if (F.at != L.at || F.n != L.n || F.e8 != L.e8 || F.knob != L.knob) { fail("LZX folders out of step with the family's"); return -2; }
+            } else { PredictCache::LzxFolder F; F.at = L.at; F.n = L.n; F.e8 = L.e8; F.knob = L.knob; f.folders.push_back(std::move(F)); }
+        }
+        auto *T = &f.folders[(size_t)idx];
+        if (k < T->base) {                                                // dropped: made again from the stream's start
+            LzxMakecabFree(f.ctx); f.ctx = nullptr; f.dead = false; f.over = false; f.kept = 0; f.total = 0;
+            for (auto &F : f.folders) { F.fed = 0; F.base = 0; F.started = false; F.flushed = false; F.frames.clear(); }   // (written or not)
+        }
+        for (;;) {
+            if (k < T->base + T->frames.size()) { auto &F = T->frames[(size_t)(k - T->base)]; use(F.b); F.used |= written; predictedAny = true; return 1; }
+            if (T->flushed) return 0;
+            if (f.dead) return -1;
+            if (!lzxStep(f, (size_t)idx, k)) return why ? -2 : -1;
+        }
+    }
     //NEAREST's index: hash chains (3-byte and 2-byte keys, newest first) over the content from `lo` up to `upto`, the
     //machine's own; positions the window no longer reaches are dropped by the ring
     struct NIdx { uint64_t lo = UINT64_MAX, upto = 0; uint32_t mask = 0; std::vector<uint32_t> h3, h2, p3, p2; } nidx;
@@ -844,7 +962,7 @@ struct Machine {
         uint32_t tick = 0, val = 0; const Ins *op_ = nullptr;
         // DIRECT THREADING: every handler ends with its own jump to the next one (computed goto), so the branch predictor
         // learns per-instruction patterns instead of one shared switch. Table order = OpCode order, then the fused ones.
-        static const void *const J[] = { &&L_OP_BIT, &&L_OP_TREE, &&L_OP_RTREE, &&L_OP_DIRECT, &&L_OP_MLIT, &&L_OP_RAW, &&L_OP_HUFF, &&L_OP_BUILD, &&L_OP_STA, &&L_OP_SET, &&L_OP_DEC, &&L_OP_OUTLIT, &&L_OP_OUTCOPY, &&L_OP_HMTF, &&L_OP_HPUSH, &&L_OP_JZ, &&L_OP_JMP, &&L_OP_CALL, &&L_OP_RET, &&L_OP_ASSERT, &&L_OP_FLUSH, &&L_OP_MARK, &&L_OP_END, &&L_OP_HUFFRUN, &&L_OP_BYTERUN, &&L_OP_PREDICT, &&L_OP_RAWBYTES, &&L_OP_E8FRAME, &&L_OP_E8END, &&L_OP_NEAREST, &&L_F_BITJZ, &&L_F_SETBITJZ, &&L_F_DECN, &&L_F_OFFEND };
+        static const void *const J[] = { &&L_OP_BIT, &&L_OP_TREE, &&L_OP_RTREE, &&L_OP_DIRECT, &&L_OP_MLIT, &&L_OP_RAW, &&L_OP_HUFF, &&L_OP_BUILD, &&L_OP_STA, &&L_OP_SET, &&L_OP_DEC, &&L_OP_OUTLIT, &&L_OP_OUTCOPY, &&L_OP_HMTF, &&L_OP_HPUSH, &&L_OP_JZ, &&L_OP_JMP, &&L_OP_CALL, &&L_OP_RET, &&L_OP_ASSERT, &&L_OP_FLUSH, &&L_OP_MARK, &&L_OP_END, &&L_OP_HUFFRUN, &&L_OP_BYTERUN, &&L_OP_PREDICT, &&L_OP_RAWBYTES, &&L_OP_E8FRAME, &&L_OP_E8END, &&L_OP_NEAREST, &&L_OP_LZXFOLDER, &&L_OP_LZXEND, &&L_OP_LZXSIZE, &&L_OP_LZXEMIT, &&L_F_BITJZ, &&L_F_SETBITJZ, &&L_F_DECN, &&L_F_OFFEND };
         static_assert(sizeof(J) / sizeof(J[0]) == F_OFFEND + 1, "dispatch table out of step with the opcodes");
         #define NEXT() do { if (__builtin_expect(!(++tick & 0xFFFF), 0)) { fuel += 0x10000; \
                 if (overBudget() || X.err) { fail(X.err ? "the content does not read" : "a description that works without making progress"); return 0; } X.workMark = X.work; } \
@@ -984,6 +1102,63 @@ struct Machine {
                     if (d != kNoPrediction) predictedAny = true;
                 }
                 v[op_->tgt] = d; CHECK_NEXT(); }
+            L_OP_LZXFOLDER: {                                            // ISA 9
+                const uint32_t at = opnd<M>(op_->x), n = opnd<M>(op_->v), e8 = opnd<M>(op_->m);
+                const uint64_t have = M == kDecode ? X.cap : X.size;
+                if (!n || (uint64_t)at + n > have) { fail("an LZX folder past the content"); return 0; }
+                if (!lzxList.empty() && at < lzxList.back().at + lzxList.back().n) { fail("LZX folders out of order"); return 0; }
+                if (lzxList.size() >= 4096) { fail("more than 4096 LZX folders"); return 0; }
+                lzxList.push_back({at, n, e8, op_->imm}); lzxCur = (int)lzxList.size() - 1;
+                uint32_t r = kNoPrediction;
+                if (M == kDecode) {
+                    if (lzxOpen) { fail("an LZX folder opened inside another"); return 0; }
+                    lzxSlot = decOut->size(); lzxOpen = true; record(0);       // its decision: filled at LZXEND
+                    lzxAvail = !noPredict && wholeContent; lzxBad = false;
+                    if (lzxAvail) r = 1;
+                } else if (M == kCode) {
+                    uint32_t t; if (!Dc.get(t)) { fail("out of decisions"); return 0; }
+                    if (t > 1) { fail("an LZX folder's decision is 0 or 1"); return 0; }
+                    if (t && noPredict) { fail("a plain record takes no family's frames"); return 0; }
+                    lzxUse = t; if (t) r = 1;
+                }
+                v[op_->tgt] = r; CHECK_NEXT(); }
+            L_OP_LZXEND: {
+                if (M == kDecode) {
+                    if (!lzxOpen) { fail("an LZX folder ended that was not opened"); return 0; }
+                    if (e8open.open) { fail("an E8 frame open at LZXEND"); return 0; }
+                    //the family's only when the description says so AND the family made every frame it was asked for
+                    const uint32_t t = opnd<M>(op_->v) && lzxAvail && !lzxBad ? 1 : 0;
+                    (*decOut)[lzxSlot] = t; lzxOpen = false;
+                    if (t) decOut->resize(lzxSlot + 1);                  // the folder is the family's: nothing else of it is kept
+                } else if (M == kCode) lzxUse = 0;
+                CHECK_NEXT(); }
+            L_OP_LZXSIZE: {
+                uint32_t r = kNoPrediction; const uint32_t k = opnd<M>(op_->x);
+                if ((M == kDecode && lzxOpen && lzxAvail) || (M == kCode && lzxUse)) {
+                    const int q = lzxFrame(lzxCur, k, [&](const std::vector<uint8_t> &fr) { r = (uint32_t)fr.size(); });
+                    if (q == -2) return 0;
+                    if (q == -1) { if (M == kDecode) lzxBad = true;
+                                   else { fail(pcache->lzxFamily()->over ? "a description that parses without making progress" : "the LZX family no longer makes this folder"); return 0; } }
+                }
+                v[op_->tgt] = r; CHECK_NEXT(); }
+            L_OP_LZXEMIT: {
+                const uint32_t k = opnd<M>(op_->x); uint32_t r = 0;
+                if (M == kCode) {
+                    if (!lzxUse) { fail("LZXEMIT in a folder that is not the family's"); return 0; }
+                    if (bn) { fail("LZXEMIT off a byte boundary"); return 0; }
+                    const int q = lzxFrame(lzxCur, k, [&](const std::vector<uint8_t> &fr) { out->insert(out->end(), fr.begin(), fr.end()); }, true);
+                    if (q == -2) return 0;
+                    if (q == 0) { fail("no such LZX frame"); return 0; }
+                    if (q == -1) { fail(pcache->lzxFamily()->over ? "a description that parses without making progress" : "the LZX family no longer makes this folder"); return 0; }
+                    r = 1;
+                } else if (M == kDecode && lzxOpen && lzxAvail && !(bipos & 7)) {
+                    const uint64_t q0 = bipos >> 3;
+                    const int q = lzxFrame(lzxCur, k, [&](const std::vector<uint8_t> &fr) {
+                        r = q0 <= inn && fr.size() <= inn - q0 && memcmp(in + q0, fr.data(), fr.size()) == 0 ? 1 : 0; });
+                    if (q == -2) return 0;
+                    if (q == -1) lzxBad = true;
+                }
+                v[op_->tgt] = r; CHECK_NEXT(); }
             L_OP_PREDICT: {
                 uint32_t t[3] = {0, kNoPrediction, 0};
                 if (M != kPrice && !noPredict && (M != kDecode || wholeContent)) {
@@ -1057,6 +1232,10 @@ struct Machine {
             PutVar(o, runs.size());
             for (const auto &r : runs) for (uint64_t x : r) PutVar(o, x);
         }
+        if (UsesLzx(D)) {                                                 // (ISA 9 only)
+            PutVar(o, lzxList.size()); for (const auto &L : lzxList) { PutVar(o, L.at); PutVar(o, L.n); PutVar(o, L.e8); PutVar(o, L.knob); }
+            PutVar(o, (uint64_t)(lzxCur + 1)); PutVar(o, lzxUse);
+        }
         return o;
     }
     bool restore(const uint8_t *p, size_t n) {
@@ -1085,6 +1264,19 @@ struct Machine {
                     X.vframes[at + j * fn] = {(uint32_t)(j + 1 == count ? last : fn), (uint32_t)(cur + j * fn), (uint32_t)fs};
                 end = at + fn * (count - 1) + last;
             }
+        }
+        lzxList.clear(); lzxCur = -1; lzxUse = 0;
+        if (UsesLzx(D)) {
+            const uint64_t nl = r.var(); if (r.bad || nl > 4096) return fail("a malformed checkpoint");
+            uint64_t end = 0;
+            for (uint64_t k = 0; k < nl; ++k) {
+                const uint64_t at = r.var(), ln = r.var(), e8 = r.var(), kn = r.var();
+                if (r.bad || !ln || ln > 0xFFFFFFFFu || at > 0xFFFFFFFFu || at < end || at + ln > (1ull << 32) || e8 > 0xFFFFFFFFu || kn > 0xFFFFFFFFu || !LzxKnob((uint32_t)kn)) return fail("a malformed checkpoint");
+                lzxList.push_back({at, ln, (uint32_t)e8, (uint32_t)kn}); end = at + ln;
+            }
+            const uint64_t cur = r.var(), use = r.var();
+            if (r.bad || cur > nl || use > 1) return fail("a malformed checkpoint");
+            lzxCur = (int)cur - 1; lzxUse = (uint32_t)use;
         }
         if (r.bad || r.at != n || bn < 0 || bn > (D.coder == kBits16M ? 15 : 7) || cacheSize > maxCache) return fail("a malformed checkpoint");
         return true;
@@ -1121,7 +1313,7 @@ uint64_t SuggestedSpacing(const Description &D, uint64_t Shipped, bool Plain) {
 // payload length (VGCQ: then a varint, the FNV-1a 64 of the segment's shipped bytes: a family that predicts otherwise
 // than at the mint, another reader's or a hostile record's, is refused per segment, never served) | payloads. A payload
 // is one zstd frame: varint snapshot length, snapshot, varint decision count, the segment's decisions as varints.
-bool UsesPrediction(const Description &D) { for (const Op &o : D.ops) if (o.op == OP_PREDICT || o.op == OP_NEAREST) return true; return false; }
+bool UsesPrediction(const Description &D) { for (const Op &o : D.ops) if (o.op == OP_PREDICT || o.op == OP_NEAREST || o.op == OP_LZXFOLDER) return true; return false; }
 // The work a family's parse may take a byte: LZ4HC 128 (real archives take 4, 73 at worst); zlib twice its chain length and
 // a little (zlib itself walks up to its chain at a search, about twice a byte: level 9 takes thousands on degenerate data)
 uint64_t WorkPerByte(uint8_t Family, uint32_t Knob) {
@@ -1139,17 +1331,29 @@ bool MintInto(const Description &D, const uint8_t *Shipped, size_t N, size_t Con
     if (!S.ok) { Err = "a description too complex to run"; return false; }
     bool predicted = Predict && UsesPrediction(D);
     std::vector<uint32_t> dec;
+    std::vector<std::pair<uint64_t, ViewFrame>> e8first;                 // the first pass's translated frames (LZX family input)
+    std::shared_ptr<PredictCache::LzxFamily> lzx2;
     // DECODE, plain: the content, and the decisions as the stream has them
     // (predicted: DECODE again over the whole content, every token checked against the family's)
     for (int pass = 0; pass < (predicted ? 2 : 1); ++pass) {
         dec.clear();
-        Machine m(D, S, kDecode); m.in = Shipped; m.inn = N; m.X.w = Buf; m.decOut = &dec;
+        Machine m(D, S, kDecode); m.in = Shipped; m.inn = N; m.X.w = Buf; m.decOut = &dec; m.e8prev = pass ? &e8first : nullptr;
         m.X.cap = pass ? ContentLen : ContentSize ? ContentSize : ContentCap; m.noPredict = !pass; m.wholeContent = pass == 1;
+        if (pass) { m.pcache = std::make_shared<PredictCache>(); m.pcache->streamBudget = MaxWorkPerByte(D) * ((uint64_t)N + ContentLen + 2 * kLz4hcMaxBlock); }
         if (D.coder == kRange) { m.ip = 1; for (int i = 0; i < 4; ++i) m.code = (m.code << 8) | m.inByte(); }
         if (m.run(D.entryStream) != 1) { Err = std::string("decode: ") + (m.why ? m.why : "refused") + (m.failOp >= 0 ? " (op " + std::to_string(m.failOp) + ", content place " + std::to_string(m.place()) + ")" : std::string()); return false; }
         if (m.e8open.open) { Err = "decode: an E8 frame left open"; return false; }
+        //(the LZX family's work so far: the coding goes on from it, when it read what a reader will: the second decode's E8
+        //frames are the first's, so the real bytes it compressed are the content's)
+        if (pass && m.pcache) {
+            bool same = m.e8done.size() == e8first.size();
+            for (size_t q = 0; same && q < e8first.size(); ++q) {
+                const auto &a = e8first[q], &b = m.e8done[q];
+                same = a.first == b.first && a.second.n == b.second.n && a.second.cur == b.second.cur && a.second.fs == b.second.fs; }
+            if (same) lzx2 = m.pcache->lzx;
+        }
         if (pass + 1 == (predicted ? 2 : 1)) m.e8finish();               // after the LAST decode only (a second one reads
-        else m.e8done.clear();                                            // ahead what the encoder saw): the real bytes
+        else { e8first = std::move(m.e8done); m.e8done.clear(); }        // ahead what the encoder saw): the real bytes
         if (ContentSize && m.place() != ContentSize) { Err = "decode: the content is not the size expected"; return false; }
         if (pass && m.place() != ContentLen) { Err = "decode: the content is not the size expected"; return false; }
         ContentLen = m.place();
@@ -1164,6 +1368,7 @@ bool MintInto(const Description &D, const uint8_t *Shipped, size_t N, size_t Con
     m.noPredict = !predicted; m.pc = D.entryStream;
     const uint64_t streamBudget = MaxWorkPerByte(D) * ((uint64_t)N + ContentLen + 2 * kLz4hcMaxBlock);   // what a reader will allow the stream
     m.pcache = std::make_shared<PredictCache>(); m.pcache->streamBudget = streamBudget;
+    if (predicted && lzx2) { m.pcache->lzx = lzx2; m.pcache->steps = lzx2->paid; }   // (its work paid as the decode paid it)
     cks.push_back({0, 0, m.snapshot()});
     for (bool first = true;; first = false) {
         m.stopAt = cks.back().out + Spacing;                 // from the LAST checkpoint: a long run (one token) does not leave a burst of tiny segments behind it
@@ -1180,7 +1385,7 @@ bool MintInto(const Description &D, const uint8_t *Shipped, size_t N, size_t Con
         m.nidx = Machine::NIdx();                                         // (a reader restored here builds its own NEAREST index)
         {   //a fresh parse cache (a reader there has none at hand), the stream's account carried over
             auto fresh = std::make_shared<PredictCache>(); fresh->steps = m.pcache->steps.load(); fresh->streamBudget = streamBudget;
-            { std::lock_guard<std::mutex> l(m.pcache->mu); fresh->charged = m.pcache->charged; fresh->zfurthest = m.pcache->zfurthest; }
+            { std::lock_guard<std::mutex> l(m.pcache->mu); fresh->charged = m.pcache->charged; fresh->zfurthest = m.pcache->zfurthest; fresh->lzx = m.pcache->lzx; }
             m.pcache = std::move(fresh); }
     }
     if (m.copied != N) { Err = "the stream does not code back to its own bytes"; return false; }
@@ -1460,6 +1665,8 @@ void CodedByteSource::debugHoldWaiter(uint64_t Off, bool On) {
     if (On) ++I->waits[j].n; else if (I->waits.count(j) && --I->waits[j].n <= 0) I->waits.erase(j);
 }
 bool CodedByteSource::debugCached(uint64_t Off) const { std::lock_guard<std::mutex> g(I->mu); return I->segs.count(I->segOf(Off)) > 0; }
+void CodedByteSource::debugStreamBudget(uint64_t Steps) { I->pcache->streamBudget = Steps; }
+void CodedByteSource::debugLzxKept(uint64_t Bytes) { I->pcache->lzxKept = Bytes; }
 void CodedByteSource::debugDropOnNextWake() { std::lock_guard<std::mutex> g(I->mu); I->dropOnWake = true; }
 uint64_t CodedByteSource::bytesGenerated() const { return I->generated.load(); }
 

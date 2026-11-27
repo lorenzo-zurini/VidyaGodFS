@@ -62,10 +62,14 @@ const std::vector<Sig> &Sigs() {
         {"e8frame", {{kE, 'x'}, {kE, 'v'}, {kE, 'm'}, {kR, 't'}}, false},
         {"e8end", {{kE, 'v'}}, false},
         {"nearest", {{kR, 't'}, {kE, 'x'}, {kE, 'v'}, {kE, 'm'}}, false},
+        {"lzxfolder", {{kE, 'x'}, {kE, 'v'}, {kE, 'm'}, {kK, 'i'}, {kR, 't'}}, false},
+        {"lzxend", {{kE, 'v'}}, false},
+        {"lzxsize", {{kE, 'x'}, {kR, 't'}}, false},
+        {"lzxemit", {{kE, 'x'}, {kR, 't'}}, false},
     };
     return s;
 }
-static_assert(OP_COUNT == 30, "an op without a text form: add its signature");
+static_assert(OP_COUNT == 34, "an op without a text form: add its signature");
 
 struct ExName { const char *name; uint8_t op; int arity; };   // arity -1: (table|arr NAME value)
 const std::vector<ExName> &ExNames() {

@@ -28,8 +28,9 @@
 
 namespace coding {
 
-constexpr uint32_t kIsa = 8;          // the instruction set a description may use; newer is refused (3: HUFFRUN, BYTERUN; 4: STREAMPOS; 5: PREDICT; 6: U16 U32 U16BE U32BE;
-                                      // 7: the BITS16M coder, RAWBYTES, DIV MOD, a bounded HUFFRUN; 8: E8FRAME E8END NEAREST)
+constexpr uint32_t kIsa = 9;          // the instruction set a description may use; newer is refused (3: HUFFRUN, BYTERUN; 4: STREAMPOS; 5: PREDICT; 6: U16 U32 U16BE U32BE;
+                                      // 7: the BITS16M coder, RAWBYTES, DIV MOD, a bounded HUFFRUN; 8: E8FRAME E8END NEAREST;
+                                      // 9: the LZX family: LZXFOLDER LZXEND LZXSIZE LZXEMIT)
 constexpr int kRegs = 64;
 constexpr int kRegPlace = 0;          // register 0: the place in the content
 constexpr uint32_t kNoSlot = 255;
@@ -103,6 +104,18 @@ enum OpCode : uint8_t {
                  // bytes at the place (an LZ copy's distance as match finders hand it out; x >= 2), or 0xFFFFFFFF: none
                  // found within 128 candidates, or no content ahead to look at (PRICE; the first, plain DECODE of a mint).
                  // A predictor like PREDICT: what it says is checked when minted, never trusted
+    // ---- ISA 9: the LZX ENCODER FAMILY (MAKECAB 1.00's compressor, lzxmakecab.h): a whole CAB folder reproduced from its
+    // content. Folders go through ONE compressor in stream order (state survives between folders of one knob, as in
+    // MAKECAB), fed only as far as the frames asked for
+    OP_LZXFOLDER,// folder [x, x+v) of the content, E8 filesize m, knob imm (window bits | second partition / 32 KiB << 8): one
+                 // decision, the folder is the family's (DECODE decides at LZXEND); register tgt = 1 when the family is
+                 // at hand (CODE: the decision says so; DECODE: a mint's second pass), else 0xFFFFFFFF
+    OP_LZXEND,   // the folder opened is the family's if v AND the family made every frame asked for: DECODE drops every
+                 // decision recorded since LZXFOLDER's (CODE makes the folder from the family's frames instead); closes it
+    OP_LZXSIZE,  // register tgt = the byte size of the open folder's frame x (its CFDATA payload), or 0xFFFFFFFF (no such
+                 // frame: past the folder's last, or the family not at hand)
+    OP_LZXEMIT,  // frame x's payload at the stream's byte position: CODE writes it; DECODE compares (register tgt = 1 if the
+                 // stream holds it there, else 0; nothing is read)
     OP_COUNT
 };
 constexpr uint8_t kFree = 1;          // op flag: its value is a decision
@@ -194,6 +207,8 @@ public:
     // woken from waiting lose its segment at that moment (as if read-ahead had evicted it while it woke).
     void     debugHoldWaiter(uint64_t Off, bool On);
     bool     debugCached(uint64_t Off) const;
+    void     debugStreamBudget(uint64_t Steps);                // (tests) what the families may spend, the whole stream's
+    void     debugLzxKept(uint64_t Bytes);                     // (tests) the LZX family's frames kept (64 MiB)
     void     debugDropOnNextWake();
     struct Ck { uint64_t out = 0, rec = 0, recLen = 0, dec = 0, hash = 0; };   // hash: a predicted record's, of the segment's shipped bytes
     struct Impl;

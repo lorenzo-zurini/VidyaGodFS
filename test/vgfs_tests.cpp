@@ -21,6 +21,7 @@
 #include "descbuilders.h"
 #include <nlohmann/json.hpp>
 #include "lz4family.h"
+#include "lzxmakecab.h"
 #include <lzma.h>
 #include <lz4.h>
 #include <lz4hc.h>
@@ -4648,6 +4649,299 @@ TEST(nearest_predicts_an_lz_formats_distances) {
         coding::Description d2; err.clear(); CHECK(coding::Read(t2, d2, err)); std::vector<uint8_t> c3, r3;
         CHECK(coding::Mint(d2, s2.data(), s2.size(), 0, 1 << 16, 64, c3, r3, err));
         if (!err.empty()) std::cerr << "  exact nearest: " << err << "\n"; }
+}
+
+namespace lzxcab {
+// The cabinet MAKECAB 1.00 made of two generated files (LZX 21, FolderSizeThreshold=0: a folder each, setID 0x6BF), rebuilt
+// here through the family's compressor: its FNV-64 is that of MAKECAB's own (Wine, sandboxed, 2026-11-27).
+constexpr uint64_t kMakecabFnv = 0x6e3133c0867753f2ull;
+std::vector<std::vector<uint8_t>> files() {
+    uint64_t s = 7; auto next = [&] { s = (s * 1103515245ull + 12345) & 0x7FFFFFFF; return (uint32_t)s; };
+    std::vector<uint8_t> f0;
+    auto le = [&](int32_t v) { for (int k = 0; k < 4; ++k) f0.push_back((uint8_t)((uint32_t)v >> (8 * k))); };
+    while (f0.size() < 40000) {
+        const uint32_t r = next();
+        switch (r % 5) {
+        case 0: f0.insert(f0.end(), {0x55, 0x8B, 0xEC, 0xE8}); le((int32_t)((r >> 8) % 6000) - 3000); f0.insert(f0.end(), {0x83, 0xC4, 0x04}); break;
+        case 1: { const int32_t back = -(int32_t)(f0.size() % 4096); f0.push_back(0xE8); le(back); f0.insert(f0.end(), {0x5D, 0xC3}); break; }
+        case 2: { const std::string t = "mov eax, [ebp+" + std::to_string((r >> 4) % 64) + "]\n"; f0.insert(f0.end(), t.begin(), t.end()); break; }
+        case 3: for (int sh : {3, 7, 11, 15}) f0.push_back((uint8_t)(r >> sh)); break;
+        default: f0.insert(f0.end(), (r >> 5) % 9 + 1, 0x90);
+        }
+    }
+    f0.resize(40000);
+    static const char *W[] = {"the", "of", "and", "to", "in", "is", "was", "for", "on", "that", "with", "as", "by", "at", "from",
+                              "his", "her", "an", "which", "or", "were", "are", "be", "this"};
+    std::string f1;
+    for (int i = 0; i < 1100; ++i) { if (i) f1 += ' '; f1 += W[next() % 24]; }
+    if (f1.size() > 6000) f1.resize(6000);
+    return {f0, std::vector<uint8_t>(f1.begin(), f1.end())};
+}
+uint32_t checksum(const uint8_t *p, size_t n, uint32_t c) {
+    for (size_t k = 0; k + 4 <= n; k += 4) c ^= (uint32_t)p[k] | (uint32_t)p[k + 1] << 8 | (uint32_t)p[k + 2] << 16 | (uint32_t)p[k + 3] << 24;
+    uint32_t u = 0; const uint8_t *t = p + (n & ~(size_t)3);
+    switch (n & 3) { case 3: u |= (uint32_t)*t++ << 16; [[fallthrough]]; case 2: u |= (uint32_t)*t++ << 8; [[fallthrough]]; case 1: u |= *t; }
+    return c ^ u;
+}
+// the cabinet: file i in folder of[i] (consecutive; none given: a folder each), folder j compressed with E8 file size e8[j]
+// (MAKECAB: always 12,000,000), window 2^wbits, second partition `second`
+std::vector<uint8_t> make(const std::vector<std::vector<uint8_t>> &fs, const std::vector<uint32_t> &e8, std::vector<uint64_t> *steps = nullptr,
+                          uint32_t second = 0x10000, uint32_t wbits = 21, std::vector<size_t> of = {}, uint16_t setid = 0x6BF,
+                          std::vector<uint32_t> wb = {}) {
+    const char *names[] = {"code.bin", "words.txt", "more.bin"};
+    if (of.empty()) for (size_t i = 0; i < fs.size(); ++i) of.push_back(i);
+    const size_t nf = of.back() + 1;
+    if (wb.empty()) wb.assign(nf, wbits);   // (a folder of another window: a context of its own, as MAKECAB makes it)
+    std::vector<std::vector<uint8_t>> in(nf); std::vector<uint32_t> uoff(fs.size());
+    for (size_t i = 0; i < fs.size(); ++i) { uoff[i] = (uint32_t)in[of[i]].size(); in[of[i]].insert(in[of[i]].end(), fs[i].begin(), fs[i].end()); }
+    std::vector<std::vector<std::vector<uint8_t>>> frames(nf); std::vector<std::vector<uint32_t>> unc(nf);
+    LzxMakecab *m = LzxMakecabNew(wb[0], second); if (!m) return {};
+    struct A { std::vector<std::vector<uint8_t>> *f; std::vector<uint32_t> *u; };
+    auto sink = [](void *a, const uint8_t *p, uint32_t n, uint32_t un) { auto *x = (A *)a; x->f->emplace_back(p, p + n); x->u->push_back(un); return 0; };
+    for (size_t i = 0; i < nf; ++i) {
+        if (i && wb[i] != wb[i - 1]) { if (LzxMakecabNextFolderWindow(m, wb[i], second) != LZXMK_OK) { LzxMakecabFree(m); return {}; } }
+        else if (i && LzxMakecabNextFolder(m) != LZXMK_OK) { LzxMakecabFree(m); return {}; }
+        A a{&frames[i], &unc[i]};
+        for (size_t o = 0; o < in[i].size(); o += 32768)
+            if (LzxMakecabCompress(m, in[i].data() + o, (uint32_t)std::min<size_t>(32768, in[i].size() - o), e8[i], 1, sink, &a) != LZXMK_OK) { LzxMakecabFree(m); return {}; }
+        if (LzxMakecabFlush(m, sink, &a) != LZXMK_OK) { LzxMakecabFree(m); return {}; }
+        if (steps) steps->push_back(LzxMakecabSteps(m));   // (the match finder's work so far)
+    }
+    LzxMakecabFree(m);
+    std::vector<uint8_t> o;
+    auto u16 = [&](uint32_t v) { o.push_back((uint8_t)v); o.push_back((uint8_t)(v >> 8)); };
+    auto u32 = [&](uint32_t v) { u16(v & 0xFFFF); u16(v >> 16); };
+    const uint32_t coffFiles = 36 + 8 * (uint32_t)nf;
+    uint32_t at = coffFiles; for (size_t i = 0; i < fs.size(); ++i) at += 17 + (uint32_t)strlen(names[i]);
+    o.insert(o.end(), {'M', 'S', 'C', 'F'}); u32(0); u32(0); u32(0); u32(coffFiles); u32(0); o.push_back(3); o.push_back(1);
+    u16((uint32_t)nf); u16((uint32_t)fs.size()); u16(0); u16(setid); u16(0);
+    for (size_t i = 0; i < nf; ++i) {
+        u32(at); u16((uint32_t)frames[i].size()); u16(0x0003 | wb[i] << 8);
+        for (const auto &f : frames[i]) at += 8 + (uint32_t)f.size();
+    }
+    for (size_t i = 0; i < fs.size(); ++i) { u32((uint32_t)fs[i].size()); u32(uoff[i]); u16((uint32_t)of[i]); u16(0x5D7B); u16(0x9F4B); u16(0x20);
+        o.insert(o.end(), names[i], names[i] + strlen(names[i]) + 1); }
+    for (size_t i = 0; i < nf; ++i)
+        for (size_t k = 0; k < frames[i].size(); ++k) {
+            const auto &f = frames[i][k]; uint8_t h[4] = {(uint8_t)f.size(), (uint8_t)(f.size() >> 8), (uint8_t)unc[i][k], (uint8_t)(unc[i][k] >> 8)};
+            u32(checksum(h, 4, checksum(f.data(), f.size(), 0))); o.insert(o.end(), h, h + 4); o.insert(o.end(), f.begin(), f.end());
+        }
+    o[8] = (uint8_t)o.size(); o[9] = (uint8_t)(o.size() >> 8); o[10] = (uint8_t)(o.size() >> 16); o[11] = (uint8_t)(o.size() >> 24);
+    return o;
+}
+uint64_t fnv(const std::vector<uint8_t> &b) { uint64_t h = 1469598103934665603ull; for (uint8_t x : b) { h ^= x; h *= 1099511628211ull; } return h; }
+std::string description() { std::ifstream f(VGFS_TEST_DATA "/cab_lzx_family.json"); return std::string(std::istreambuf_iterator<char>(f), {}); }
+uint64_t decisions(const std::vector<uint8_t> &rec) {            // the record's header: magic, shipped size, decisions
+    size_t at = 4; uint64_t v = 0;
+    for (int f = 0; f < 2; ++f) { v = 0; for (int sh = 0; at < rec.size(); sh += 7) { const uint8_t b = rec[at++]; v |= (uint64_t)(b & 0x7F) << sh; if (!(b & 0x80)) break; } }
+    return v; }
+}  // namespace lzxcab
+
+TEST(the_lzx_family_makes_makecabs_folders) {
+    const auto fs = lzxcab::files();
+    std::vector<uint64_t> steps; const auto cab = lzxcab::make(fs, {12000000, 12000000}, &steps);
+    CHECK_EQ(steps.size(), (size_t)2);
+    CHECK(steps.size() == 2 && steps[0] == 748420 && steps[1] == 812898);   // the match finder's work, pinned (its bound counts it)
+    CHECK_EQ(cab.size(), (size_t)12253);
+    CHECK_EQ(lzxcab::fnv(cab), lzxcab::kMakecabFnv);                    // the compressor IS MAKECAB's, byte for byte
+    const std::string text = lzxcab::description();
+    coding::Description d; std::string err; CHECK(coding::Read(text, d, err));
+    if (!err.empty()) std::cerr << "  read: " << err << "\n";
+    std::vector<uint8_t> c1, rq, c2, rp;
+    CHECK(coding::Mint(d, cab.data(), cab.size(), 0, 1 << 20, 2048, c1, rq, err));
+    if (!err.empty()) std::cerr << "  mint: " << err << "\n";
+    CHECK(coding::Mint(d, cab.data(), cab.size(), 0, 1 << 20, 2048, c2, rp, err, false));
+    // the content: the header and file table as they are, then each folder's real bytes (the installed files)
+    CHECK_EQ(c1.size(), (size_t)(103 + 40000 + 4209)); CHECK(c1 == c2);
+    CHECK(c1.size() == 44312 && std::equal(fs[0].begin(), fs[0].end(), c1.begin() + 103) && std::equal(fs[1].begin(), fs[1].end(), c1.begin() + 40103));
+    // the family's record: a decision per folder (it is the family's) and each block's checksum, nothing else
+    CHECK(rq.size() > 3 && rq[3] == 'Q' && rp.size() > 3 && rp[3] == 'R');
+    CHECK_EQ(lzxcab::decisions(rq), (uint64_t)5);
+    CHECK(rq.size() < 400 && rp.size() > 8000);
+    if (rq.size() >= 400) std::cerr << "  predicted " << rq.size() << " vs plain " << rp.size() << "\n";
+    // read back segment by segment, each from a reader that has nothing yet (restored inside a folder the family makes)
+    for (int pass = 0; pass < 2; ++pass) {
+        auto src = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d)), std::make_shared<MemByteSource>(rq),
+                                                   std::make_shared<MemByteSource>(c1), cab.size(), err);
+        CHECK(src != nullptr); if (!src) break;
+        CHECK(src->checkpoints() >= 3);
+        std::vector<uint8_t> got(cab.size());
+        if (pass == 0) CHECK(src->preadAll(got.data(), got.size(), 0));
+        else for (size_t k = src->checkpoints(); k-- > 0;) {
+            auto one = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d)), std::make_shared<MemByteSource>(rq),
+                                                       std::make_shared<MemByteSource>(c1), cab.size(), err);
+            const uint64_t at = cab.size() * (2 * k + 1) / (2 * src->checkpoints());
+            const size_t n = (size_t)std::min<uint64_t>(700, cab.size() - at);
+            CHECK(one && one->preadAll(got.data() + at, n, at));
+            CHECK(std::equal(got.begin() + (long)at, got.begin() + (long)(at + n), cab.begin() + (long)at)); }
+        if (pass == 0) CHECK(got == cab);
+    }
+    // a checkpoint naming a folder the content cannot hold (a peer's record): refused, never a folder-sized allocation
+    {   auto put = [](std::vector<uint8_t> &o, uint64_t x) { while (x >= 0x80) { o.push_back((uint8_t)(x | 0x80)); x >>= 7; } o.push_back((uint8_t)x); };
+        struct Rv { const std::vector<uint8_t> &p; size_t at = 0;
+                    uint64_t var() { uint64_t x = 0; for (int sh = 0; at < p.size(); sh += 7) { const uint8_t b = p[at++]; x |= (uint64_t)(b & 0x7F) << sh; if (!(b & 0x80)) break; } return x; } };
+        Rv r{rq}; r.at = 4; const uint64_t N = r.var(), total = r.var(), nck = r.var();
+        struct Ck { uint64_t out, dec, len, hash; }; std::vector<Ck> cks;
+        for (uint64_t k = 0; k < nck; ++k) { Ck c; c.out = r.var(); c.dec = r.var(); c.len = r.var(); c.hash = r.var(); cks.push_back(c); }
+        std::vector<std::vector<uint8_t>> pay; size_t at = r.at;
+        for (const auto &c : cks) { pay.emplace_back(rq.begin() + (long)at, rq.begin() + (long)(at + c.len)); at += c.len; }
+        auto tail = [&](uint64_t a, uint64_t n) { std::vector<uint8_t> t; put(t, 1); put(t, a); put(t, n); put(t, 12000000); put(t, 533); put(t, 1); put(t, 1); return t; };
+        const auto honest = tail(103, 40000);
+        int target = -1; std::vector<uint8_t> raw; uint64_t sn = 0; size_t s0 = 0;
+        for (size_t k = 0; k < pay.size() && target < 0; ++k) {             // the checkpoint inside folder 0
+            raw.assign((size_t)ZSTD_getFrameContentSize(pay[k].data(), pay[k].size()), 0);
+            raw.resize(ZSTD_decompress(raw.data(), raw.size(), pay[k].data(), pay[k].size()));
+            Rv q{raw}; sn = q.var(); s0 = q.at;
+            if (sn >= honest.size() && memcmp(raw.data() + s0 + sn - honest.size(), honest.data(), honest.size()) == 0) target = (int)k; }
+        CHECK(target > 0);
+        const std::pair<uint64_t, uint64_t> cases[] = {{103, 40000}, {1ull << 63, (1ull << 63) + 5}, {103, (1ull << 40) + 5}, {0xFFFFFFFFull, 2}, {103, 0xFFFFFFFFull}};
+        for (const auto &[ca, cn] : cases) {
+            if (target <= 0) break;
+            std::vector<uint8_t> snap(raw.begin() + (long)s0, raw.begin() + (long)(s0 + sn - honest.size())); const auto t = tail(ca, cn); snap.insert(snap.end(), t.begin(), t.end());
+            std::vector<uint8_t> nr; put(nr, snap.size()); nr.insert(nr.end(), snap.begin(), snap.end()); nr.insert(nr.end(), raw.begin() + (long)(s0 + sn), raw.end());
+            std::vector<uint8_t> z(ZSTD_compressBound(nr.size())); z.resize(ZSTD_compress(z.data(), z.size(), nr.data(), nr.size(), 3));
+            auto pp = pay; auto cc = cks; pp[(size_t)target] = z; cc[(size_t)target].len = z.size();
+            std::vector<uint8_t> rec = {'V', 'G', 'C', 'Q'}; put(rec, N); put(rec, total); put(rec, nck);
+            for (const auto &c : cc) { put(rec, c.out); put(rec, c.dec); put(rec, c.len); put(rec, c.hash); }
+            for (const auto &q : pp) rec.insert(rec.end(), q.begin(), q.end());
+            auto src = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d)), std::make_shared<MemByteSource>(rec),
+                                                       std::make_shared<MemByteSource>(c1), cab.size(), err);
+            CHECK(src != nullptr); if (!src) continue;
+            std::vector<uint8_t> got(700);
+            CHECK_EQ(src->preadAll(got.data(), got.size(), cks[(size_t)target].out + 10), ca == 103 && cn == 40000); }
+        //the same record as a PLAIN one (no segment hashes): a plain record never takes the family's frames
+        std::vector<uint8_t> plain = {'V', 'G', 'C', 'R'}; put(plain, N); put(plain, total); put(plain, nck);
+        for (const auto &c : cks) { put(plain, c.out); put(plain, c.dec); put(plain, c.len); }
+        for (const auto &q : pay) plain.insert(plain.end(), q.begin(), q.end());
+        auto ps = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d)), std::make_shared<MemByteSource>(plain),
+                                                  std::make_shared<MemByteSource>(c1), cab.size(), err);
+        CHECK(ps != nullptr);
+        if (ps) { std::vector<uint8_t> got(cab.size()); CHECK(!ps->preadAll(got.data(), got.size(), 0)); } }
+    // frames kept past the bound are dropped, and made again when asked for: from the stream's start, paid once (the
+    // budget that read it once reads it again)
+    {   auto src = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d)), std::make_shared<MemByteSource>(rq),
+                                                   std::make_shared<MemByteSource>(c1), cab.size(), err);
+        CHECK(src != nullptr);
+        if (src && steps.size() == 2) {
+            src->debugLzxKept(1); src->debugStreamBudget(steps[1] + 100);
+            std::vector<uint8_t> got(cab.size());
+            CHECK(src->preadAll(got.data() + 12000, cab.size() - 12000, 12000));   // folder 1 (folder 0 made on the way, dropped)
+            CHECK(src->preadAll(got.data(), 12000, 0));                          // folder 0 again: made again, unpaid
+            CHECK(got == cab);
+            } }
+    // two readers of one source at once, each in another folder (the family's lock, its frames shared)
+    {   auto src = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d)), std::make_shared<MemByteSource>(rq),
+                                                   std::make_shared<MemByteSource>(c1), cab.size(), err);
+        CHECK(src != nullptr);
+        if (src) { std::vector<uint8_t> g1(cab.size()), g2(cab.size()); bool o1 = false, o2 = false;
+            std::thread t1([&] { o1 = src->preadAll(g1.data() + 11600, cab.size() - 11600, 11600); });
+            std::thread t2([&] { o2 = src->preadAll(g2.data(), 11000, 0); });
+            t1.join(); t2.join();
+            CHECK(o1 && o2 && std::equal(g1.begin() + 11600, g1.end(), cab.begin() + 11600) && std::equal(g2.begin(), g2.begin() + 11000, cab.begin())); } }
+    // the family's work is the stream's account: a reader with too little left refuses the folder, it never runs unbounded
+    //(too little for folder 0; enough for folder 0 and half of folder 1, which then is refused; enough)
+    for (int b = 0; b < 3 && steps.size() == 2; ++b) {
+        const uint64_t budget = b == 0 ? 4000 : b == 1 ? steps[0] + (steps[1] - steps[0]) / 2 : 50000000;
+        auto src = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d)), std::make_shared<MemByteSource>(rq),
+                                                   std::make_shared<MemByteSource>(c1), cab.size(), err);
+        CHECK(src != nullptr); if (!src) break;
+        src->debugStreamBudget(budget);
+        std::vector<uint8_t> got(cab.size());
+        CHECK_EQ(src->preadAll(got.data(), 9000, 0), b > 0);             // folder 0's first block
+        CHECK_EQ(src->preadAll(got.data() + 12000, cab.size() - 12000, 12000), b > 1);   // folder 1's
+        if (b > 1) { CHECK(src->preadAll(got.data(), got.size(), 0)); CHECK(got == cab); } }
+    // a folder the family does not make (another E8 size): that folder alone keeps its decisions, the stream still codes back
+    {   const auto cab2 = lzxcab::make(fs, {12000000, 11000000});
+        std::vector<uint8_t> c3, r3, c4, r4;
+        CHECK(coding::Mint(d, cab2.data(), cab2.size(), 0, 1 << 20, 2048, c3, r3, err));
+        CHECK(coding::Mint(d, cab2.data(), cab2.size(), 0, 1 << 20, 2048, c4, r4, err, false));
+        CHECK(c3 == c1 && cab2 != cab);
+        CHECK(lzxcab::decisions(r3) > 5 && lzxcab::decisions(r3) < lzxcab::decisions(r4));
+        CHECK(r3.size() > 400 && r3.size() < r4.size()); }
+    // the compressor's match finder is bounded (its trees have no depth limit of their own): past its steps it stops
+    {   LzxMakecab *m = LzxMakecabNew(21, 0x10000); CHECK(m != nullptr);
+        auto none = [](void *, const uint8_t *, uint32_t, uint32_t) { return 0; };
+        LzxMakecabLimit(m, 1000);
+        CHECK_EQ(LzxMakecabCompress(m, fs[0].data(), 32768, 12000000, 1, none, nullptr), (int)LZXMK_OVER);
+        CHECK_EQ(LzxMakecabSteps(m), (uint64_t)1001);
+        CHECK_EQ(LzxMakecabCompress(m, fs[0].data(), 32768, 12000000, 1, none, nullptr), (int)LZXMK_ERROR);   // (spent)
+        LzxMakecabFree(m);
+        m = LzxMakecabNew(21, 0x10000);
+        CHECK_EQ(LzxMakecabCompress(m, fs[0].data(), 32768, 12000000, 1, none, nullptr), (int)LZXMK_OK);
+        CHECK_EQ(LzxMakecabSteps(m), (uint64_t)298670);                 // every tree step counted, pinned
+        LzxMakecabFree(m); }
+    // a frame the family does not make, though its folder decodes alike: a padding bit of its last 16-bit word set (the
+    // frame differs from MAKECAB's in its last bytes only)
+    {   const size_t end = cab.size();                                    // folder 1's only frame ends the cabinet
+        bool found = false;
+        for (int bit = 0; bit < 16 && !found; ++bit) {
+            auto cab3 = cab; cab3[end - 2 + bit / 8] ^= (uint8_t)(1u << (bit % 8));
+            std::vector<uint8_t> c5, r5, c6, r6; std::string e5;
+            if (!coding::Mint(d, cab3.data(), cab3.size(), 0, 1 << 20, 2048, c6, r6, e5, false) || c6 != c1) continue;   // not a padding bit
+            found = true; e5.clear();
+            CHECK(coding::Mint(d, cab3.data(), cab3.size(), 0, 1 << 20, 2048, c5, r5, e5));
+            if (!e5.empty()) std::cerr << "  padding: " << e5 << "\n";
+            CHECK(c5 == c1 && lzxcab::decisions(r5) > 5 && lzxcab::decisions(r5) < lzxcab::decisions(r6)); }
+        CHECK(found); }
+    // the engine, not the description, has the last word: a description calling every folder the family's mints plain
+    // where the family is not at hand (a plain mint), and a closed folder has no frames
+    {   std::string tl = text; const std::string e = "\"lzxend (and ok (eq rem 0))\",";
+        CHECK(tl.find(e) != std::string::npos);
+        tl.replace(tl.find(e), e.size(), "\"lzxend 1\",");
+        coding::Description dl; CHECK(coding::Read(tl, dl, err));
+        std::vector<uint8_t> c11, r11; err.clear();
+        CHECK(coding::Mint(dl, cab.data(), cab.size(), 0, 1 << 20, 2048, c11, r11, err, false));
+        if (!err.empty()) std::cerr << "  claims all: " << err << "\n";
+        CHECK(c11 == c1 && r11.size() > 3 && r11[3] == 'R' && lzxcab::decisions(r11) == lzxcab::decisions(rp));
+        std::string ta = text;
+        ta.replace(ta.find(e), e.size(), e + " \"decode: lzxsize 0 t\", \"decode: assert (eq t 0xFFFFFFFF)\",");
+        coding::Description da; CHECK(coding::Read(ta, da, err));
+        std::vector<uint8_t> c12, r12; err.clear();
+        CHECK(coding::Mint(da, cab.data(), cab.size(), 0, 1 << 20, 2048, c12, r12, err));
+        if (!err.empty()) std::cerr << "  closed: " << err << "\n";
+        CHECK_EQ(lzxcab::decisions(r12), (uint64_t)5); }
+    // CODE never takes the family's frames for a folder that is not its (here: folder 1 of cab2, coded as it decodes, and a
+    // description asking for the family's frame there anyway)
+    {   std::string tc = text; const std::string at = "\"@cfnf\",";
+        CHECK(tc.find(at) != std::string::npos);
+        tc.replace(tc.find(at), at.size(), at + " \"code: lzxemit 0 e\",");
+        coding::Description dc; CHECK(coding::Read(tc, dc, err));
+        const auto cab2 = lzxcab::make(fs, {12000000, 11000000});
+        std::vector<uint8_t> c7, r7; err.clear();
+        CHECK(!coding::Mint(dc, cab2.data(), cab2.size(), 0, 1 << 20, 2048, c7, r7, err));
+        CHECK(err.find("not the family's") != std::string::npos);
+        if (err.find("not the family's") == std::string::npos) std::cerr << "  emit outside: " << err << "\n"; }
+    // folders past the window and MAKECAB's second partition (32 KiB + 64 KiB: the window slides): the knob's window and
+    // partition are the ones the compressor runs with
+    {   std::vector<uint8_t> big; for (int k = 0; k < 4; ++k) { big.insert(big.end(), fs[0].begin(), fs[0].end()); big[big.size() - 1 - (size_t)k * 977] ^= 0x5A; }
+        const std::vector<std::vector<uint8_t>> three = {fs[0], fs[1], big};
+        //MAKECAB's own (CompressionMemory=15; it put words.txt and more.bin in one folder): its window slides
+        std::vector<uint64_t> ss; const auto slide = lzxcab::make(three, {12000000, 12000000}, &ss, 0x10000, 15, {0, 1, 1}, 0x9D9);
+        CHECK(ss.size() == 2 && ss[0] == 746040 && ss[1] == 3396319);   // (the slides' copying counted too)
+        CHECK_EQ(slide.size(), (size_t)56656); CHECK_EQ(lzxcab::fnv(slide), (uint64_t)0xccf1d370595df203ull);
+        //and with folders of two windows (CompressionMemory 21, then 16): the second folder's knob is its own
+        std::vector<uint64_t> ms; const auto mixed = lzxcab::make(three, {12000000, 12000000}, &ms, 0x10000, 21, {0, 1, 1}, 0x9D9, {21, 16});
+        CHECK(ms.size() == 2 && ms[0] == 748420 && ms[1] == 4001477);   // (the count carried across the change of window)
+        CHECK_EQ(mixed.size(), (size_t)39536); CHECK_EQ(lzxcab::fnv(mixed), (uint64_t)0xc294e6b0aefe72ddull);
+        {   std::vector<uint8_t> c10, r10; err.clear();
+            CHECK(coding::Mint(d, mixed.data(), mixed.size(), 0, 1 << 22, 8192, c10, r10, err));
+            if (!err.empty()) std::cerr << "  mixed: " << err << "\n";
+            CHECK_EQ(lzxcab::decisions(r10), (uint64_t)(1 + 2 + 1 + 6)); }
+        {   std::vector<uint8_t> c9, r9; err.clear();
+            CHECK(coding::Mint(d, slide.data(), slide.size(), 0, 1 << 22, 8192, c9, r9, err));
+            if (!err.empty()) std::cerr << "  slide: " << err << "\n";
+            CHECK_EQ(lzxcab::decisions(r9), (uint64_t)(1 + 2 + 1 + 6)); }
+        const auto cab4 = lzxcab::make(three, {12000000, 12000000, 12000000}, nullptr, 0x10000, 15);
+        CHECK(cab4 != lzxcab::make(three, {12000000, 12000000, 12000000}, nullptr, 0x20000, 15));   // (the partition matters here)
+        CHECK(cab4 != lzxcab::make(three, {12000000, 12000000, 12000000}, nullptr, 0x10000, 16));   // (and the window)
+        std::vector<uint8_t> c8, r8; err.clear();
+        CHECK(coding::Mint(d, cab4.data(), cab4.size(), 0, 1 << 22, 8192, c8, r8, err));
+        if (!err.empty()) std::cerr << "  big: " << err << "\n";
+        CHECK_EQ(lzxcab::decisions(r8), (uint64_t)(5 + 1 + 5)); }        // folder 2: 160000 bytes, 5 blocks
+    // the family's ops need ISA 9, a window of 15..21 and a second partition of 1..32 frames
+    std::string t8 = text; t8.replace(t8.find("\"ISA\": 9"), 8, "\"ISA\": 8"); CHECK(!coding::Read(t8, d, err)); CHECK(err.find("newer") != std::string::npos);
+    std::string tk = text; tk.replace(tk.find(" 12000000 533 r"), 15, " 12000000 534 r"); CHECK(!coding::Read(tk, d, err));
+    std::string tz = text; tz.replace(tz.find(" 12000000 533 r"), 15, " 12000000 21 r"); CHECK(!coding::Read(tz, d, err));
 }
 
 TEST(a_description_newer_than_its_isa_is_refused) {
