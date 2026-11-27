@@ -40,17 +40,18 @@ struct Rd {
 
 // ================================================================================================ limits
 constexpr size_t kMaxEx = 65535, kMaxOps = 65535, kMaxTable = 1u << 20, kMaxTables = 16, kMaxArrays = 16, kMaxSlots = 1u << 22,
-                 kMaxHuff = 4, kMaxSym = 320, kMaxStack = 64;
-bool BinaryEx(uint8_t op) { return op >= EX_ADD && op <= EX_GE; }
+                 kMaxHuff = 4, kMaxSym = 1024, kMaxStack = 64;   // (LZX's main code: 256 + 8 x position slots, 656 at a 2 MiB window)
+bool BinaryEx(uint8_t op) { return (op >= EX_ADD && op <= EX_GE) || op == EX_DIV || op == EX_MOD; }
+bool DivEx(uint8_t op) { return op == EX_DIV || op == EX_MOD; }
 bool UnaryEx(uint8_t op) { return op == EX_BYTE || op == EX_TABLE || op == EX_ARR || op == EX_LOG2SLOT || (op >= EX_U16 && op <= EX_U32BE); }
-bool CodingOp(uint8_t op) { return op <= OP_HUFF; }
+bool CodingOp(uint8_t op) { return op <= OP_HUFF || op == OP_RAWBYTES; }
 
 } // namespace
 
 // ================================================================================================ the description format
 bool Validate(const Description &D, std::string &Err) {
     if (D.isa == 0 || D.isa > kIsa) { Err = "a description for a newer instruction set"; return false; }
-    if (D.coder > kBits || D.shift < 1 || D.shift > 15) { Err = "a description with an unknown coder"; return false; }
+    if (D.coder > kBits16M || D.shift < 1 || D.shift > 15 || (D.coder == kBits16M && D.isa < 7)) { Err = "a description with an unknown coder"; return false; }
     if (D.name.size() > 256) { Err = "a malformed description name"; return false; }
     if (D.nslots > kMaxSlots || D.nhuff > kMaxHuff || D.histbase + D.histlen > kRegs || D.tokK >= kRegs || D.tokL >= kRegs || D.tokSL >= kRegs || D.tokD >= kRegs)
     { Err = "a description whose header is out of range"; return false; }
@@ -64,7 +65,8 @@ bool Validate(const Description &D, std::string &Err) {
     }
     const size_t nops = D.ops.size(); if (nops == 0 || nops > kMaxOps) { Err = "a description without ops"; return false; }
     for (const Op &p : D.ops)
-        if (p.op >= OP_COUNT || p.modes > kAll || p.flags > kFree || (p.flags && !CodingOp(p.op)) || p.tgt >= kRegs ||
+        if (p.op >= OP_COUNT || p.modes > kAll || p.flags > (kFree | kBounded) || ((p.flags & kFree) && !CodingOp(p.op)) ||
+            ((p.flags & kBounded) && p.op != OP_HUFFRUN) || p.tgt >= kRegs ||
             p.x >= nex || p.v >= nex || p.m >= nex || p.target >= nops) { Err = "a malformed op"; return false; }
     if (D.entryStream >= nops || D.entryToken < -1 || D.entryToken >= (int32_t)nops) { Err = "an entry past the ops"; return false; }
     const size_t nt = D.tables.size(), na = D.arrays.size();
@@ -72,6 +74,8 @@ bool Validate(const Description &D, std::string &Err) {
     for (const auto &t : D.tables) if (t.size() > kMaxTable) { Err = "a table too large"; return false; }
     if (na > kMaxArrays) { Err = "too many arrays"; return false; }
     for (const auto &a : D.arrays) if (a.size() > kMaxTable) { Err = "an array too large"; return false; }
+    for (const Op &p : D.ops)
+        if (((p.flags & kBounded) || p.op == OP_RAWBYTES) && D.isa < 7) { Err = "an op newer than the instruction set it names"; return false; }
     { size_t tt = 0, ta = 0; for (const auto &t : D.tables) tt += t.size(); for (const auto &a : D.arrays) ta += a.size();
       if (tt > (16u << 20) || ta > (4u << 20)) { Err = "a description too large"; return false; } }
     // what the ops name must exist
@@ -83,13 +87,15 @@ bool Validate(const Description &D, std::string &Err) {
             ((p.op == OP_HMTF || p.op == OP_HPUSH) && (p.nb == 0 || p.tgt + p.nb > kRegs)) ||
             (p.op >= OP_HUFFRUN && D.isa < 3) ||
             (p.op == OP_HUFFRUN && (p.imm >= D.nhuff || p.nb >= kRegs)) ||
+            (p.op == OP_HUFFRUN && !(p.flags & kBounded) && !(D.ex[p.v].op == EX_CONST && D.ex[p.v].imm == 0)) ||   // (v: the bound's)
+            (p.op == OP_RAWBYTES && D.isa < 7) ||
             (p.op == OP_PREDICT && (D.isa < 5 || p.tgt + 3 > kRegs ||
                                     !((p.nb == kFamilyLz4hc && p.imm != 0 && p.imm <= kLz4hcMaxAttempts) || (p.nb == kFamilyZlib && ZlibParser::ValidKnob(p.imm)))));
         if (bad) { Err = "an op naming something the description lacks"; return false; }
     }
     for (const Ex &e : D.ex) {
         if ((e.op == EX_TABLE && e.imm >= nt) || (e.op == EX_ARR && e.imm >= na)) { Err = "an expression naming something the description lacks"; return false; }
-        if ((e.op == EX_STREAMPOS && D.isa < 4) || (e.op >= EX_U16 && e.op <= EX_U32BE && D.isa < 6)) { Err = "an expression newer than the instruction set it names"; return false; }
+        if ((e.op == EX_STREAMPOS && D.isa < 4) || (e.op >= EX_U16 && e.op <= EX_U32BE && D.isa < 6) || (DivEx(e.op) && D.isa < 7)) { Err = "an expression newer than the instruction set it names"; return false; }
     }
     return true;
 }
@@ -106,7 +112,8 @@ struct PriceInit { PriceInit() { for (uint32_t i = 8; i < 2048; i += 16) { uint3
 // folded, register and constant operands read in place, evaluation in index order. No recursion, no cycles.
 enum : uint8_t { M_ADD, M_ADDI, M_SUB, M_SUBI, M_RSUBI, M_MUL, M_MULI, M_SHL, M_SHLI, M_SHR, M_SHRI, M_AND, M_ANDI, M_OR, M_ORI, M_XOR, M_XORI,
                  M_LT, M_LTI, M_EQ, M_EQI, M_NE, M_NEI, M_GE, M_GEI, M_LDI, M_COPY,
-                 M_BYTE, M_TABLE, M_ARR, M_LOG2, M_BITPOS, M_DLEFT, M_XLEFT, M_INLEFT, M_SPOS, M_U16, M_U32, M_U16BE, M_U32BE };
+                 M_BYTE, M_TABLE, M_ARR, M_LOG2, M_BITPOS, M_DLEFT, M_XLEFT, M_INLEFT, M_SPOS, M_U16, M_U32, M_U16BE, M_U32BE,
+                 M_DIV, M_DIVI, M_MOD, M_MODI };
 struct Mu { uint8_t c; uint16_t d, a, b; uint32_t imm; };
 // An operand resolved once: a constant, a register, an AFFINE form (a constant plus up to four terms, each
 // ((src >> rs) & mask) << ls times mul, src a register or the content byte at a register + offset: what nearly every
@@ -131,11 +138,12 @@ struct Spec {
         for (size_t i = 0; i < n; ++i) {
             const Ex &e = D.ex[i];
             if (e.op == EX_CONST) { isConst[i] = 1; cval[i] = e.imm; continue; }
-            if (BinaryEx(e.op) && isConst[e.a] && isConst[e.b]) {
+            if (BinaryEx(e.op) && isConst[e.a] && isConst[e.b] && !(DivEx(e.op) && cval[e.b] == 0)) {   // (÷0: refused when it runs)
                 const uint32_t a = cval[e.a], b = cval[e.b]; uint32_t r = 0;
                 switch (e.op) { case EX_ADD: r = a + b; break; case EX_SUB: r = a - b; break; case EX_MUL: r = a * b; break; case EX_SHL: r = b >= 32 ? 0 : a << b; break;
                 case EX_SHR: r = b >= 32 ? 0 : a >> b; break; case EX_AND: r = a & b; break; case EX_OR: r = a | b; break; case EX_XOR: r = a ^ b; break;
-                case EX_LT: r = a < b; break; case EX_EQ: r = a == b; break; case EX_NE: r = a != b; break; case EX_GE: r = a >= b; break; }
+                case EX_LT: r = a < b; break; case EX_EQ: r = a == b; break; case EX_NE: r = a != b; break; case EX_GE: r = a >= b; break;
+                case EX_DIV: r = a / b; break; case EX_MOD: r = a % b; break; }
                 isConst[i] = 1; cval[i] = r; continue;
             }
             if (e.op == EX_LOG2SLOT && isConst[e.a]) { const uint32_t a = cval[e.a]; isConst[i] = 1; cval[i] = a < 4 ? a : 2 * (31 - (uint32_t)__builtin_clz(a)) + ((a >> (30 - __builtin_clz(a))) & 1); continue; }
@@ -169,14 +177,16 @@ struct Spec {
                                       e.op == EX_U16 ? M_U16 : e.op == EX_U32 ? M_U32 : e.op == EX_U16BE ? M_U16BE : e.op == EX_U32BE ? M_U32BE : M_SPOS;
                     mu.push_back({c, d, a, 0, e.imm}); continue;
                 }
-                static const uint8_t RR[] = {0, 0, M_ADD, M_SUB, M_MUL, M_SHL, M_SHR, M_AND, M_OR, M_XOR, M_LT, M_EQ, M_NE, M_GE};
-                static const uint8_t RI[] = {0, 0, M_ADDI, M_SUBI, M_MULI, M_SHLI, M_SHRI, M_ANDI, M_ORI, M_XORI, M_LTI, M_EQI, M_NEI, M_GEI};
+                static const uint8_t RR0[] = {0, 0, M_ADD, M_SUB, M_MUL, M_SHL, M_SHR, M_AND, M_OR, M_XOR, M_LT, M_EQ, M_NE, M_GE};
+                static const uint8_t RI0[] = {0, 0, M_ADDI, M_SUBI, M_MULI, M_SHLI, M_SHRI, M_ANDI, M_ORI, M_XORI, M_LTI, M_EQI, M_NEI, M_GEI};
+                const auto RR = [](uint8_t o) -> uint8_t { return o == EX_DIV ? (uint8_t)M_DIV : o == EX_MOD ? (uint8_t)M_MOD : RR0[o]; };
+                const auto RI = [](uint8_t o) -> uint8_t { return o == EX_DIV ? (uint8_t)M_DIVI : o == EX_MOD ? (uint8_t)M_MODI : RI0[o]; };
                 const bool ca = isConst[e.a], cb = isConst[e.b];
-                if (!ca && !cb) mu.push_back({RR[e.op], d, loc(e.a), loc(e.b), 0});
-                else if (cb) mu.push_back({RI[e.op], d, loc(e.a), 0, cval[e.b]});
-                else if (e.op == EX_ADD || e.op == EX_MUL || e.op == EX_AND || e.op == EX_OR || e.op == EX_XOR || e.op == EX_EQ || e.op == EX_NE) mu.push_back({RI[e.op], d, loc(e.b), 0, cval[e.a]});
+                if (!ca && !cb) mu.push_back({RR(e.op), d, loc(e.a), loc(e.b), 0});
+                else if (cb) mu.push_back({RI(e.op), d, loc(e.a), 0, cval[e.b]});
+                else if (e.op == EX_ADD || e.op == EX_MUL || e.op == EX_AND || e.op == EX_OR || e.op == EX_XOR || e.op == EX_EQ || e.op == EX_NE) mu.push_back({RI(e.op), d, loc(e.b), 0, cval[e.a]});
                 else if (e.op == EX_SUB) mu.push_back({M_RSUBI, d, loc(e.b), 0, cval[e.a]});
-                else { mu.push_back({M_LDI, d, 0, 0, cval[e.a]}); mu.push_back({RR[e.op], d, d, loc(e.b), 0}); }
+                else { mu.push_back({M_LDI, d, 0, 0, cval[e.a]}); mu.push_back({RR(e.op), d, d, loc(e.b), 0}); }
             }
             len[r] = (uint32_t)(mu.size() - start[r]);
         }
@@ -277,7 +287,7 @@ struct Spec {
     }
 };
 
-struct Huff { uint16_t code[kMaxSym]; uint8_t len[kMaxSym]; int16_t count[16], sym[kMaxSym]; int nsym = 0; };
+struct Huff { uint16_t code[kMaxSym], mcode[kMaxSym]; uint8_t len[kMaxSym]; int16_t count[17], sym[kMaxSym]; int nsym = 0; };   // code: bit-reversed (LSB-first coders); mcode: as is (BITS16M)
 
 // Content as the machine sees it: DECODE writes it; CODE reads it through a window over a ByteSource.
 struct Content {
@@ -430,6 +440,9 @@ struct Machine {
     uint64_t low = 0; uint32_t range = 0xFFFFFFFFu; uint8_t cache = 0; uint64_t cacheSize = 1; uint32_t code = 0;
     // bit coder
     uint64_t acc = 0; int bn = 0; uint64_t bipos = 0;
+    //DECODE, BITS16M: words are counted from where bits begin (a container's bitstream starts wherever its block does): wb
+    //is that bit position; after bytes (byterun, rawbytes) the next bits start a new run of words where they stand
+    uint64_t wb = 0; bool bytesMode = true;
     // bytes in (DECODE) / out (CODE)
     const uint8_t *in = nullptr; size_t inn = 0, ip = 0;
     std::vector<uint8_t> *out = nullptr;
@@ -502,6 +515,8 @@ struct Machine {
             case M_NE: o = x[m->a] != x[m->b]; break;    case M_NEI: o = x[m->a] != m->imm; break;
             case M_GE: o = x[m->a] >= x[m->b]; break;    case M_GEI: o = x[m->a] >= m->imm; break;
             case M_LDI: o = m->imm; break;
+            case M_DIV: case M_MOD: { const uint32_t b = x[m->b]; if (!b) { fail("a division by zero"); o = 0; } else o = m->c == M_DIV ? x[m->a] / b : x[m->a] % b; break; }
+            case M_DIVI: case M_MODI: if (!m->imm) { fail("a division by zero"); o = 0; } else o = m->c == M_DIVI ? x[m->a] / m->imm : x[m->a] % m->imm; break;
             case M_COPY: o = x[m->a]; break;
             case M_BYTE: { const uint32_t a = x[m->a]; o = M == kDecode ? (a < place() && a < X.cap ? X.w[a] : 0) : X.at(a); break; }
             case M_U16: case M_U32: case M_U16BE: case M_U32BE: {        // (each byte read as M_BYTE reads one)
@@ -516,11 +531,11 @@ struct Machine {
             case M_TABLE: { const uint32_t a = x[m->a]; const auto &t = D.tables[m->imm]; if (a >= t.size()) { fail("a table read out of range"); o = 0; } else o = t[a]; break; }
             case M_ARR: { const uint32_t a = x[m->a]; const auto &t = arr[m->imm]; if (a >= t.size()) { fail("an array read out of range"); o = 0; } else o = t[a]; break; }
             case M_LOG2: { const uint32_t a = x[m->a]; if (a < 4) o = a; else { const uint32_t z = 31 - (uint32_t)__builtin_clz(a); o = 2 * z + ((a >> (z - 1)) & 1); } break; }
-            case M_BITPOS: o = M == kDecode ? (uint32_t)(bipos & 7) : (uint32_t)(bn & 7); break;
+            case M_BITPOS: o = D.coder == kBits16M ? (M == kDecode ? (bytesMode ? 0u : (uint32_t)((bipos - wb) & 15)) : (uint32_t)(bn & 15)) : M == kDecode ? (uint32_t)(bipos & 7) : (uint32_t)(bn & 7); break;
             case M_DLEFT: o = (uint32_t)std::min<uint64_t>(0xFFFFFFFFu, Dc.total > Dc.consumed() ? Dc.total - Dc.consumed() : 0); break;
             case M_XLEFT: { const uint64_t sz = M == kDecode ? X.cap : X.size; o = sz > place() ? (uint32_t)std::min<uint64_t>(0xFFFFFFFFu, sz - place()) : 0; break; }
             case M_INLEFT: o = M == kDecode ? (uint32_t)std::min<uint64_t>(0xFFFFFFFFu, inn * 8 > bipos ? inn * 8 - bipos : 0) : 0; break;
-            case M_SPOS: o = (uint32_t)std::min<uint64_t>(0xFFFFFFFFu, M == kDecode ? (D.coder == kBits ? bipos >> 3 : ip) : M == kCode && out ? outBase + out->size() + copied + (uint64_t)(bn >> 3) : 0); break;
+            case M_SPOS: o = (uint32_t)std::min<uint64_t>(0xFFFFFFFFu, M == kDecode ? (D.coder != kRange ? bipos >> 3 : ip) : M == kCode && out ? outBase + out->size() + copied + (uint64_t)(bn >> 3) : 0); break;
             }
         }
         return x[res];
@@ -553,39 +568,54 @@ struct Machine {
     // ---- the bit coder
     void bput(uint32_t val, int n) {
         if (!n) return;
+        if (D.coder == kBits16M) {                                       // MSB-first into 16-bit words, each written low byte first
+            acc = (acc << n) | (val & (n >= 32 ? 0xFFFFFFFFu : ((1u << n) - 1))); bn += n;
+            while (bn >= 16) { const uint32_t w = (uint32_t)(acc >> (bn - 16)) & 0xFFFF; out->push_back((uint8_t)w); out->push_back((uint8_t)(w >> 8)); bn -= 16; }
+            acc &= bn ? ((1ull << bn) - 1) : 0; return;
+        }
         acc |= (uint64_t)(val & (n >= 32 ? 0xFFFFFFFFu : ((1u << n) - 1))) << bn; bn += n;
         while (bn >= 8) { out->push_back((uint8_t)acc); acc >>= 8; bn -= 8; }
     }
     uint32_t bget(int n) {
         uint32_t r = 0;
+        if (D.coder == kBits16M) {                                       // MSB-first from 16-bit little-endian words
+            if (bytesMode) { wb = bipos; bytesMode = false; }               // (bytes leave the position byte-aligned)
+            for (int i = 0; i < n; ++i) {
+                const uint64_t rel = bipos - wb, b = rel & 15, q = (wb >> 3) + (rel >> 4) * 2 + (b < 8 ? 1 : 0);
+                if (q >= inn) { fail("the stream ends early"); return 0; }
+                r = (r << 1) | ((in[q] >> (b < 8 ? 7 - b : 15 - b)) & 1); ++bipos;
+            }
+            return r;
+        }
         for (int i = 0; i < n; ++i) { const uint64_t q = bipos >> 3; if (q >= inn) { fail("the stream ends early"); return 0; } r |= (uint32_t)((in[q] >> (bipos & 7)) & 1) << i; ++bipos; }
         return r;
     }
     bool build(int t, const uint32_t *len, uint32_t n) {
         Huff &h = hf[t];
-        if (n > kMaxSym) return fail("a code with too many symbols");
+        if (n > kMaxSym || (D.isa < 7 && n > 320)) return fail("a code with too many symbols");
         memset(h.count, 0, sizeof h.count); h.nsym = (int)n; hlens[t].assign(n, 0);
-        for (uint32_t s = 0; s < n; ++s) { if (len[s] > 15) return fail("a code length over 15"); h.count[len[s]]++; h.len[s] = (uint8_t)len[s]; hlens[t][s] = (uint8_t)len[s]; }
+        //lengths to 15 (16 from ISA 7: LZX's pretree adds mod 17)
+        for (uint32_t s = 0; s < n; ++s) { if (len[s] > (D.isa < 7 ? 15u : 16u)) return fail("a code length over its instruction set's"); h.count[len[s]]++; h.len[s] = (uint8_t)len[s]; hlens[t][s] = (uint8_t)len[s]; }
         h.count[0] = 0; int left = 1;
-        for (int l = 1; l < 16; ++l) { left <<= 1; left -= h.count[l]; if (left < 0) return fail("an over-subscribed code"); }
-        int16_t offs[16] = {0}; for (int l = 1; l < 15; ++l) offs[l + 1] = (int16_t)(offs[l] + h.count[l]);
+        for (int l = 1; l < 17; ++l) { left <<= 1; left -= h.count[l]; if (left < 0) return fail("an over-subscribed code"); }   // (lengths to 16: LZX's)
+        int16_t offs[17] = {0}; for (int l = 1; l < 16; ++l) offs[l + 1] = (int16_t)(offs[l] + h.count[l]);
         for (uint32_t s = 0; s < n; ++s) if (len[s]) h.sym[offs[len[s]]++] = (int16_t)s;
-        int next[16] = {0}, c = 0; for (int l = 1; l < 16; ++l) { c = (c + h.count[l - 1]) << 1; next[l] = c; }
-        for (uint32_t s = 0; s < n; ++s) { if (!len[s]) continue; int cc = next[len[s]]++, rv = 0; for (uint32_t i = 0; i < len[s]; ++i) { rv = (rv << 1) | (cc & 1); cc >>= 1; } h.code[s] = (uint16_t)rv; }
+        int next[17] = {0}, c = 0; for (int l = 1; l < 17; ++l) { c = (c + h.count[l - 1]) << 1; next[l] = c; }
+        for (uint32_t s = 0; s < n; ++s) { if (!len[s]) continue; int cc = next[len[s]]++, rv = 0; h.mcode[s] = (uint16_t)cc; for (uint32_t i = 0; i < len[s]; ++i) { rv = (rv << 1) | (cc & 1); cc >>= 1; } h.code[s] = (uint16_t)rv; }
         return true;
     }
     uint32_t huff(int t, uint32_t sym) {
         Huff &h = hf[t];
         if (mode == kDecode) {
             int c = 0, first = 0, index = 0;
-            for (int l = 1; l < 16; ++l) { c |= (int)bget(1); if (why) return 0; const int k = h.count[l];
+            for (int l = 1; l < 17; ++l) { c |= (int)bget(1); if (why) return 0; const int k = h.count[l];
                 if (c - k < first) return (uint32_t)h.sym[index + (c - first)];
                 index += k; first += k; first <<= 1; c <<= 1; }
             fail("a code its table does not have"); return 0;
         }
         if ((int)sym >= h.nsym || !h.len[sym]) { fail("a symbol its code cannot say"); return sym; }
         if (mode == kPrice) { price += (uint32_t)h.len[sym] << 4; return sym; }
-        bput(h.code[sym], h.len[sym]); return sym;
+        bput(D.coder == kBits16M ? h.mcode[sym] : h.code[sym], h.len[sym]); return sym;
     }
     bool slots(uint32_t at, uint32_t n) { if ((uint64_t)at + n > slot.size()) return fail("a slot out of range"); return true; }
     // the family's token anchored at At, from its parse of the block [Lo, Hi): false refuses (a block the content does not
@@ -682,7 +712,7 @@ struct Machine {
         uint32_t tick = 0, val = 0; const Ins *op_ = nullptr;
         // DIRECT THREADING: every handler ends with its own jump to the next one (computed goto), so the branch predictor
         // learns per-instruction patterns instead of one shared switch. Table order = OpCode order, then the fused ones.
-        static const void *const J[] = { &&L_OP_BIT, &&L_OP_TREE, &&L_OP_RTREE, &&L_OP_DIRECT, &&L_OP_MLIT, &&L_OP_RAW, &&L_OP_HUFF, &&L_OP_BUILD, &&L_OP_STA, &&L_OP_SET, &&L_OP_DEC, &&L_OP_OUTLIT, &&L_OP_OUTCOPY, &&L_OP_HMTF, &&L_OP_HPUSH, &&L_OP_JZ, &&L_OP_JMP, &&L_OP_CALL, &&L_OP_RET, &&L_OP_ASSERT, &&L_OP_FLUSH, &&L_OP_MARK, &&L_OP_END, &&L_OP_HUFFRUN, &&L_OP_BYTERUN, &&L_OP_PREDICT, &&L_F_BITJZ, &&L_F_SETBITJZ, &&L_F_DECN, &&L_F_OFFEND };
+        static const void *const J[] = { &&L_OP_BIT, &&L_OP_TREE, &&L_OP_RTREE, &&L_OP_DIRECT, &&L_OP_MLIT, &&L_OP_RAW, &&L_OP_HUFF, &&L_OP_BUILD, &&L_OP_STA, &&L_OP_SET, &&L_OP_DEC, &&L_OP_OUTLIT, &&L_OP_OUTCOPY, &&L_OP_HMTF, &&L_OP_HPUSH, &&L_OP_JZ, &&L_OP_JMP, &&L_OP_CALL, &&L_OP_RET, &&L_OP_ASSERT, &&L_OP_FLUSH, &&L_OP_MARK, &&L_OP_END, &&L_OP_HUFFRUN, &&L_OP_BYTERUN, &&L_OP_PREDICT, &&L_OP_RAWBYTES, &&L_F_BITJZ, &&L_F_SETBITJZ, &&L_F_DECN, &&L_F_OFFEND };
         static_assert(sizeof(J) / sizeof(J[0]) == F_OFFEND + 1, "dispatch table out of step with the opcodes");
         #define NEXT() do { if (__builtin_expect(!(++tick & 0xFFFF), 0)) { fuel += 0x10000; \
                 if (fuel > fuelBase + (1u << 22) + 512 * (progress() - std::min(prog0, progress()))) { fail("a description that works without making progress"); return 0; } } \
@@ -731,9 +761,11 @@ struct Machine {
             L_OP_HUFF: VALUE(); val = huff((int)op_->imm, val); if (why) return 0; GIVE(); NEXT();
             L_OP_HUFFRUN: {
                 Huff &h = hf[op_->imm]; uint32_t p = place(), n = 0;
+                const bool bounded = (op_->flags & kBounded) != 0; const uint32_t most = bounded ? opnd<M>(op_->v) : 0;   // ISA 7
                 if (M == kDecode) {
                     const uint32_t lim = opnd<M>(op_->m);
-                    for (;;) { const uint32_t sym = huff((int)op_->imm, 0); if (why) return 0;
+                    for (;;) { if (bounded && n >= most) { v[op_->nb] = 0xFFFFFFFFu; break; }
+                        const uint32_t sym = huff((int)op_->imm, 0); if (why) return 0;
                         if (sym >= lim || sym > 255) { v[op_->nb] = sym; break; }
                         if (p >= X.cap) { fail("more content than expected"); return 0; }
                         X.w[p++] = (uint8_t)sym; ++n; }
@@ -741,17 +773,19 @@ struct Machine {
                     n = opnd<M>(op_->x);
                     for (uint32_t i = 0; i < n; ++i) { const uint8_t c = X.at((uint64_t)p + i);
                         if (c >= h.nsym || !h.len[c]) { fail("a symbol its code cannot say"); return 0; }
-                        if (M == kPrice) price += (uint32_t)h.len[c] << 4; else bput(h.code[c], h.len[c]); }
-                    p += n; huff((int)op_->imm, v[op_->nb]); if (why) return 0;
+                        if (M == kPrice) price += (uint32_t)h.len[c] << 4; else bput(D.coder == kBits16M ? h.mcode[c] : h.code[c], h.len[c]); }
+                    p += n; if (!(bounded && n == most)) huff((int)op_->imm, v[op_->nb]); if (why) return 0;   // (ran out: no end symbol)
                 }
                 v[op_->tgt] = n; v[kRegPlace] = p; CHECK_NEXT(); }
             L_OP_BYTERUN: {
-                if (D.coder != kBits) { fail("a byte run outside the bit coder"); return 0; }
+                if (D.coder == kRange) { fail("a byte run outside the bit coder"); return 0; }
                 const uint32_t n = opnd<M>(op_->x), p = place();
+                if (D.coder == kBits16M && ((M == kDecode && !bytesMode && ((bipos - wb) & 15)) || (M == kCode && bn))) { fail("a byte run off a word boundary"); return 0; }
                 if (M == kDecode) {
                     if ((uint64_t)p + n > X.cap) { fail("more content than expected"); return 0; }
                     if (!(bipos & 7)) { const uint64_t q = bipos >> 3; if (q + n > inn) { fail("the stream ends early"); return 0; } if (n) memcpy(X.w + p, in + q, n); bipos += 8ull * n; }
                     else for (uint32_t i = 0; i < n; ++i) { X.w[p + i] = (uint8_t)bget(8); if (why) return 0; }
+                    if (D.coder == kBits16M) bytesMode = true;
                 } else if (M == kPrice) price += n << 7;
                 else if (!bn) {
                     if (runs && n >= kRunMin) {
@@ -761,6 +795,18 @@ struct Machine {
                 }
                 else for (uint32_t i = 0; i < n; ++i) bput(X.at((uint64_t)p + i), 8);
                 v[kRegPlace] = p + n; CHECK_NEXT(); }
+            L_OP_RAWBYTES: { VALUE();
+                const uint32_t n = opnd<M>(op_->x);
+                if (n < 1 || n > 4) { fail("rawbytes takes 1 to 4 bytes"); return 0; }
+                if (D.coder == kRange) { fail("bytes outside the bit coder"); return 0; }
+                if (M == kDecode) {
+                    if (D.coder == kBits16M ? (!bytesMode && ((bipos - wb) & 15)) : (bipos & 7) != 0) { fail("bytes off a byte boundary"); return 0; }
+                    const uint64_t q = bipos >> 3; if (q + n > inn) { fail("the stream ends early"); return 0; }
+                    val = 0; for (uint32_t k = 0; k < n; ++k) val |= (uint32_t)in[q + k] << (8 * k);
+                    bipos += 8ull * n; if (D.coder == kBits16M) bytesMode = true;
+                } else if (M == kPrice) price += n << 7;
+                else { if (bn) { fail("bytes off a byte boundary"); return 0; } for (uint32_t k = 0; k < n; ++k) out->push_back((uint8_t)(val >> (8 * k))); }
+                GIVE(); NEXT(); }
             L_OP_PREDICT: {
                 uint32_t t[3] = {0, kNoPrediction, 0};
                 if (M != kPrice && !noPredict && (M != kDecode || wholeContent)) {
@@ -800,7 +846,7 @@ struct Machine {
             L_OP_CALL: if (why) return 0; if (stk.size() >= kMaxStack) { fail("calls too deep"); return 0; } stk.push_back((int)ip_); ip_ = op_->target; NEXT();
             L_OP_RET: if (why) return 0; if (stk.size() == depth0) return leave(1); ip_ = (uint32_t)stk.back(); stk.pop_back(); NEXT();
             L_OP_ASSERT: if (!opnd<M>(op_->v)) { failOp = (int)op_->orig; fail("the stream breaks a rule of its format"); return 0; } CHECK_NEXT();
-            L_OP_FLUSH: if (M == kCode) { if (D.coder == kRange) for (int i = 0; i < 5; ++i) rcShift(); else if (bn) bput(0, 8 - bn); } CHECK_NEXT();
+            L_OP_FLUSH: if (M == kCode) { if (D.coder == kRange) for (int i = 0; i < 5; ++i) rcShift(); else if (bn) bput(0, (D.coder == kBits16M ? 16 : 8) - bn); } CHECK_NEXT();
             L_OP_MARK: if (why) return 0; if (M == kCode && out && out->size() + copied >= stopAt) return leave(2); NEXT();
             L_OP_END: if (why) return 0; return leave(1);
         #undef NEXT
@@ -836,7 +882,7 @@ struct Machine {
             if (k && !build(t, l.data(), (uint32_t)k)) return false;
             if (!k) hf[t].nsym = 0;
         }
-        if (r.bad || r.at != n || bn < 0 || bn > 7 || cacheSize > maxCache) return fail("a malformed checkpoint");
+        if (r.bad || r.at != n || bn < 0 || bn > (D.coder == kBits16M ? 15 : 7) || cacheSize > maxCache) return fail("a malformed checkpoint");
         return true;
     }
 };

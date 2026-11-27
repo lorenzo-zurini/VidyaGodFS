@@ -4343,6 +4343,141 @@ TEST(a_zlib_family_record_reads_through_parallel_segments) {
     CHECK(got == shipped);
 }
 
+// ISA 7, for LZX (CAB) and its kin: the BITS16M coder (bits MSB-first from 16-bit little-endian words, counted from where
+// the bits begin), RAWBYTES, a HUFFRUN bounded by a count (no end symbol), DIV and MOD, codes of up to 1024 symbols and
+// 16 bits. Streams are written here by an independent LZX-style bit writer; each description decodes its stream, codes
+// it back, and a reader restored at checkpoints (mid-word ones included) reads it back. Teeth: a word's bytes swapped;
+// bits LSB-first; words counted from the stream's start; restores limited to 7 pending bits; the run's end symbol
+// written when the count ran out; any ISA 7 piece let through under ISA 6; a division by zero let through.
+TEST(the_bits16m_coder_reads_lzx_order) {
+    struct W16 { std::vector<uint8_t> o; uint32_t acc = 0; int n = 0;
+        void bits(uint32_t v, int k) { for (int i = k - 1; i >= 0; --i) { acc = (acc << 1) | ((v >> i) & 1); if (++n == 16) { o.push_back((uint8_t)acc); o.push_back((uint8_t)(acc >> 8)); acc = 0; n = 0; } } }
+        void align(uint32_t fill = 0) { if (n) bits(fill ? 0xFFFF : 0, 16 - n); }
+        void byte(uint8_t b) { o.push_back(b); } };
+    std::string err;
+    // mint, then read back through a reader restored at every checkpoint (segments of `spacing` shipped bytes)
+    const auto roundTrip = [&](const coding::Description &d, const std::vector<uint8_t> &s, uint64_t spacing, std::vector<uint8_t> &content) {
+        std::vector<uint8_t> rec; err.clear();
+        if (!coding::Mint(d, s.data(), s.size(), 0, 1 << 16, spacing, content, rec, err)) { std::cerr << "  mint: " << err << "\n"; return false; }
+        auto src = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d)), std::make_shared<MemByteSource>(rec),
+                                                   std::make_shared<MemByteSource>(content), s.size(), err);
+        if (!src) { std::cerr << "  reader: " << err << "\n"; return false; }
+        std::vector<uint8_t> got(s.size());
+        for (size_t k = src->checkpoints(); k-- > 0;) {                    // each segment alone, from the back
+            const uint64_t at = s.size() * k / src->checkpoints(); if (!src->preadAll(got.data() + at, std::min<size_t>(3, s.size() - at), at)) return false; }
+        if (!src->preadAll(got.data(), got.size(), 0) || got != s) { std::cerr << "  read back differs\n"; return false; }
+        if (src->checkpoints() < 2) { std::cerr << "  only " << src->checkpoints() << " checkpoint(s)\n"; return false; }
+        return true;
+    };
+    // canonical code for lengths 1,2,3,3: 0, 10, 110, 111
+    const uint32_t code[4] = {0, 2, 6, 7}; const int clen[4] = {1, 2, 3, 3};
+    const std::string text = R"J({"NAME": "lzx-ish", "ISA": 7, "CODER": "BITS16M", "ARRAYS": {"lens": {"SIZE": 4, "INIT": [1, 2, 3, 3]}},
+      "HUFFS": ["h"], "REGISTERS": {"place": 0, "count": 1, "run": 2, "term": 3, "pad": 4, "q": 5, "padb": 6, "tail": 7, "i": 8, "c": 9, "z": 10}, "ENTRY": "@s",
+      "CODE": ["@s", "build h lens 0 4", "raw free 16 count", "set i 0",
+        "@lit", "mark", "jz (lt i count) @run", "huff h (byte place) c", "outlit c", "set i (add i 1)", "jmp @lit",
+        "@run", "mark", "raw free 16 count",
+        "huffrun h count run term 4 count",
+        "decode: assert (eq term 0xFFFFFFFF)", "assert (eq run count)",
+        "mark", "raw free (and (sub 16 (bitpos)) 15) pad",
+        "rawbytes free 4 q", "assert (eq q 0x11223344)",
+        "byterun 3",
+        "rawbytes free 1 padb",
+        "mark", "raw free 7 tail", "raw free (and (sub 16 (bitpos)) 15) z", "flush", "end"]})J";
+    coding::Description d; CHECK(coding::Read(text, d, err));
+    if (!err.empty()) std::cerr << "  read: " << err << "\n";
+    // three streams: zero pads; ones pads; a run that ends on a word boundary (no pad bits at all)
+    for (const auto &[pad, runLen] : std::vector<std::pair<uint32_t, int>>{{0, 700}, {1, 700}, {0, 0}}) {
+        std::vector<uint8_t> lits, run; std::mt19937 r(3); for (int i = 0; i < 300; ++i) lits.push_back((uint8_t)(r() % 4));
+        W16 w; w.bits((uint32_t)lits.size(), 16);
+        for (uint8_t c : lits) w.bits(code[c], clen[c]);
+        int n = runLen;
+        if (!n) {                                                          // as many as make the run end word-aligned
+            int bits = w.n + 16; std::mt19937 r2(4);
+            while (true) { const uint8_t c = (uint8_t)(r2() % 4); run.push_back(c); bits += clen[c]; if (run.size() > 50 && bits % 16 == 0) break; }
+            n = (int)run.size();
+        } else { std::mt19937 r2(4); for (int i = 0; i < n; ++i) run.push_back((uint8_t)(r2() % 4)); }
+        w.bits((uint32_t)n, 16); for (uint8_t c : run) w.bits(code[c], clen[c]);
+        w.align(pad); for (uint8_t bt : {0x44, 0x33, 0x22, 0x11}) w.byte(bt);
+        for (uint8_t bt : {'x', 'y', 'z'}) w.byte(bt);
+        w.byte(0); w.bits(0x55, 7); w.align(pad);
+        std::vector<uint8_t> content;
+        const bool ok = roundTrip(d, w.o, 16, content); CHECK(ok);
+        if (!ok) std::cerr << "  (stream: pad " << pad << ", run " << runLen << ")\n";
+        std::vector<uint8_t> want = lits; want.insert(want.end(), run.begin(), run.end()); want.insert(want.end(), {'x', 'y', 'z'});
+        CHECK(content == want);
+    }
+    std::string printed; CHECK(coding::Print(d, printed, err)); coding::Description back; CHECK(coding::Read(printed, back, err));
+    CHECK(coding::Serialize(back) == coding::Serialize(d));
+    // a bitstream that begins at an odd byte (a CAB's LZX data starts wherever its block does)
+    {   W16 w2; for (uint8_t bt : {'h', 'd', 'r'}) w2.byte(bt);
+        W16 bits2; bits2.bits(0xABC, 12); bits2.bits(0x5, 4); bits2.bits(0x1234, 16); bits2.align();
+        w2.o.insert(w2.o.end(), bits2.o.begin(), bits2.o.end());
+        const std::string t2 = R"J({"NAME": "odd start", "ISA": 7, "CODER": "BITS16M", "ENTRY": "@s", "CODE": ["@s", "byterun 3",
+            "mark", "raw free 12 r1", "assert (eq r1 0xABC)", "mark", "raw free 4 r2", "assert (eq r2 5)", "raw free 16 r3", "assert (eq r3 0x1234)", "flush", "end"]})J";
+        coding::Description d2; CHECK(coding::Read(t2, d2, err)); std::vector<uint8_t> c2;
+        CHECK(roundTrip(d2, w2.o, 1, c2)); }
+    // bytes in the middle of a word are refused (a description that lost its alignment pad)
+    {   std::string t3 = text; t3.replace(t3.find("\"raw free (and (sub 16 (bitpos)) 15) pad\","), 42, "");
+        coding::Description d3; CHECK(coding::Read(t3, d3, err));
+        W16 w; w.bits(1, 16); w.bits(0, 1); w.bits(1, 16); w.bits(0, 1); w.align(); for (int k = 0; k < 8; ++k) w.byte(0x11);
+        std::vector<uint8_t> c3, r3; CHECK(!coding::Mint(d3, w.o.data(), w.o.size(), 0, 4096, 1 << 20, c3, r3, err));
+        CHECK(err.find("decode: bytes off a byte boundary") != std::string::npos); }
+    // LZX's codes: up to 1024 symbols, lengths up to 16. A complete code of lengths 1..15, 16, 16 on symbols 640..656 of
+    // a 700-symbol code: its symbols 656 (sixteen 1s) and 640 (one 0) read and written back
+    {   W16 w3; w3.bits(0xFFFF, 16); w3.bits(0x0, 1); w3.align();
+        std::string init; for (int k = 0; k < 640; ++k) init += "0, ";
+        for (int l = 1; l <= 15; ++l) { init += std::to_string(l) + ", "; }
+        init += "16, 16";
+        const std::string t4 = std::string(R"J({"NAME": "long codes", "ISA": 7, "CODER": "BITS16M", "ARRAYS": {"lens": {"SIZE": 700, "INIT": [)J") + init +
+            R"J(]}}, "HUFFS": ["g"], "ENTRY": "@s", "CODE": ["@s", "build g lens 0 700", "huff free g r1", "assert (eq r1 656)",
+            "huff free g r2", "assert (eq r2 640)", "raw free (and (sub 16 (bitpos)) 15) r3", "flush", "end"]})J";
+        coding::Description d4; err.clear(); CHECK(coding::Read(t4, d4, err)); std::vector<uint8_t> c4, r4;
+        CHECK(coding::Mint(d4, w3.o.data(), w3.o.size(), 0, 64, 1 << 20, c4, r4, err));
+        if (!err.empty()) std::cerr << "  long codes: " << err << "\n";
+        // the same code under ISA 6 (with the BITS coder): refused, it is ISA 7's
+        const std::string from4 = "\"ISA\": 7, \"CODER\": \"BITS16M\"";
+        std::string t4b = t4; t4b.replace(t4b.find(from4), from4.size(), "\"ISA\": 6, \"CODER\": \"BITS\"");
+        coding::Description d4b; CHECK(coding::Read(t4b, d4b, err));
+        CHECK(!coding::Mint(d4b, w3.o.data(), w3.o.size(), 0, 64, 1 << 20, c4, r4, err)); }
+    // a bound of 0 is a run of no literals (not "no bound": the next bits are not read as literals)
+    {   W16 w5; w5.bits(0, 16);
+        const std::string t5 = R"J({"NAME": "bound 0", "ISA": 7, "CODER": "BITS16M", "ARRAYS": {"lens": {"SIZE": 4, "INIT": [1, 2, 3, 3]}}, "HUFFS": ["h"],
+            "ENTRY": "@s", "CODE": ["@s", "build h lens 0 4", "huffrun h 0 r2 r3 4 0", "assert (eq r2 0)", "raw free 16 r4", "flush", "end"]})J";
+        coding::Description d5; CHECK(coding::Read(t5, d5, err)); std::vector<uint8_t> c5, r5;
+        CHECK(coding::Mint(d5, w5.o.data(), w5.o.size(), 0, 64, 1 << 20, c5, r5, err)); CHECK(c5.empty()); }
+    // each code limit of ISA 7 alone, on a valid LSB-first stream: more than 320 symbols; a 16-bit length
+    for (const std::string &init : {std::string("1, 1"), std::string("1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 16")}) {
+        const bool many = init == "1, 1"; const std::string size = many ? "321" : "17";
+        for (const char *isa : {"6", "7"}) {
+            const std::string t6 = std::string(R"J({"NAME": "limits", "ISA": )J") + isa + R"J(, "CODER": "BITS", "ARRAYS": {"lens": {"SIZE": )J" + size +
+                R"J(, "INIT": [)J" + init + R"J(]}}, "HUFFS": ["h"], "ENTRY": "@s", "CODE": ["@s", "build h lens 0 )J" + size +
+                R"J(", "huff free h r1", "raw free 7 r2", "end"]})J";
+            coding::Description d6; CHECK(coding::Read(t6, d6, err)); const uint8_t one[1] = {0}; std::vector<uint8_t> c6, r6;
+            const bool ok = coding::Mint(d6, one, 1, 0, 16, 1 << 20, c6, r6, err);
+            CHECK(ok == (std::string(isa) == "7"));
+            if (ok != (std::string(isa) == "7")) std::cerr << "  limits (" << (many ? "symbols" : "length") << ", ISA " << isa << "): " << err << "\n";
+        }
+    }
+    // a division by zero refuses the run, a constant divisor and a register one alike
+    for (const char *e : {"(div 100 r9)", "(mod 100 r9)", "(div r1 0)", "(mod r1 0)"}) {
+        const std::string t5 = std::string(R"J({"NAME": "div", "ISA": 7, "CODER": "BITS", "ENTRY": "@s", "CODE": ["@s", "raw free 8 r1", "set r2 )J") + e + R"J(", "end"]})J";
+        coding::Description d5; CHECK(coding::Read(t5, d5, err)); std::vector<uint8_t> c5, r5; const uint8_t one[1] = {7};
+        CHECK(!coding::Mint(d5, one, 1, 0, 16, 1 << 20, c5, r5, err)); CHECK(err.find("division by zero") != std::string::npos); }
+    // each of ISA 7's pieces under ISA 6: refused at read
+    for (const char *piece : {"\"rawbytes free 1 r1\"", "\"set r1 (div 7 2)\"", "\"set r1 (mod 7 2)\"", "\"huffrun h 4 r1 r2 4 r3\""}) {
+        const std::string t6 = std::string(R"J({"NAME": "old", "ISA": 6, "CODER": "BITS", "ARRAYS": {"lens": {"SIZE": 4, "INIT": [1, 2, 3, 3]}},
+            "HUFFS": ["h"], "ENTRY": "@s", "CODE": ["@s", "build h lens 0 4", )J") + piece + R"J(, "end"]})J";
+        coding::Description d6; CHECK(!coding::Read(t6, d6, err));
+        std::string t7 = t6; t7.replace(t7.find("\"ISA\": 6"), 8, "\"ISA\": 7"); CHECK(coding::Read(t7, d6, err)); }
+    {   coding::Description d8; CHECK(!coding::Read(R"J({"NAME": "c", "ISA": 6, "CODER": "BITS16M", "ENTRY": "@s", "CODE": ["@s", "end"]})J", d8, err)); }
+    // RAWBYTES in the LSB-first coder: bytes at a byte boundary, little-endian
+    {   const std::string lsb = R"J({"NAME": "lsb", "ISA": 7, "CODER": "BITS", "ENTRY": "@s", "CODE": ["@s", "raw free 8 r1",
+            "rawbytes free 2 r2", "assert (eq r2 0xBEEF)", "raw free 3 r3", "flush", "end"]})J";
+        coding::Description d9; CHECK(coding::Read(lsb, d9, err));
+        const std::vector<uint8_t> s9 = {0x7A, 0xEF, 0xBE, 0x05}; std::vector<uint8_t> c9, r9;
+        CHECK(coding::Mint(d9, s9.data(), s9.size(), 0, 64, 1 << 20, c9, r9, err)); }
+}
+
 TEST(a_description_newer_than_its_isa_is_refused) {
     auto d = coding::BsaDescription(0); auto bytes = coding::Serialize(d);
     coding::Description back; std::string err;

@@ -28,7 +28,7 @@ using ojson = nlohmann::ordered_json;
 
 // ---- operand signatures: what each op's text names, in order (fields not named must be their defaults)
 enum Kind : char { kE = 'E', kR = 'R', kN = 'N', kH = 'H', kA = 'A', kF = 'F', kK = 'K', kL = 'L', kB = 'B' };
-struct Arg { char kind, field; };                   // field: x v m t(tgt) n(nb) i(imm) l(target)
+struct Arg { char kind, field; bool opt = false; };  // field: x v m t(tgt) n(nb) i(imm) l(target); opt: may be left out (0)
 struct Sig { const char *name; std::vector<Arg> args; bool freeable; };
 const std::vector<Sig> &Sigs() {
     static const std::vector<Sig> s = {
@@ -55,13 +55,14 @@ const std::vector<Sig> &Sigs() {
         {"flush", {}, false},
         {"mark", {}, false},
         {"end", {}, false},
-        {"huffrun", {{kH, 'i'}, {kE, 'x'}, {kR, 't'}, {kB, 'n'}, {kE, 'm'}}, false},
+        {"huffrun", {{kH, 'i'}, {kE, 'x'}, {kR, 't'}, {kB, 'n'}, {kE, 'm'}, {kE, 'v', true}}, false},   // (ISA 7: a bound)
         {"byterun", {{kE, 'x'}}, false},
         {"predict", {{kF, 'n'}, {kK, 'i'}, {kR, 't'}, {kE, 'x'}, {kE, 'v'}, {kE, 'm'}}, false},
+        {"rawbytes", {{kE, 'x'}, {kE, 'v'}, {kR, 't'}}, true},
     };
     return s;
 }
-static_assert(OP_COUNT == 26, "an op without a text form: add its signature");
+static_assert(OP_COUNT == 27, "an op without a text form: add its signature");
 
 struct ExName { const char *name; uint8_t op; int arity; };   // arity -1: (table|arr NAME value)
 const std::vector<ExName> &ExNames() {
@@ -71,11 +72,11 @@ const std::vector<ExName> &ExNames() {
         {"ne", EX_NE, 2}, {"ge", EX_GE, 2}, {"byte", EX_BYTE, 1}, {"table", EX_TABLE, -1}, {"arr", EX_ARR, -1},
         {"log2slot", EX_LOG2SLOT, 1}, {"bitpos", EX_BITPOS, 0}, {"dleft", EX_DLEFT, 0}, {"xleft", EX_XLEFT, 0},
         {"inleft", EX_INLEFT, 0}, {"streampos", EX_STREAMPOS, 0},
-        {"u16", EX_U16, 1}, {"u32", EX_U32, 1}, {"u16be", EX_U16BE, 1}, {"u32be", EX_U32BE, 1},
+        {"u16", EX_U16, 1}, {"u32", EX_U32, 1}, {"u16be", EX_U16BE, 1}, {"u32be", EX_U32BE, 1}, {"div", EX_DIV, 2}, {"mod", EX_MOD, 2},
     };
     return s;
 }
-static_assert(EX_COUNT == 27, "an expression without a text form: add its name");
+static_assert(EX_COUNT == 29, "an expression without a text form: add its name");
 
 const char *FamilyName(uint8_t f) { return f == kFamilyLz4hc ? "lz4hc" : f == kFamilyZlib ? "zlib" : nullptr; }
 
@@ -158,7 +159,7 @@ bool Print(const Description &D, std::string &Out, std::string &Err, const TextN
     auto field = [&](const char *k, const std::string &v) { o += "  \""; o += k; o += "\": "; o += v; o += ",\n"; };
     field("NAME", Quote(D.name));
     field("ISA", std::to_string(D.isa));
-    field("CODER", D.coder == kBits ? "\"BITS\"" : "\"RANGE\"");
+    field("CODER", D.coder == kBits ? "\"BITS\"" : D.coder == kBits16M ? "\"BITS16M\"" : "\"RANGE\"");
     if (D.shift != 5) field("SHIFT", std::to_string(D.shift));
     if (D.nslots) field("SLOTS", std::to_string(D.nslots));
     if (D.window) field("WINDOW", std::to_string(D.window));
@@ -211,11 +212,14 @@ bool Print(const Description &D, std::string &Out, std::string &Err, const TextN
         line += s.name;
         const bool fr = (p.flags & kFree) != 0;
         if (fr) line += " free";
+        if ((p.flags & kBounded) && p.op != OP_HUFFRUN) { Err = "a bound on an op that has none"; return false; }
         bool used[7] = {};                               // x v m t n i l
         auto idx = [](char f) { return std::string("xvmtnil").find(f); };
         for (const Arg &a : s.args) {
             if (fr && a.field == 'v') { used[1] = true; if (!ZeroEx(D, p.v)) { Err = "a free op with a value"; return false; } continue; }
-            used[idx(a.field)] = true; line += " ";
+            used[idx(a.field)] = true;
+            if (a.opt && !(p.flags & kBounded)) continue;                // (the bound: printed only on a bounded run)
+            line += " ";
             switch (a.kind) {
                 case kE: if (!P.ex(a.field == 'x' ? p.x : a.field == 'v' ? p.v : p.m, line)) { Err = P.err; return false; } break;
                 case kR: line += P.reg(p.tgt); break;
@@ -230,7 +234,8 @@ bool Print(const Description &D, std::string &Out, std::string &Err, const TextN
         }
         // whatever the text does not name must be its default, or the text would not say what the op does
         if ((!used[0] && !ZeroEx(D, p.x)) || (!used[1] && !ZeroEx(D, p.v)) || (!used[2] && !ZeroEx(D, p.m)) ||
-            (!used[3] && p.tgt) || (!used[4] && p.nb) || (!used[5] && p.imm) || (!used[6] && p.target) || (fr && !s.freeable))
+            (!used[3] && p.tgt) || (!used[4] && p.nb) || (!used[5] && p.imm) || (!used[6] && p.target) || (fr && !s.freeable) ||
+            (!(p.flags & kBounded) && p.op == OP_HUFFRUN && !ZeroEx(D, p.v)))
         { Err = "op " + std::to_string(i) + " (" + s.name + ") sets a field its text form does not name"; return false; }
         o += "    " + Quote(line) + (i + 1 < D.ops.size() ? ",\n" : "\n");
         if (o.size() > P.cap) { Err = "a description too large to print"; return false; }
@@ -361,6 +366,8 @@ struct Reader {
         if (sg.freeable && peek() == "free") { fr = true; ++at; p.flags = kFree; }
         for (const Arg &a : sg.args) {
             if (fr && a.field == 'v') continue;
+            if (a.opt && !more()) continue;                              // left out: no bound
+            if (a.opt) p.flags |= kBounded;                              // given: a bounded run (0 too)
             uint32_t v = 0; uint16_t e = 0;
             switch (a.kind) {
                 case kE: if (!value(e)) return false; (a.field == 'x' ? p.x : a.field == 'v' ? p.v : p.m) = e; break;
@@ -417,7 +424,7 @@ bool Read(const std::string &Text, Description &Out, std::string &Err, TextNames
     D.name = J["NAME"].get<std::string>();
     if (!J.contains("ISA") || !U32(J["ISA"], D.isa)) return bad("a description needs its ISA");
     if (!J.contains("CODER") || !J["CODER"].is_string()) return bad("a description needs its CODER (BITS or RANGE)");
-    { const std::string c = J["CODER"].get<std::string>(); if (c == "BITS") D.coder = kBits; else if (c == "RANGE") D.coder = kRange; else return bad("no such coder: " + c); }
+    { const std::string c = J["CODER"].get<std::string>(); if (c == "BITS") D.coder = kBits; else if (c == "BITS16M") D.coder = kBits16M; else if (c == "RANGE") D.coder = kRange; else return bad("no such coder: " + c); }
     auto num = [&](const char *k, uint32_t &dst, uint32_t max) {
         if (!J.contains(k)) return true;
         if (!U32(J[k], dst) || dst > max) { Err = std::string("a bad ") + k; return false; }

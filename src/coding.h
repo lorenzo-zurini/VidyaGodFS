@@ -28,7 +28,8 @@
 
 namespace coding {
 
-constexpr uint32_t kIsa = 6;          // the instruction set a description may use; newer is refused (3: HUFFRUN, BYTERUN; 4: STREAMPOS; 5: PREDICT; 6: U16 U32 U16BE U32BE)
+constexpr uint32_t kIsa = 7;          // the instruction set a description may use; newer is refused (3: HUFFRUN, BYTERUN; 4: STREAMPOS; 5: PREDICT; 6: U16 U32 U16BE U32BE;
+                                      // 7: the BITS16M coder, RAWBYTES, DIV MOD, a bounded HUFFRUN)
 constexpr int kRegs = 64;
 constexpr int kRegPlace = 0;          // register 0: the place in the content
 constexpr uint32_t kNoSlot = 255;
@@ -36,7 +37,10 @@ constexpr uint32_t kNoPrediction = 0xFFFFFFFFu;
 constexpr uint8_t kFamilyLz4hc = 1;
 
 enum Mode : uint8_t { kCode = 1, kDecode = 2, kPrice = 4, kAll = 7, kCodePrice = 5 };
-enum Coder : uint8_t { kRange = 0, kBits = 1 };
+// kBits: bits LSB-first (deflate). kBits16M (ISA 7): bits MSB-first from 16-bit little-endian words (LZX), the words
+// counted from where the bits begin (after bytes, the next bits start a new run of words where they stand: a container's
+// bitstream begins wherever its block does); byte runs and RAWBYTES at word boundaries of the bits before them.
+enum Coder : uint8_t { kRange = 0, kBits = 1, kBits16M = 2 };
 
 enum ExOp : uint8_t {
     EX_CONST, EX_REG, EX_ADD, EX_SUB, EX_MUL, EX_SHL, EX_SHR, EX_AND, EX_OR, EX_XOR, EX_LT, EX_EQ, EX_NE, EX_GE,
@@ -54,6 +58,9 @@ enum ExOp : uint8_t {
     EX_U32,       // the little-endian 32-bit integer at a
     EX_U16BE,     // big-endian 16 bits at a
     EX_U32BE,     // big-endian 32 bits at a
+    // ---- ISA 7
+    EX_DIV,       // a / b (b 0: the run is refused)
+    EX_MOD,       // a % b (b 0: the run is refused)
     EX_COUNT
 };
 enum OpCode : uint8_t {
@@ -75,16 +82,22 @@ enum OpCode : uint8_t {
     // ---- ISA 3: runs (22.12 flattening: a run of literals is one op, not one program per byte)
     OP_HUFFRUN,  // a run of literals through code imm: CODE emits x content bytes then the terminating symbol in register nb;
                  // DECODE reads symbols below m as literals (into the content) until one is not, which goes to register nb;
-                 // register tgt gets the run's length either way
+                 // register tgt gets the run's length either way. ISA 7, flag kBounded: v BOUNDS the run (LZX: no end
+                 // symbol): DECODE stops after v literals (register nb then 0xFFFFFFFF: "the count ran out"), and CODE
+                 // writes no terminating symbol when the run's length is v
     OP_BYTERUN,  // x content bytes through the bit coder as they are (byte-aligned: copied whole)
     // ---- ISA 5: encoder families (22.15.4: a family predicts the encoder's decisions, so a record holds corrections)
     OP_PREDICT,  // registers tgt, tgt+1, tgt+2 = family nb's predicted token anchored at content place x, from its parse of
                  // the content [v, m) (a block), knob imm. Family 1: LZ4 high compression (lz4family.h), imm = its attempts;
                  // the token is (literals, copy length, distance), copy length 0 the block's last; no prediction at x (or a
                  // run that predicts nothing: PRICE, a plain mint) gives copy length kNoPrediction
+    // ---- ISA 7
+    OP_RAWBYTES, // x (1..4) stream bytes as a little-endian integer, at a byte boundary (BITS16M: a word boundary of the bits
+                 // before it, or after bytes); a coding op (`free` makes it a decision)
     OP_COUNT
 };
 constexpr uint8_t kFree = 1;          // op flag: its value is a decision
+constexpr uint8_t kBounded = 2;       // op flag (HUFFRUN, ISA 7): v bounds the run (0 too: a run of no literals)
 
 struct Ex { uint8_t op = 0; uint16_t a = 0, b = 0; uint32_t imm = 0; };
 struct Op { uint8_t op = 0, modes = 0, flags = 0, nb = 0, tgt = 0; uint16_t x = 0, v = 0, m = 0, target = 0; uint32_t imm = 0; };
