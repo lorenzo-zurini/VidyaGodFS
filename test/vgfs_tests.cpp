@@ -3992,6 +3992,59 @@ TEST(a_record_the_mint_accepts_every_reader_can_read) {
     CHECK(coding::Mint(famD, bsa.data(), bsa.size(), 0, want.size() + 4096, 1u << 20, content, rec, err, false));
 }
 
+// A mount reads a predicted record for as long as it lives: re-reading (segments decoded again, parses evicted) never runs
+// the stream's parse budget out (adversary 2026-11-27: the 4th full read of one source failed). Teeth: charge every
+// parse, not every distinct block.
+TEST(a_predicted_record_reads_again_and_again) {
+    std::vector<uint8_t> data(4u << 20); std::mt19937 r(13); for (auto &x : data) x = (uint8_t)(r() & 3);
+    std::vector<BsaMember> ms;
+    for (int i = 0; i < 16; ++i) ms.push_back({ "m" + std::to_string(i) + ".dds", std::vector<uint8_t>(data.begin() + i * (256 << 10), data.begin() + (i + 1) * (256 << 10)), false, 64 });
+    std::vector<uint8_t> want; const auto bsa = makeBsa({{"t", ms}}, 0x7, want);
+    const auto famD = coding::BsaDescription(512);
+    std::vector<uint8_t> content, rec; std::string err;
+    CHECK(coding::Mint(famD, bsa.data(), bsa.size(), 0, want.size() + 4096, 8u << 10, content, rec, err));
+    auto src = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(famD)), std::make_shared<MemByteSource>(rec),
+                                               std::make_shared<MemByteSource>(content), bsa.size(), err);
+    CHECK(src != nullptr); if (!src) return;
+    CHECK(src->checkpoints() > 40);                                      // more segments than the cache keeps: decoded again each pass
+    std::vector<uint8_t> all(bsa.size()); int good = 0;
+    for (int pass = 0; pass < 8; ++pass) if (src->preadAll(all.data(), all.size(), 0) && all == bsa) ++good;
+    CHECK_EQ(good, 8);
+}
+
+// The parser's work budget is exact: a parse stops at MaxSteps (never far past it), and Steps carries on across calls.
+TEST(the_family_parse_stops_at_its_budget) {
+    std::vector<uint8_t> s(1u << 20); std::mt19937 r(3); for (auto &x : s) x = (uint8_t)(r() & 1);
+    coding::Lz4hcParser P; std::vector<coding::Lz4Seq> q; uint64_t st = 0;
+    CHECK(!P.parse(s.data(), s.size(), 65536, q, st, 100000));
+    CHECK(st > 100000 && st <= 100000 + 8);                              // (each search on the way out adds one)
+    uint64_t st2 = 5; CHECK(P.parse(s.data(), 4096, 16, q, st2)); CHECK(st2 > 5);
+}
+
+// A predicted record over content that is not its own (one byte of a member changed) is refused by that segment's hash,
+// never served with the byte changed; a record claiming a stream far bigger than its content is refused by ExpandInto
+// itself. Teeth: skip the hash; drop the bound.
+TEST(a_predicted_record_refuses_content_not_its_own) {
+    const auto famD = coding::BsaDescription(512);
+    std::vector<uint8_t> want; const auto bsa = makeBsa({{"t", {{"a.dds", sampleContent(0, 300000, 61), false, 64}}}}, 0x7, want);
+    std::vector<uint8_t> content, rec; std::string err;
+    CHECK(coding::Mint(famD, bsa.data(), bsa.size(), 0, want.size() + 4096, 4096, content, rec, err));
+    auto other = content; other[other.size() - 5000] ^= 0x20;            // a member's byte (a literal or a copied one)
+    auto src = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(famD)), std::make_shared<MemByteSource>(rec),
+                                               std::make_shared<MemByteSource>(other), bsa.size(), err);
+    CHECK(src != nullptr);
+    if (src) { std::vector<uint8_t> all(bsa.size()); CHECK(!src->preadAll(all.data(), all.size(), 0)); }
+    // a record whose shipped size says 16x its content
+    auto big = rec; std::vector<uint8_t> h = {'V', 'G', 'C', 'Q'}; size_t at = 4; while (big[at] & 0x80) ++at; ++at;
+    for (uint64_t v = (uint64_t)content.size() * 16; ; v >>= 7) { if (v < 0x80) { h.push_back((uint8_t)v); break; } h.push_back((uint8_t)(v | 0x80)); }
+    h.insert(h.end(), big.begin() + (long)at, big.end());
+    std::vector<uint8_t> sb(content.size() * 16 + 16), cb(content.size()), plain;
+    CHECK(!coding::ExpandInto(std::make_shared<MemByteSource>(coding::Serialize(famD)), std::make_shared<MemByteSource>(h), std::make_shared<MemByteSource>(content),
+                              sb.data(), sb.size(), cb.data(), cb.size(), 4096, plain, err));
+    if (err.find("far bigger") == std::string::npos) std::fprintf(stderr, "  expand: %s\n", err.c_str());
+    CHECK(err.find("far bigger") != std::string::npos);
+}
+
 // PREDICT is ISA 5 and bounded: an ISA-4 description naming it, a family the reader lacks, and a knob past the limit are
 // refused.
 TEST(a_predict_op_is_checked) {

@@ -400,8 +400,19 @@ struct PredictCache {
     struct E { Seqs seqs; bool ready = false; uint64_t used = 0; };
     std::mutex mu; std::condition_variable cv; std::map<std::tuple<uint32_t, uint32_t, uint32_t>, E> m; uint64_t clock = 0;
     //the whole stream's parse work, every segment's together (a record of many tiny segments gets no allowance per
-    //segment): 128 steps a byte of the stream and its content, plus two of the largest blocks
+    //segment): 128 steps a byte of the stream and its content, plus two of the largest blocks. Each DISTINCT block is
+    //charged once, by its first parse: parsing it again (its parse evicted, a segment decoded again) is reading, which
+    //a mount does for as long as it lives, never a reason to refuse it
     std::atomic<uint64_t> steps{0}; uint64_t streamBudget = UINT64_MAX;
+    std::set<std::tuple<uint32_t, uint32_t, uint32_t>> charged;     // (guarded by mu)
+    bool isCharged(uint32_t Lo, uint32_t Hi, uint32_t Att) { std::lock_guard<std::mutex> l(mu); return charged.count({Lo, Hi, Att}) > 0; }
+    //(a million blocks at most are remembered: a real stream has thousands; past that every parse is charged again)
+    void charge(uint32_t Lo, uint32_t Hi, uint32_t Att, uint64_t S) {
+        std::lock_guard<std::mutex> l(mu);
+        if (charged.count({Lo, Hi, Att})) return;
+        steps += S;
+        if (charged.size() < (1u << 20)) charged.insert({Lo, Hi, Att});
+    }
     // the block [Lo, Hi)'s parse, made by `Make` here if no machine has it or is making it
     template <class F> Seqs get(uint32_t Lo, uint32_t Hi, uint32_t Att, F &&Make) {
         const auto k = std::make_tuple(Lo, Hi, Att);
@@ -608,10 +619,11 @@ struct Machine {
                 else if (X.mem) b = X.mem + Lo;
                 else { tmp.resize(Hi - Lo); if (!X.src->preadAll(tmp.data(), tmp.size(), Lo)) return false; b = tmp.data(); }
                 const uint64_t before = psteps, shared = pcache->steps.load();
-                const uint64_t room = pcache->streamBudget > shared ? pcache->streamBudget - shared : 0;
-                const bool ok = P->parse(b, Hi - Lo, Att, V, psteps, std::min(budget, before + room));
-                pcache->steps += psteps - before;
+                const bool again = pcache->isCharged(Lo, Hi, Att);             // parsed before: its work is paid
+                const uint64_t room = again ? UINT64_MAX : pcache->streamBudget > shared ? pcache->streamBudget - shared : 0;
+                const bool ok = P->parse(b, Hi - Lo, Att, V, psteps, room == UINT64_MAX ? budget : std::min(budget, before + room));
                 if (!ok) { over = true; return false; }
+                pcache->charge(Lo, Hi, Att, psteps - before);
                 return true;
             };
             if (!pcache) pcache = std::make_shared<PredictCache>();
@@ -872,7 +884,10 @@ bool MintInto(const Description &D, const uint8_t *Shipped, size_t N, size_t Con
         //from here on, as a reader restored at this checkpoint runs: its own parse budget and no parse at hand (a record
         //no reader could read is refused here, never minted)
         m.prog0 = m.progress(); m.fuelBase = m.fuel; m.psteps = 0; m.pseqs.reset();
-        { auto fresh = std::make_shared<PredictCache>(); fresh->steps = m.pcache->steps.load(); fresh->streamBudget = streamBudget; m.pcache = std::move(fresh); }
+        {   //a fresh parse cache (a reader there has none at hand), the stream's account carried over
+            auto fresh = std::make_shared<PredictCache>(); fresh->steps = m.pcache->steps.load(); fresh->streamBudget = streamBudget;
+            { std::lock_guard<std::mutex> l(m.pcache->mu); fresh->charged = m.pcache->charged; }
+            m.pcache = std::move(fresh); }
     }
     if (m.copied != N) { Err = "the stream does not code back to its own bytes"; return false; }
     if (m.Dc.consumed() != dec.size()) { Err = "decisions left over"; return false; }
@@ -1123,7 +1138,7 @@ bool ExpandInto(std::shared_ptr<ByteSource> Desc, std::shared_ptr<ByteSource> Re
     if (!C) return false;
     const uint64_t n = C->size(), cn = Content->size();
     //what a record says the stream's size is, the content must account for (a stream is its content coded, plus framing)
-    if (n > cn + cn / 8 + Record->size() + (64u << 20)) { Err = "the record claims a stream far bigger than its content"; return false; }
+    if (n > cn + cn / 8 + Record->size() + (1u << 20)) { Err = "the record claims a stream far bigger than its content"; return false; }
     if (n > ShippedCap || cn > ContentCap) { Err = "the buffers are too small for this stream"; return false; }
     // the shipped bytes, through the predicted record (read front to back: segments decode ahead in the pool)
     for (uint64_t at = 0; at < n;) {
