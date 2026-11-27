@@ -3736,6 +3736,49 @@ TEST(a_bsa_archive_is_served_through_its_description) {
     }
 }
 
+// Under a slow content read (a busy disk) and read-ahead far past the segment cache, readers on many threads still get
+// every byte: a segment decoded for a reader is never evicted before it is taken, and one gone anyway is decoded again
+// (Packagizer 2026-11-27: `coding verify` of a 1.8 GB BSA failed once with "read failed" under HDD load). Teeth: let
+// await return when its segment is gone (EIO); evict a segment a reader waits for.
+struct SlowSource : ByteSource {
+    std::shared_ptr<ByteSource> In;
+    explicit SlowSource(std::shared_ptr<ByteSource> S) : In(std::move(S)) {}
+    ssize_t pread(void *b, size_t n, uint64_t o) override { std::this_thread::sleep_for(std::chrono::microseconds(300)); return In->pread(b, n, o); }
+    uint64_t size() const override { return In->size(); }
+};
+TEST(a_coded_stream_reads_whole_under_slow_content_and_deep_read_ahead) {
+    const auto in = sampleContent(3, 1500000, 21);
+    std::vector<uint8_t> stream;                                          // stored deflate blocks of 8000 bytes
+    std::vector<uint8_t> s2;
+    for (size_t o = 0; o < in.size(); o += 8000) {
+        const size_t n = std::min<size_t>(8000, in.size() - o);
+        s2.push_back(o + n == in.size() ? 1 : 0);
+        s2.push_back((uint8_t)n); s2.push_back((uint8_t)(n >> 8)); s2.push_back((uint8_t)~n); s2.push_back((uint8_t)(~n >> 8));
+        s2.insert(s2.end(), in.begin() + (long)o, in.begin() + (long)(o + n));
+    }
+    stream = s2;
+    const auto d = coding::DeflateDescription();
+    std::vector<uint8_t> content, record; std::string err;
+    CHECK(coding::Mint(d, stream.data(), stream.size(), in.size(), in.size(), 256, content, record, err));
+    auto src = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d)), std::make_shared<MemByteSource>(record),
+                                               std::make_shared<SlowSource>(std::make_shared<MemByteSource>(content)), stream.size(), err);
+    CHECK(src != nullptr); if (!src) return;
+    CHECK(src->checkpoints() > 60);                                          // far more segments than the cache keeps
+    std::atomic<int> bad{0};
+    std::vector<std::thread> T;
+    for (int t = 0; t < 6; ++t)
+        T.emplace_back([&, t] {
+            std::vector<uint8_t> b(9000);
+            for (uint64_t o = (uint64_t)t * 3000; o < stream.size(); o += b.size()) {
+                const size_t n = (size_t)std::min<uint64_t>(b.size(), stream.size() - o);
+                src->prefetch(o + n, 8u << 20);                              // read-ahead far past the cache
+                if (!src->preadAll(b.data(), n, o) || memcmp(b.data(), stream.data() + o, n)) { ++bad; return; }
+            }
+        });
+    for (auto &x : T) x.join();
+    CHECK_EQ(bad.load(), 0);
+}
+
 // ISA 4: a description using STREAMPOS is refused by a parser that claims an older instruction set.
 TEST(a_description_newer_than_its_isa_is_refused) {
     auto d = coding::BsaDescription(); auto bytes = coding::Serialize(d);

@@ -908,7 +908,8 @@ struct CodedByteSource::Impl : std::enable_shared_from_this<CodedByteSource::Imp
         const size_t cap = 4 * Pool::Get().size() + 8;                       // keep a few: the least recently read go
         while (segs.size() > cap) {
             size_t victim = SIZE_MAX; uint64_t oldest = UINT64_MAX;
-            for (const auto &[j, t] : used) if (t < oldest && j != k) { oldest = t; victim = j; }
+            //never one a reader is waiting for: it was decoded for that reader, who has not taken it yet
+            for (const auto &[j, t] : used) if (t < oldest && j != k && !waits.count(j)) { oldest = t; victim = j; }
             if (victim == SIZE_MAX) break;
             segs.erase(victim); used.erase(victim);
         }
@@ -934,7 +935,9 @@ struct CodedByteSource::Impl : std::enable_shared_from_this<CodedByteSource::Imp
     void await(size_t j, std::unique_lock<std::mutex> &l) {
         while (!segs.count(j) && !bad.count(j)) {
             if (queued.count(j)) { run(j, l); continue; }
-            if (!running.count(j)) return;
+            //neither decoded, queued nor underway: decoded and gone again before this reader woke (read-ahead filled
+            //the cache under a slow content read) — decode it once more, here
+            if (!running.count(j)) { queued.insert(j); run(j, l); continue; }
             Waiters &w = waits[j]; ++w.n; w.cv.wait(l); if (--w.n == 0) waits.erase(j);
         }
     }
@@ -987,7 +990,9 @@ uint64_t CodedByteSource::bytesGenerated() const { return I->generated.load(); }
 void CodedByteSource::prefetch(uint64_t Off, uint64_t N) {
     if (Off >= Size || !N) return;
     std::lock_guard<std::mutex> g(I->mu);
-    I->ahead(I->segOf(Off), I->segOf(std::min<uint64_t>(Size - 1, Off + N - 1)) + 1);
+    //at most half the segments kept: asking further ahead only decodes what is evicted before it is read
+    const size_t From = I->segOf(Off), Cap = (4 * Pool::Get().size() + 8) / 2;
+    I->ahead(From, std::min<size_t>(I->segOf(std::min<uint64_t>(Size - 1, Off + N - 1)) + 1, From + Cap));
 }
 
 ssize_t CodedByteSource::pread(void *Buf, size_t N, uint64_t Off) {
