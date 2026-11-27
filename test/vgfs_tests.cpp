@@ -3822,7 +3822,7 @@ TEST(a_bsa_family_predicts_its_frames) {
     CHECK(coding::Mint(famD, bsa.data(), bsa.size(), 0, want.size() * 2, 4096, content, recQ, err)); CHECK(content == want);
     CHECK(coding::Mint(famD, bsa.data(), bsa.size(), 0, want.size() * 2, 4096, content, recP, err, false));
     CHECK(recQ.size() >= 4 && recQ[3] == 'Q' && recP[3] == 'R');
-    CHECK(recQ.size() * 3 < recP.size());                                // flags, not tokens
+    CHECK(recQ.size() * 20 < recP.size());                               // flags, not tokens (1.6 KB against 60 KB)
     auto mk = [&](const coding::Description &d, const std::vector<uint8_t> &rec) {
         return coding::CodedByteSource::Create(std::make_shared<MemByteSource>(coding::Serialize(d)), std::make_shared<MemByteSource>(rec),
                                                std::make_shared<MemByteSource>(content), bsa.size(), err); };
@@ -3843,6 +3843,66 @@ TEST(a_bsa_family_predicts_its_frames) {
     // served under 1 either reads back exactly or is refused, never other bytes)
     auto other = mk(coding::BsaDescription(1), recQ);
     if (other) { std::vector<uint8_t> all(bsa.size()); if (other->preadAll(all.data(), all.size(), 0)) CHECK(all == bsa); }
+}
+
+// The family parses as lz4 1.7 did (the parse verified against Skyrim SE's archives: Meshes1 3000/3000 blocks): its
+// output over a fixed set of inputs is pinned, and today's liblz4 at level 9 (the same parser, later revised) agrees on
+// most of them. Teeth: any change to the parse (the lookahead, a correction, the window, the chain) moves the digest.
+static std::vector<uint8_t> familyBlock(const std::vector<uint8_t> &in, uint32_t att) {
+    coding::Lz4hcParser P; std::vector<coding::Lz4Seq> seqs; P.parse(in.data(), in.size(), att, seqs); std::vector<uint8_t> b;
+    auto len = [](std::vector<uint8_t> &o, size_t n) { for (; n >= 255; n -= 255) o.push_back(255); o.push_back((uint8_t)n); };
+    for (const auto &q : seqs) { const size_t ml = q.ml ? q.ml - 4 : 0;
+        b.push_back((uint8_t)((std::min<size_t>(q.lit, 15) << 4) | (q.ml ? std::min<size_t>(ml, 15) : 0)));
+        if (q.lit >= 15) len(b, q.lit - 15);
+        b.insert(b.end(), in.begin() + (long)q.anchor, in.begin() + (long)(q.anchor + q.lit));
+        if (!q.ml) break;
+        b.push_back((uint8_t)q.off); b.push_back((uint8_t)(q.off >> 8)); if (ml >= 15) len(b, ml - 15); }
+    return b;
+}
+TEST(the_lz4_family_parses_as_lz4_1_7_did) {
+    int same = 0, all = 0; uint64_t h = 1469598103934665603ull; bool decodes = true;
+    for (int kind : {0, 1, 2, 3}) for (uint32_t seed = 1; seed <= 25; ++seed) for (size_t n : {13ul, 100ul, 5000ul, 60000ul, 65536ul}) {
+        const auto in = sampleContent(kind, n, seed);
+        const auto ours = familyBlock(in, 256);
+        std::vector<uint8_t> t((size_t)LZ4_compressBound((int)n));
+        t.resize((size_t)LZ4_compress_HC((const char *)in.data(), (char *)t.data(), (int)n, (int)t.size(), 9));
+        ++all; if (t == ours) ++same;
+        std::vector<uint8_t> back(n + 16);                                // and it is a valid LZ4 block of the input
+        decodes = decodes && LZ4_decompress_safe((const char *)ours.data(), (char *)back.data(), (int)ours.size(), (int)back.size()) == (int)n
+                          && std::equal(in.begin(), in.end(), back.begin());
+        for (uint8_t c : ours) { h ^= c; h *= 1099511628211ull; } h ^= ours.size(); h *= 1099511628211ull;
+    }
+    CHECK(decodes);
+    CHECK_EQ(h, 4403846504761238684ull);
+    CHECK(same >= 350 && same < all);                                    // 357/500: the revisions show, rarely
+}
+
+// A description asking for parse after parse of a big block while making no progress is refused, and quickly.
+TEST(a_description_that_parses_without_progress_is_refused) {
+    coding::Description d; d.name = "parse bomb"; d.isa = 5; d.coder = coding::kBits;
+    auto ex = [&](uint8_t op, uint16_t a, uint16_t b, uint32_t imm) { d.ex.push_back(coding::Ex{op, a, b, imm}); return (uint16_t)(d.ex.size() - 1); };
+    const uint16_t c0 = ex(coding::EX_CONST, 0, 0, 0), c1 = ex(coding::EX_CONST, 0, 0, 1), big = ex(coding::EX_CONST, 0, 0, 4u << 20);
+    const uint16_t cnt = ex(coding::EX_REG, 0, 0, 20), dec = ex(coding::EX_SUB, cnt, c1, 0), lim = ex(coding::EX_CONST, 0, 0, 200);
+    auto op = [&](uint8_t o, uint8_t tgt, uint16_t x, uint16_t v, uint16_t m, uint32_t imm, uint8_t nb = 0, uint16_t target = 0) {
+        coding::Op p; p.op = o; p.tgt = tgt; p.x = x; p.v = v; p.m = m; p.imm = imm; p.nb = nb; p.target = target; d.ops.push_back(p); };
+    op(coding::OP_SET, 20, c0, lim, c0, 0);                                           // 0: 200 rounds
+    op(coding::OP_PREDICT, 30, c0, c0, big, 1, coding::kFamilyLz4hc);              // 1: the block [0, 4 MiB)
+    op(coding::OP_PREDICT, 30, c0, c1, big, 1, coding::kFamilyLz4hc);              // 2: and [1, 4 MiB): another block
+    op(coding::OP_SET, 20, c0, dec, c0, 0);                                           // 3
+    op(coding::OP_JZ, 0, c0, cnt, c0, 0, 0, 6);                                       // 4: done
+    op(coding::OP_JMP, 0, c0, c0, c0, 0, 0, 1);                                       // 5
+    op(coding::OP_BYTERUN, 0, big, c0, c0, 0);                                        // 6: then the stream, as it is
+    op(coding::OP_END, 0, c0, c0, c0, 0);
+    const auto bytes = coding::Serialize(d); coding::Description back; std::string err;
+    CHECK(coding::Parse(bytes.data(), bytes.size(), back, err));
+    std::vector<uint8_t> shipped(4u << 20); for (size_t i = 0; i < shipped.size(); ++i) shipped[i] = (uint8_t)(i * 31 ^ (i >> 9));
+    std::vector<uint8_t> content, rec;
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(!coding::Mint(back, shipped.data(), shipped.size(), shipped.size(), shipped.size(), 1u << 20, content, rec, err));
+    CHECK(err.find("parses without making progress") != std::string::npos);
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(60));
+    // the same program minted plain never parses: it is only a byte run
+    CHECK(coding::Mint(back, shipped.data(), shipped.size(), shipped.size(), shipped.size(), 1u << 20, content, rec, err, false));
 }
 
 // PREDICT is ISA 5 and bounded: an ISA-4 description naming it, a family the reader lacks, and a knob past the limit are
