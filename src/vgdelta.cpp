@@ -554,14 +554,55 @@ static uint64_t HashWin(const uint8_t *p) { uint64_t h = 0; for (uint32_t i = 0;
 // node per window was ~40 bytes plus its bucket: a 57 GB base's 222 M windows took ~9 GB and OOM-killed the desktop
 // on a big jump; this is ~2.7 GB. A check collision drops a window from the index (a match not found: a bigger
 // delta, never a wrong one — every candidate is byte-compared before it is used).
+// The base as the matcher reads it: one or more mapped files, back to back (a delta over several sources), NEVER joined
+// in memory (a whole-build delta over 6 GB of bases used to copy them all into one buffer first).
+struct BaseParts {
+    std::vector<const uint8_t *> p; std::vector<uint64_t> start, len; uint64_t total = 0;
+    void add(const uint8_t *P, uint64_t N) { p.push_back(P); start.push_back(total); len.push_back(N); total += N; }
+    size_t partOf(uint64_t o) const { return (size_t)(std::upper_bound(start.begin(), start.end(), o) - start.begin()) - 1; }
+    // a pointer to n bytes at o when they lie in one part, else nullptr
+    const uint8_t *span(uint64_t o, uint64_t n) const { const size_t k = partOf(o); return o - start[k] + n <= len[k] ? p[k] + (o - start[k]) : nullptr; }
+    void copy(uint64_t o, uint8_t *out, uint64_t n) const {
+        for (size_t k = partOf(o); n; ++k) { const uint64_t a = o - start[k], m = std::min(n, len[k] - a); memcpy(out, p[k] + a, m); out += m; o += m; n -= m; }
+    }
+    // how many bytes from o match t forward (at most max)
+    size_t fwd(uint64_t o, const uint8_t *t, size_t max) const {
+        size_t n = 0;
+        for (size_t k = partOf(o); n < max && k < p.size(); ++k) {
+            const uint64_t a = o + n - start[k]; const uint8_t *b = p[k] + a; const size_t lim = (size_t)std::min<uint64_t>(max - n, len[k] - a);
+            size_t i = 0; while (i < lim && b[i] == t[n + i]) ++i;
+            n += i; if (i < lim) break;
+        }
+        return n;
+    }
+    // how many bytes before o match the bytes before t (at most max)
+    size_t back(uint64_t o, const uint8_t *t, size_t max) const {
+        size_t n = 0;
+        while (n < max && o > n) {
+            const size_t k = partOf(o - n - 1); const uint64_t a = o - n - start[k];   // bytes of part k before o - n
+            const size_t lim = (size_t)std::min<uint64_t>(max - n, a);
+            size_t i = 0; while (i < lim && p[k][a - 1 - i] == t[-(ptrdiff_t)(n + i) - 1]) ++i;
+            n += i; if (i < lim) break;
+        }
+        return n;
+    }
+    uint64_t fnv() const { uint64_t h = 1469598103934665603ULL; for (size_t k = 0; k < p.size(); ++k) for (uint64_t i = 0; i < len[k]; ++i) { h ^= p[k][i]; h *= 1099511628211ULL; } return h; }
+};
+
 class BaseIndex {
 public:
-    bool Build(const uint8_t *base, size_t len) {
+    bool Build(const BaseParts &B) {
+        const uint64_t len = B.total;
         const uint64_t n = len >= ANCHOR ? (uint64_t)(len - ANCHOR) / ANCHOR + 1 : 0;
         if (n >= UINT32_MAX) return false;                      // > 1 TiB of base: windows no longer fit 32 bits
         Cap = std::max<uint64_t>(16, n + n / 2);
         Slots.assign(Cap, 0);
-        for (uint64_t w = 0; w < n; ++w) Insert(HashWin(base + w * ANCHOR), (uint32_t)w);
+        uint8_t tmp[ANCHOR];
+        for (uint64_t w = 0; w < n; ++w) {
+            const uint8_t *s = B.span(w * ANCHOR, ANCHOR);
+            if (!s) { B.copy(w * ANCHOR, tmp, ANCHOR); s = tmp; }      // a window across two parts
+            Insert(HashWin(s), (uint32_t)w);
+        }
         return true;
     }
     // The base offset of the first window hashing to h, or -1. A candidate: the caller compares the bytes.
@@ -644,6 +685,14 @@ static int64_t CompressFile(const std::filesystem::path &from, uint64_t n, const
 bool GenerateDeltaToFile(const uint8_t *base, size_t baseLen, const uint8_t *target, size_t targetLen,
                          const std::string &outPath, std::string &Err, uint32_t blockSize,
                          const std::string &scratchDir, const ProgressFn &progress) {
+    return GenerateDeltaToFile(std::vector<std::pair<const uint8_t *, size_t>>{ { base, baseLen } }, target, targetLen, outPath, Err, blockSize, scratchDir, progress);
+}
+
+bool GenerateDeltaToFile(const std::vector<std::pair<const uint8_t *, size_t>> &bases, const uint8_t *target, size_t targetLen,
+                         const std::string &outPath, std::string &Err, uint32_t blockSize,
+                         const std::string &scratchDir, const ProgressFn &progress) {
+    BaseParts B; for (const auto &[P, N] : bases) if (N) B.add(P, N);
+    const uint64_t baseLen = B.total;
     if (blockSize == 0) blockSize = DEFAULT_BLOCK;
     //What the reader refuses is not made: a delta that would not mount is no delta.
     if (blockSize > (64u << 20)) { Err = "vgdelta: block size past 64 MiB (" + std::to_string(blockSize) + ")"; return false; }
@@ -690,7 +739,7 @@ bool GenerateDeltaToFile(const uint8_t *base, size_t baseLen, const uint8_t *tar
     };
 
     BaseIndex index;
-    if (!index.Build(base, baseLen)) return Fail("the base is over 1 TiB");
+    if (!index.Build(B)) return Fail("the base is over 1 TiB");
 
     const uint64_t Rhi = PowR(ANCHOR - 1);
     size_t p = 0, litStart = 0;
@@ -709,12 +758,10 @@ bool GenerateDeltaToFile(const uint8_t *base, size_t baseLen, const uint8_t *tar
             }
             bool matched = false;
             if (const int64_t at = index.Find(h); at >= 0) {
-                size_t o = (size_t)at;
-                if (o + ANCHOR <= baseLen && std::memcmp(base + o, target + p, ANCHOR) == 0) {
-                    size_t len = ANCHOR;
-                    while (o + len < baseLen && p + len < targetLen && base[o + len] == target[p + len]) ++len;
-                    size_t back = 0;
-                    while (back < p - litStart && o > back && base[o - 1 - back] == target[p - 1 - back]) ++back;
+                const uint64_t o = (uint64_t)at;
+                if (o + ANCHOR <= baseLen && B.fwd(o, target + p, ANCHOR) == ANCHOR) {
+                    const size_t len = ANCHOR + B.fwd(o + ANCHOR, target + p + ANCHOR, (size_t)std::min<uint64_t>(baseLen - o - ANCHOR, targetLen - p - ANCHOR));
+                    const size_t back = B.back(o, target + p, p - litStart);
                     emitAdd(litStart, p - back);
                     emitSeg(KIND_COPY, (uint64_t)(len + back), (uint64_t)(o - back));
                     p += len; litStart = p;
@@ -780,7 +827,7 @@ bool GenerateDeltaToFile(const uint8_t *base, size_t baseLen, const uint8_t *tar
     put32(head, blockSize);
     put64(head, targetLen);
     put64(head, baseLen);
-    put64(head, Fnv1a64(base, baseLen));
+    put64(head, B.fnv());
     put32(head, (uint32_t)numSegs);
     put32(head, (uint32_t)blocks.size());
     put64(head, (uint64_t)segComp); put64(head, segBytes);

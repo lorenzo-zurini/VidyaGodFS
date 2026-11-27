@@ -155,6 +155,11 @@ using ProgressFn = std::function<bool(int stage, uint64_t done, uint64_t total)>
 bool GenerateDeltaToFile(const uint8_t *base, size_t baseLen, const uint8_t *target, size_t targetLen,
                          const std::string &outPath, std::string &Err, uint32_t blockSize = DEFAULT_BLOCK,
                          const std::string &scratchDir = std::string(), const ProgressFn &progress = {});
+// The same over a base of several files back to back (a delta over several sources): each is read where it is mapped,
+// never joined in memory.
+bool GenerateDeltaToFile(const std::vector<std::pair<const uint8_t *, size_t>> &bases, const uint8_t *target, size_t targetLen,
+                         const std::string &outPath, std::string &Err, uint32_t blockSize = DEFAULT_BLOCK,
+                         const std::string &scratchDir = std::string(), const ProgressFn &progress = {});
 // The same delta, returned in memory — for small ones (the tests, a fixture, the editor's single archive). Empty on
 // failure or a cancel. A delta of gigabytes goes to a file.
 std::vector<uint8_t> GenerateDelta(const uint8_t *base, size_t baseLen,

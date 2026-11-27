@@ -1897,6 +1897,25 @@ TEST(a_delta_with_no_file_for_its_base_or_a_ring_is_reported_and_left_out) {
     CHECK(VfsGetattr(S, "c", at) != 0);
 }
 
+// A delta over several bases reads each where it lies (never joined in memory) and is, byte for byte, the delta over
+// them joined: windows and matches that cross from one base into the next included. Teeth: drop a window across parts;
+// stop a match at a part's end.
+TEST(a_delta_over_several_bases_is_the_delta_over_them_joined) {
+    std::mt19937 r(31); std::vector<uint8_t> a(70000), b(1000), c(90000), t;
+    for (auto *v : {&a, &b, &c}) for (auto &x : *v) x = (uint8_t)r();
+    std::vector<uint8_t> joined = a; joined.insert(joined.end(), b.begin(), b.end()); joined.insert(joined.end(), c.begin(), c.end());
+    // the target: runs from each base, and runs crossing a|b and b|c, with literals between
+    t.insert(t.end(), joined.begin() + 69000, joined.begin() + 72000);          // across a|b|c (b is 1000 bytes)
+    for (int i = 0; i < 500; ++i) t.push_back((uint8_t)r());
+    t.insert(t.end(), joined.begin() + 100, joined.begin() + 30000);
+    t.insert(t.end(), joined.begin() + 80000, joined.begin() + 160000);
+    TmpDir d; std::string e1, e2;
+    CHECK(vgdelta::GenerateDeltaToFile(joined.data(), joined.size(), t.data(), t.size(), d.str("one.vgdelta"), e1));
+    CHECK(vgdelta::GenerateDeltaToFile({ {a.data(), a.size()}, {b.data(), b.size()}, {c.data(), c.size()} }, t.data(), t.size(), d.str("parts.vgdelta"), e2));
+    CHECK(slurpFile(d / "one.vgdelta") == slurpFile(d / "parts.vgdelta"));
+    CHECK(slurpFile(d / "one.vgdelta").size() < t.size() / 10);             // it did match (the runs, the crossings)
+}
+
 // A delta over NOTHING ("bases": []) is a file stored compressed: it mounts its own bytes, zstd blocks read at random;
 // a delta that named no base ("bases": null) is reported and left out. Teeth: refuse empty bases; read null as empty.
 TEST(a_delta_over_nothing_is_its_own_bytes_and_one_naming_none_is_left_out) {
