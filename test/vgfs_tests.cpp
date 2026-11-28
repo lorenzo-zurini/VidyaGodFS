@@ -6077,3 +6077,33 @@ TEST(a_tree_reads_a_cid_on_a_zip_and_a_file_in_either_order) {
         VfsAttr a; CHECK_EQ(VfsGetattr(S, "G/whole.zip", a), 0); CHECK_EQ((uint64_t)a.size, ZipSize);
     }
 }
+
+
+// The Golden Pass's Black mint (2026-11-28): a disc read only through a view a tree reads is the tree's, not a file beside
+// it; a layer of its own placing it elsewhere (an emulator's image) still shows it there.
+TEST(a_disc_a_tree_reads_through_its_view_is_hidden_at_the_trees_place) {
+    TmpDir t;
+    coding::Description D; std::string err;
+    CHECK(coding::Read(kToyView, D, err));
+    const uint32_t At = 512;
+    const auto Bytes = toyContent({ {"game.xbe", 0, At, 5} }, "hello", At);
+    MemByteSource Src(Bytes); std::vector<coding::ViewEntry> V; CHECK(coding::RunView(D, Src, V, err));
+    std::ofstream(t / "disc.iso", std::ios::binary).write((const char *)Bytes.data(), (std::streamsize)Bytes.size());
+    std::ofstream(t / "disc.vgview", std::ios::binary) << coding::ViewListing(V);
+    vgtree::Table T; T.bases = { "bafyview" };
+    vgtree::Entry E; E.path = "game.xbe"; E.op = vgtree::Entry::Same; E.base = 0; E.basePath = "game.xbe"; E.size = 5; T.entries = { E };
+    CHECK(vgtree::WriteTree(t.str("t.vgtz"), T, {}, {}, err));
+    const auto Spec_ = [&](const std::string &DiscTarget) {
+        return std::string(R"J({"mountpoint":"/m","readonly":true,"layers":[{"type":"file","source":")J") + t.str("disc.iso")
+             + R"J(","target":")J" + DiscTarget + R"J(","cid":"bafydisc"},{"type":"view","source":")J" + t.str("disc.vgview")
+             + R"J(","bases":["bafydisc"],"target":"G","cid":"bafyview"},{"type":"tree","source":")J" + t.str("t.vgtz")
+             + R"J(","bases":["bafyview"],"target":"G","cid":"bafytree"}]})J"; };
+    { Spec sp; CHECK(ParseSpecText(Spec_("G"), sp, err)); VfsState S; CHECK(S.Init(sp, err));
+      std::set<std::string> In; CHECK_EQ(VfsReaddir(S, "G", [&](const std::string &n) { In.insert(n); }), 0);
+      In.erase("."); In.erase("..");
+      CHECK(In == std::set<std::string>{ "game.xbe" });                                         // the tree's file, not the disc
+      CHECK_EQ(readAll(S, "G/game.xbe", 2), std::string("hello")); }
+    { Spec sp; CHECK(ParseSpecText(Spec_("media"), sp, err)); VfsState S; CHECK(S.Init(sp, err));
+      VfsAttr a; CHECK_EQ(VfsGetattr(S, "media/disc.iso", a), 0);                               // placed elsewhere: shown there
+      CHECK_EQ(readAll(S, "G/game.xbe", 2), std::string("hello")); }
+}

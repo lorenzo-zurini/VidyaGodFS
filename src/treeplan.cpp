@@ -94,7 +94,9 @@ TreePlan PlanTree(const Spec &S, const std::vector<bool> &Failed)
     //steps, not a million. Per CID: place -> the highest layer whose placements beneath it are hidden there.
     std::unordered_map<std::string, std::vector<size_t>> NamedBy;   // CID -> the rebuilding deltas naming it
     for (size_t D = 0; D < N; ++D)
-        if ((S.layers[D].type == LayerType::Delta || S.layers[D].type == LayerType::Tree) && !P.broken[D])   // a tree hides its bases too
+        //a tree hides its bases too, and a view its content: what a tree reads through a view (a disc) is hidden at the tree's
+        //place with the view, and shows only where a layer of its own places it elsewhere (an emulator's image)
+        if ((S.layers[D].type == LayerType::Delta || S.layers[D].type == LayerType::Tree || S.layers[D].type == LayerType::View) && !P.broken[D])
             for (const std::string &C : S.layers[D].bases) NamedBy[C].push_back(D);
     std::unordered_map<std::string, std::map<std::string, size_t>> Down;
     std::unordered_set<std::string> Passed;
