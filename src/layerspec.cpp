@@ -123,7 +123,17 @@ bool ParseSpecText(const std::string &Text, Spec &Out, std::string &Err)
                 LS.name = NormalizeVPath(L["name"].get<std::string>());
             }
             else if (L.contains("description") || L.contains("name")) return Bad("only a coded stream has a description and a name");
+            if (L.contains("hide"))
+            {
+                if (!L["hide"].is_array()) return Bad("hide must be an array of paths");
+                for (const auto &H : L["hide"])
+                {
+                    if (!H.is_string() || NormalizeVPath(H.get<std::string>()).empty()) return Bad("a hidden path must be a non-empty path");
+                    LS.hide.push_back(NormalizeVPath(H.get<std::string>()));
+                }
+            }
             LS.rw      = L.value("rw", false);
+            if (LS.rw && !LS.hide.empty()) return Bad("a read-write folder hides nothing (it is the user's)");
             LS.bytesOnly = L.value("bytesOnly", false);
             LS.fixed   = L.value("fixed", false);
             if (LS.bytesOnly && !Bytes)

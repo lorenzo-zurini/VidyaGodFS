@@ -42,6 +42,10 @@ struct LayerSpec {
     //in its target folder.
     std::string description;
     std::string name;
+    //Places (virtual paths, normalized) this layer does not serve: a file, or a folder and everything below it. What a
+    //re-provided copy of a node's layer leaves to the layers beneath it (MetaPackageFormat 05 §5.4: the paths later
+    //layers of the same composition rewrite). Hidden like a delta hides its bases (TreePlan::maskedUnder).
+    std::vector<std::string> hide;
 };
 
 //Bytes a launch puts into a file a lower layer serves (a BinaryPatch the app resolved against it): every read of the

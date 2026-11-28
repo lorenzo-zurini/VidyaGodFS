@@ -103,6 +103,9 @@ TreePlan PlanTree(const Spec &S, const std::vector<bool> &Failed)
         for (const auto &[Place, Upto] : DownOf(S.layers[L].cid))
             if (L < Upto) P.maskedUnder[L].push_back(Place);
     }
+    //What a layer hides of itself (a re-provided copy: the paths later layers rewrite stay below it).
+    for (size_t L = 0; L < N; ++L)
+        for (const std::string &H : S.layers[L].hide) P.maskedUnder[L].push_back(H);
     for (size_t L = 0; L < N; ++L)
         P.whole[L] = S.layers[L].bytesOnly
                   || (!P.maskedUnder[L].empty() && std::all_of(P.mounts[L].begin(), P.mounts[L].end(), [&](const auto &M) {

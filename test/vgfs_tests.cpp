@@ -277,6 +277,46 @@ TEST(two_zip_layers_upper_masks) {
     checkReaddirSubsetGetattr(S, "");
 }
 
+// A layer's `hide` places are left to the layers below it: a file there, and a folder with everything inside it — read,
+// listed and stat'ed alike. Teeth: ignore hide (the upper's x.cfg wins); hide only exact names (d/inner.txt shows).
+TEST(a_layers_hidden_places_are_left_to_the_layers_below) {
+    TmpDir t;
+    writeStoreZip(t / "base.zip",  { { "g/x.cfg", "BASE", false }, { "g/d/inner.txt", "b", false } });
+    writeStoreZip(t / "upper.zip", { { "g/x.cfg", "UPPER", false }, { "g/y.cfg", "Y", false }, { "g/d/inner.txt", "u", false }, { "g/d/only_up.txt", "o", false } });
+    LayerSpec Up = zipLayer(t.str("upper.zip"));
+    Up.hide = { "g/x.cfg", "g/d" };
+    Spec sp; sp.layers = { zipLayer(t.str("base.zip")), Up };
+    VfsState S; std::string err; CHECK(S.Init(sp, err));
+    OpenFile *of = nullptr; VfsOpen(S, "g/x.cfg", 0, of);
+    char buf[8] = {0}; ssize_t r = VfsRead(of, buf, sizeof(buf), 0); VfsRelease(of);
+    CHECK_EQ(std::string(buf, r), std::string("BASE"));       // hidden in the upper: the base's
+    of = nullptr; VfsOpen(S, "g/d/inner.txt", 0, of);
+    r = VfsRead(of, buf, sizeof(buf), 0); VfsRelease(of);
+    CHECK_EQ(std::string(buf, r), std::string("b"));
+    VfsAttr a;
+    CHECK(VfsGetattr(S, "g/d/only_up.txt", a) != 0);           // the whole folder is the base's
+    CHECK_EQ(VfsGetattr(S, "g/y.cfg", a), 0);                  // the rest of the upper shows
+    CHECK(readdirNames(S, "g/d").count("only_up.txt") == 0);
+    checkReaddirSubsetGetattr(S, "g");
+    checkReaddirSubsetGetattr(S, "g/d");
+    //on a case-insensitive mount a hidden place is the place whatever its spelling (an authored EDIT target)
+    {
+        LayerSpec Up2 = zipLayer(t.str("upper.zip"));
+        Up2.hide = { "G/X.CFG" };
+        Spec ci; ci.caseInsensitive = true; ci.layers = { zipLayer(t.str("base.zip")), Up2 };
+        VfsState S2; std::string e2; CHECK(S2.Init(ci, e2));
+        OpenFile *o2 = nullptr; VfsOpen(S2, "g/x.cfg", 0, o2);
+        char b2[8] = {0}; ssize_t r2 = VfsRead(o2, b2, sizeof(b2), 0); VfsRelease(o2);
+        CHECK_EQ(std::string(b2, r2), std::string("BASE"));
+    }
+    //the spec's shape: an array of non-empty paths, never on the user's read-write folder
+    Spec Bad; std::string E;
+    CHECK(!ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"dir","source":"/s","hide":"x"}]})", Bad, E));
+    CHECK(!ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"dir","source":"/s","hide":[""]}]})", Bad, E));
+    CHECK(!ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"dir","source":"/s","rw":true,"hide":["a"]}]})", Bad, E));
+    CHECK(ParseSpecText(R"({"mountpoint":"/m","layers":[{"type":"dir","source":"/s","hide":["/a/b/"]}]})", Bad, E) && Bad.layers[0].hide == std::vector<std::string>{"a/b"});
+}
+
 TEST(dir_layer_serves_files) {
     TmpDir t;
     writeFile(t / "src/foo.txt", "FOO");

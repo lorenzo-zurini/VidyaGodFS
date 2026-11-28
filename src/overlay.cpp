@@ -283,6 +283,11 @@ bool VfsState::Init(const Spec &S, std::string &Err)
             Walk(L.subpath);
         }
         for (const std::string &D : implicitDirs) canonCase.try_emplace(FoldCase(D), D);
+        //A place a layer hides (a delta's bases, a re-provided copy's `hide`) is matched against lookups spelled as the
+        //layers spell them: an authored hide in another case ("dgvoodoo.conf" for "dgVoodoo.conf") is the same place.
+        for (Layer &L : layers)
+            for (std::string &M : L.maskedUnder)
+                if (const auto It = canonCase.find(FoldCase(M)); It != canonCase.end()) M = It->second;
     }
     //The byte patches, by the path as the layers spell it: in spec order onto each file's bytes (a later one wins on a
     //byte two cover), then merged into runs.
