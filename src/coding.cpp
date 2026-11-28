@@ -102,6 +102,20 @@ bool Validate(const Description &D, std::string &Err) {
                                     !((p.nb == kFamilyLz4hc && p.imm != 0 && p.imm <= kLz4hcMaxAttempts) || (p.nb == kFamilyZlib && ZlibParser::ValidKnob(p.imm)))));
         if (bad) { Err = "an op naming something the description lacks"; return false; }
     }
+    // ISA 10: VIEW mode lists the files in a content (viewmode.h): control flow, registers, arrays and the entry ops only
+    for (const Op &p : D.ops) if (p.op >= OP_ENAME && (D.isa < 10 || !D.view)) { Err = p.op >= OP_ENAME && D.isa < 10 ? "an op newer than the instruction set it names" : "a file-table op in a codec (VIEW mode only)"; return false; }
+    if (D.view) {
+        if (D.isa < 10) { Err = "VIEW mode is ISA 10"; return false; }
+        if (D.names > kNamesShiftJis) { Err = "a view's NAMES encoding is unknown"; return false; }
+        for (const Op &p : D.ops) {
+            const bool ok = p.op == OP_SET || p.op == OP_STA || p.op == OP_JZ || p.op == OP_JMP || p.op == OP_CALL || p.op == OP_RET ||
+                            p.op == OP_ASSERT || p.op == OP_END || p.op >= OP_ENAME;
+            if (!ok || p.modes || p.flags) { Err = "a view runs no coder: only set sta jz jmp call ret assert end and the entry ops"; return false; }
+            if ((p.op == OP_STA && p.nb >= na) || (p.op == OP_ETAB && p.imm >= nt)) { Err = "an op naming something the description lacks"; return false; }
+        }
+        for (const Ex &e : D.ex)
+            if (e.op == EX_BITPOS || e.op == EX_DLEFT || e.op == EX_INLEFT || e.op == EX_STREAMPOS) { Err = "a view has no stream: bitpos dleft inleft streampos mean nothing in it"; return false; }
+    }
     for (const Ex &e : D.ex) {
         if ((e.op == EX_TABLE && e.imm >= nt) || (e.op == EX_ARR && e.imm >= na)) { Err = "an expression naming something the description lacks"; return false; }
         if ((e.op == EX_STREAMPOS && D.isa < 4) || (e.op >= EX_U16 && e.op <= EX_U32BE && D.isa < 6) || (DivEx(e.op) && D.isa < 7)) { Err = "an expression newer than the instruction set it names"; return false; }
@@ -962,7 +976,7 @@ struct Machine {
         uint32_t tick = 0, val = 0; const Ins *op_ = nullptr;
         // DIRECT THREADING: every handler ends with its own jump to the next one (computed goto), so the branch predictor
         // learns per-instruction patterns instead of one shared switch. Table order = OpCode order, then the fused ones.
-        static const void *const J[] = { &&L_OP_BIT, &&L_OP_TREE, &&L_OP_RTREE, &&L_OP_DIRECT, &&L_OP_MLIT, &&L_OP_RAW, &&L_OP_HUFF, &&L_OP_BUILD, &&L_OP_STA, &&L_OP_SET, &&L_OP_DEC, &&L_OP_OUTLIT, &&L_OP_OUTCOPY, &&L_OP_HMTF, &&L_OP_HPUSH, &&L_OP_JZ, &&L_OP_JMP, &&L_OP_CALL, &&L_OP_RET, &&L_OP_ASSERT, &&L_OP_FLUSH, &&L_OP_MARK, &&L_OP_END, &&L_OP_HUFFRUN, &&L_OP_BYTERUN, &&L_OP_PREDICT, &&L_OP_RAWBYTES, &&L_OP_E8FRAME, &&L_OP_E8END, &&L_OP_NEAREST, &&L_OP_LZXFOLDER, &&L_OP_LZXEND, &&L_OP_LZXSIZE, &&L_OP_LZXEMIT, &&L_F_BITJZ, &&L_F_SETBITJZ, &&L_F_DECN, &&L_F_OFFEND };
+        static const void *const J[] = { &&L_OP_BIT, &&L_OP_TREE, &&L_OP_RTREE, &&L_OP_DIRECT, &&L_OP_MLIT, &&L_OP_RAW, &&L_OP_HUFF, &&L_OP_BUILD, &&L_OP_STA, &&L_OP_SET, &&L_OP_DEC, &&L_OP_OUTLIT, &&L_OP_OUTCOPY, &&L_OP_HMTF, &&L_OP_HPUSH, &&L_OP_JZ, &&L_OP_JMP, &&L_OP_CALL, &&L_OP_RET, &&L_OP_ASSERT, &&L_OP_FLUSH, &&L_OP_MARK, &&L_OP_END, &&L_OP_HUFFRUN, &&L_OP_BYTERUN, &&L_OP_PREDICT, &&L_OP_RAWBYTES, &&L_OP_E8FRAME, &&L_OP_E8END, &&L_OP_NEAREST, &&L_OP_LZXFOLDER, &&L_OP_LZXEND, &&L_OP_LZXSIZE, &&L_OP_LZXEMIT, &&L_OP_VIEW, &&L_OP_VIEW, &&L_OP_VIEW, &&L_OP_VIEW, &&L_OP_VIEW, &&L_OP_VIEW, &&L_OP_VIEW, &&L_OP_VIEW, &&L_F_BITJZ, &&L_F_SETBITJZ, &&L_F_DECN, &&L_F_OFFEND };
         static_assert(sizeof(J) / sizeof(J[0]) == F_OFFEND + 1, "dispatch table out of step with the opcodes");
         #define NEXT() do { if (__builtin_expect(!(++tick & 0xFFFF), 0)) { fuel += 0x10000; \
                 if (overBudget() || X.err) { fail(X.err ? "the content does not read" : "a description that works without making progress"); return 0; } X.workMark = X.work; } \
@@ -1141,6 +1155,7 @@ struct Machine {
                                    else { fail(pcache->lzxFamily()->over ? "a description that parses without making progress" : "the LZX family no longer makes this folder"); return 0; } }
                 }
                 v[op_->tgt] = r; CHECK_NEXT(); }
+            L_OP_VIEW: { fail("a file-table op in a codec (VIEW mode only)"); return 0; }   // (ISA 10: Validate refuses them first)
             L_OP_LZXEMIT: {
                 const uint32_t k = opnd<M>(op_->x); uint32_t r = 0;
                 if (M == kCode) {
@@ -1326,6 +1341,7 @@ namespace { uint64_t SegmentHash(const uint8_t *p, size_t n, uint64_t h = 146959
 
 bool MintInto(const Description &D, const uint8_t *Shipped, size_t N, size_t ContentSize, uint8_t *Buf, size_t ContentCap, uint64_t Spacing,
               size_t &ContentLen, std::vector<uint8_t> &Record, std::string &Err, bool Predict) {
+    if (D.view) { Err = "a VIEW lists files; it codes no stream"; return false; }
     if (ContentCap > 0xFFFFFFFFu || ContentSize > ContentCap) { Err = "content over 4 GiB is not supported"; return false; }
     Spec S(D);
     if (!S.ok) { Err = "a description too complex to run"; return false; }
@@ -1591,6 +1607,7 @@ std::shared_ptr<CodedByteSource> CodedByteSource::Create(std::shared_ptr<ByteSou
     std::vector<uint8_t> d(Desc->size());
     if (d.size() > (64u << 20) || (!d.empty() && !Desc->preadAll(d.data(), d.size(), 0))) { Err = "the description does not read"; return nullptr; }
     if (!Parse(d.data(), d.size(), S->I->D, Err)) return nullptr;
+    if (S->I->D.view) { Err = "a VIEW lists files; it codes no stream"; return nullptr; }
     S->I->S = std::make_unique<Spec>(S->I->D);
     if (!S->I->S->ok) { Err = "a description too complex to run"; return nullptr; }
     if (Content->size() > 0xFFFFFFFFu) { Err = "content over 4 GiB is not supported"; return nullptr; }

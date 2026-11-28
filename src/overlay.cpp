@@ -2,6 +2,7 @@
 
 #include <map>
 #include "treeplan.h"
+#include "viewmode.h"
 #include "vgdelta.h"
 #include "hostio.h"     // all host filesystem I/O goes through the backend-neutral shim
 
@@ -145,6 +146,47 @@ bool VfsState::Init(const Spec &S, std::string &Err)
         Z->byName.emplace(LS.name, E);
         return Z;
     };
+    //A view (ISA 10) appears as the folder of files its listing finds in its content: an index of those entries, each
+    //file's bytes the content's (one extent: read in place; several: a concatenation of slices). Null if the listing
+    //does not read, or names bytes the content does not have.
+    const auto ViewIndex = [](std::shared_ptr<ByteSource> Content, const LayerSpec &LS, std::string &Why) -> std::shared_ptr<ZipIndex> {
+        HostIO::Fd Fd = HostIO::Open(LS.source, O_RDONLY);
+        if (Fd < 0) { Why = "cannot open its listing"; return nullptr; }
+        HostIO::Stat St;
+        std::string Text;
+        if (HostIO::Fstat(Fd, St) == 0 && St.size <= (256ull << 20))
+        {
+            Text.resize((size_t)St.size);
+            size_t Got = 0;
+            while (Got < Text.size()) { const ssize_t R = HostIO::Pread(Fd, Text.data() + Got, Text.size() - Got, Got); if (R <= 0) break; Got += (size_t)R; }
+            Text.resize(Got);
+        }
+        HostIO::Close(Fd);
+        std::vector<coding::ViewEntry> V;
+        if (!coding::ReadViewListing(Text, V, Why, Content->size())) return nullptr;
+        auto Z = std::make_shared<ZipIndex>(); Z->archivePath = LS.source; Z->src = Content;
+        for (const coding::ViewEntry &E : V)
+        {
+            ZipEntry Z1; Z1.name = E.path; Z1.isDir = E.dir; Z1.size = E.size();
+            if (!E.dir)
+            {
+                Z1.stored = true;
+                if (E.extents.size() <= 1) Z1.dataOffset = E.extents.empty() ? 0 : E.extents[0].first;
+                else
+                {
+                    std::vector<std::shared_ptr<ByteSource>> Parts;
+                    for (const auto &[O, N] : E.extents) Parts.push_back(std::make_shared<SliceByteSource>(Content, O, N));
+                    Z1.own = std::make_shared<ConcatByteSource>(Parts);
+                    Z1.dataOffset = 0;
+                }
+            }
+            const size_t Sl = E.path.find_last_of('/');
+            Z->dirChildren[Sl == std::string::npos ? std::string() : E.path.substr(0, Sl)].insert(Sl == std::string::npos ? E.path : E.path.substr(Sl + 1));
+            if (E.dir) Z->dirChildren.try_emplace(E.path);
+            Z->byName.emplace(E.path, std::move(Z1));
+        }
+        return Z;
+    };
     TreePlan P = PlanTree(S);
     for (const std::string &Why : P.problems) std::cerr << "[vidyagodfs] " << Why << " — it is left out\n";
     //What indexing reads first, asked for at once: an archive's central directory at its end, a delta's header and
@@ -178,10 +220,17 @@ bool VfsState::Init(const Spec &S, std::string &Err)
         for (size_t I = 0; I < S.layers.size(); ++I)
         {
             const LayerSpec &LS = S.layers[I];
-            const bool Coded = LS.type == LayerType::Coded;
-            if ((LS.type != LayerType::Zip && LS.type != LayerType::Delta && !Coded) || P.whole[I] || Index[I] || Failed[I]) continue;
-            if ((LS.type == LayerType::Delta || Coded) && P.broken[I]) continue;
+            const bool Coded = LS.type == LayerType::Coded, View = LS.type == LayerType::View;
+            if ((LS.type != LayerType::Zip && LS.type != LayerType::Delta && !Coded && !View) || P.whole[I] || Index[I] || Failed[I]) continue;
+            if ((LS.type == LayerType::Delta || Coded || View) && P.broken[I]) continue;
             std::string Why;
+            if (View)
+            {
+                std::shared_ptr<ByteSource> Content = Bytes.Get(P.bases[I][0], &Why);
+                if (Content) Index[I] = ViewIndex(Content, LS, Why);
+                if (!Index[I]) { std::cerr << "[vidyagodfs] skipping view " << LS.source << ": " << Why << "\n"; Failed[I] = true; }
+                continue;
+            }
             std::shared_ptr<ByteSource> Src = Bytes.Get(I, &Why);
             if (!Src)
             {
@@ -201,7 +250,7 @@ bool VfsState::Init(const Spec &S, std::string &Err)
     for (size_t gi = 0; gi < S.layers.size(); ++gi)
     {
         const LayerSpec &LS = S.layers[gi];
-        const bool Archive = LS.type == LayerType::Zip || LS.type == LayerType::Delta || LS.type == LayerType::Coded;
+        const bool Archive = LS.type == LayerType::Zip || LS.type == LayerType::Delta || LS.type == LayerType::Coded || LS.type == LayerType::View;
         if (Archive && (P.whole[gi] || !Index[gi])) continue;   // a byte input only, or nothing to serve
         for (const auto &[sub, tgt] : P.mounts[gi])
         {

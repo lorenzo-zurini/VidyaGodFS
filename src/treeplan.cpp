@@ -20,7 +20,7 @@ bool Within(const std::string &vrel, const std::string &root)
 //file's own bytes (a disc image).
 static bool CarriesBytes(const LayerSpec &L) { return L.type == LayerType::Zip || L.type == LayerType::Delta || L.type == LayerType::File || L.type == LayerType::Coded; }
 //A layer rebuilt over the bytes its `bases` name: a delta over its base, a coded stream over its content.
-static bool Rebuilt(const LayerSpec &L) { return L.type == LayerType::Delta || L.type == LayerType::Coded; }
+static bool Rebuilt(const LayerSpec &L) { return L.type == LayerType::Delta || L.type == LayerType::Coded || L.type == LayerType::View; }
 static std::string Name(const LayerSpec &L)
 {
     const size_t S = L.source.find_last_of("/\\");
@@ -55,7 +55,7 @@ TreePlan PlanTree(const Spec &S, const std::vector<bool> &Failed)
         if (D < Failed.size() && Failed[D]) Why = "its bytes did not rebuild over its bases";
         //a delta over NO base is its own bytes, zstd-compressed with random access (content at rest); a coded stream
         //always has its content
-        if ((S.layers[D].type == LayerType::Coded ? S.layers[D].bases.empty() : !S.layers[D].basesNamed) && Why.empty()) Why = "it names no base";
+        if ((S.layers[D].type == LayerType::Delta ? !S.layers[D].basesNamed : S.layers[D].bases.empty()) && Why.empty()) Why = "it names no base";
         for (const std::string &C : S.layers[D].bases)
         {
             const auto It = Carrier.find(C);
@@ -68,7 +68,7 @@ TreePlan PlanTree(const Spec &S, const std::vector<bool> &Failed)
             }
         }
         P.broken[D] = !Why.empty();
-        if (P.broken[D]) P.problems.push_back(std::string(S.layers[D].type == LayerType::Coded ? "coded stream " : "delta ") + Name(S.layers[D]) + " (at '" + S.layers[D].target + "') cannot rebuild: " + Why);
+        if (P.broken[D]) P.problems.push_back(std::string(S.layers[D].type == LayerType::Coded ? "coded stream " : S.layers[D].type == LayerType::View ? "view " : "delta ") + Name(S.layers[D]) + " (at '" + S.layers[D].target + "') cannot rebuild: " + Why);
         Seen[D] = Done;
         return !P.broken[D];
     };

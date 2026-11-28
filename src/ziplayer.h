@@ -31,6 +31,9 @@ struct ZipEntry {
     // A link's resolution (ResolveZipSymlink), learned on its first lookup: null = not yet, the marker
     // kNoZipTarget = no file inside the archive, else that file's entry.
     mutable const ZipEntry *linkTo = nullptr;
+    //A file of several extents a VIEW lists (ISA 10): its bytes, read from 0 (a concatenation of slices of the content).
+    //Null for an archive's member, whose bytes are the archive's at dataOffset.
+    std::shared_ptr<ByteSource> own;
 };
 
 //A whole zip archive indexed for the FS lifetime, read through a ByteSource — so the archive bytes may be a

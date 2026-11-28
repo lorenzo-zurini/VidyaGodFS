@@ -142,6 +142,20 @@ struct MmapByteSource : ByteSource {
     uint64_t size() const override { return n; }
 };
 
+// SliceByteSource — bytes [off, off+len) of another source, read from 0: one extent of a file a VIEW lists (ISA 10).
+struct SliceByteSource : ByteSource {
+    std::shared_ptr<ByteSource> src;
+    uint64_t off = 0, len = 0;
+    SliceByteSource(std::shared_ptr<ByteSource> s, uint64_t o, uint64_t n) : src(std::move(s)), off(o), len(n) {}
+    ssize_t pread(void *buf, size_t n, uint64_t o) override {
+        if (o >= len) return 0;
+        const uint64_t avail = len - o;
+        return src->pread(buf, n < avail ? n : static_cast<size_t>(avail), off + o);
+    }
+    void prefetch(uint64_t o, uint64_t n) override { if (o < len) src->prefetch(off + o, n < len - o ? n : len - o); }
+    uint64_t size() const override { return len; }
+};
+
 struct ConcatByteSource : ByteSource {
     struct Part { std::shared_ptr<ByteSource> src; uint64_t start; uint64_t len; };
     std::vector<Part> parts;

@@ -27,7 +27,7 @@ namespace {
 using ojson = nlohmann::ordered_json;
 
 // ---- operand signatures: what each op's text names, in order (fields not named must be their defaults)
-enum Kind : char { kE = 'E', kR = 'R', kN = 'N', kH = 'H', kA = 'A', kF = 'F', kK = 'K', kL = 'L', kB = 'B' };
+enum Kind : char { kE = 'E', kR = 'R', kN = 'N', kH = 'H', kA = 'A', kF = 'F', kK = 'K', kL = 'L', kB = 'B', kT = 'T' };   // kT: a table name (imm)
 struct Arg { char kind, field; bool opt = false; };  // field: x v m t(tgt) n(nb) i(imm) l(target); opt: may be left out (0)
 struct Sig { const char *name; std::vector<Arg> args; bool freeable; };
 const std::vector<Sig> &Sigs() {
@@ -66,10 +66,19 @@ const std::vector<Sig> &Sigs() {
         {"lzxend", {{kE, 'v'}}, false},
         {"lzxsize", {{kE, 'x'}, {kR, 't'}}, false},
         {"lzxemit", {{kE, 'x'}, {kR, 't'}}, false},
+        // ISA 10: VIEW mode (viewmode.h)
+        {"ename", {{kE, 'x'}, {kE, 'v'}}, false},
+        {"echar", {{kE, 'v'}}, false},
+        {"etab", {{kT, 'i'}}, false},
+        {"edir", {}, false},
+        {"efinish", {{kE, 'x'}, {kE, 'v'}}, false},
+        {"estride", {{kE, 'x'}, {kE, 'v'}, {kK, 'i'}, {kE, 'm'}}, false},
+        {"epart", {{kE, 'x'}, {kE, 'v'}}, false},
+        {"efin", {}, false},
     };
     return s;
 }
-static_assert(OP_COUNT == 34, "an op without a text form: add its signature");
+static_assert(OP_COUNT == 42, "an op without a text form: add its signature");
 
 struct ExName { const char *name; uint8_t op; int arity; };   // arity -1: (table|arr NAME value)
 const std::vector<ExName> &ExNames() {
@@ -166,7 +175,13 @@ bool Print(const Description &D, std::string &Out, std::string &Err, const TextN
     auto field = [&](const char *k, const std::string &v) { o += "  \""; o += k; o += "\": "; o += v; o += ",\n"; };
     field("NAME", Quote(D.name));
     field("ISA", std::to_string(D.isa));
-    field("CODER", D.coder == kBits ? "\"BITS\"" : D.coder == kBits16M ? "\"BITS16M\"" : "\"RANGE\"");
+    if (D.view) {                                      // ISA 10: a file table, no coder
+        static const char *const kNames[] = {"utf-8", "ascii", "latin-1", "utf-16be", "shift-jis"};
+        if (D.names > kNamesShiftJis) { Err = "a view's NAMES encoding is unknown"; return false; }
+        field("MODE", "\"VIEW\"");
+        field("NAMES", Quote(kNames[D.names]));
+    }
+    else field("CODER", D.coder == kBits ? "\"BITS\"" : D.coder == kBits16M ? "\"BITS16M\"" : "\"RANGE\"");
     if (D.shift != 5) field("SHIFT", std::to_string(D.shift));
     if (D.nslots) field("SLOTS", std::to_string(D.nslots));
     if (D.window) field("WINDOW", std::to_string(D.window));
@@ -236,6 +251,7 @@ bool Print(const Description &D, std::string &Out, std::string &Err, const TextN
                 case kA: line += P.array(p.nb); break;
                 case kF: { const char *f = FamilyName(p.nb); if (!f) { Err = "an unknown family"; return false; } line += f; break; }
                 case kK: line += Num(p.imm); break;
+                case kT: line += P.table(p.imm); break;
                 case kL: line += "@" + lab[p.target]; break;
             }
         }
@@ -387,6 +403,7 @@ struct Reader {
                          if (tok[at] == "lz4hc") p.nb = kFamilyLz4hc; else if (tok[at] == "zlib") p.nb = kFamilyZlib; else return fail("no such family: " + tok[at]);
                          ++at; break;
                 case kK: if (!more() || !number(tok[at], v)) return fail("not a number: " + peek()); ++at; p.imm = v; break;
+                case kT: if (!nameOf(tables, "table", v)) return false; p.imm = v; break;
                 case kL: if (!more() || tok[at].size() < 2 || tok[at][0] != '@') return fail("not a label: " + peek());
                          fix.push_back({D.ops.size(), tok[at].substr(1)}); ++at; break;
             }
@@ -433,7 +450,7 @@ bool Read(const std::string &Text, Description &Out, std::string &Err, TextNames
     Description D;
     Reader R{D};
     auto bad = [&](const std::string &m) { Err = m; return false; };
-    static const std::vector<std::string> known = {"NAME", "ISA", "CODER", "SHIFT", "SLOTS", "WINDOW", "MAXLEN", "LEN1SLOT", "HISTORY",
+    static const std::vector<std::string> known = {"NAME", "ISA", "MODE", "NAMES", "CODER", "SHIFT", "SLOTS", "WINDOW", "MAXLEN", "LEN1SLOT", "HISTORY",
                                                    "TOKEN", "REGISTERS", "TABLES", "ARRAYS", "HUFFS", "ENTRY", "TOKEN_ENTRY", "CODE"};
     for (auto it = J.begin(); it != J.end(); ++it)
         if (std::find(known.begin(), known.end(), it.key()) == known.end()) return bad("an unknown description field: " + it.key());
@@ -441,8 +458,20 @@ bool Read(const std::string &Text, Description &Out, std::string &Err, TextNames
     if (!J.contains("NAME") || !J["NAME"].is_string()) return bad("a description needs a NAME");
     D.name = J["NAME"].get<std::string>();
     if (!J.contains("ISA") || !U32(J["ISA"], D.isa)) return bad("a description needs its ISA");
-    if (!J.contains("CODER") || !J["CODER"].is_string()) return bad("a description needs its CODER (BITS or RANGE)");
-    { const std::string c = J["CODER"].get<std::string>(); if (c == "BITS") D.coder = kBits; else if (c == "BITS16M") D.coder = kBits16M; else if (c == "RANGE") D.coder = kRange; else return bad("no such coder: " + c); }
+    if (J.contains("MODE")) {                          // ISA 10: "VIEW" lists the files in a content (viewmode.h)
+        if (!J["MODE"].is_string() || J["MODE"].get<std::string>() != "VIEW") return bad("MODE is \"VIEW\" (a codec names none)");
+        D.view = true;
+        if (J.contains("CODER")) return bad("a view has no CODER");
+        if (!J.contains("NAMES") || !J["NAMES"].is_string()) return bad("a view says how its names are written: NAMES utf-8, ascii, latin-1, utf-16be or shift-jis");
+        const std::string n = J["NAMES"].get<std::string>();
+        if (n == "utf-8") D.names = kNamesUtf8; else if (n == "ascii") D.names = kNamesAscii; else if (n == "latin-1") D.names = kNamesLatin1;
+        else if (n == "utf-16be") D.names = kNamesUtf16be; else if (n == "shift-jis") D.names = kNamesShiftJis;
+        else return bad("no such NAMES encoding: " + n);
+    } else {
+        if (J.contains("NAMES")) return bad("NAMES belongs to a view (MODE \"VIEW\")");
+        if (!J.contains("CODER") || !J["CODER"].is_string()) return bad("a description needs its CODER (BITS or RANGE)");
+        const std::string c = J["CODER"].get<std::string>(); if (c == "BITS") D.coder = kBits; else if (c == "BITS16M") D.coder = kBits16M; else if (c == "RANGE") D.coder = kRange; else return bad("no such coder: " + c);
+    }
     auto num = [&](const char *k, uint32_t &dst, uint32_t max) {
         if (!J.contains(k)) return true;
         if (!U32(J[k], dst) || dst > max) { Err = std::string("a bad ") + k; return false; }

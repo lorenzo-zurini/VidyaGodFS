@@ -45,6 +45,7 @@ set(VGFS_CORE_SRC
     src/deflatelayer.cpp
     src/coding.cpp
     src/codingtext.cpp
+    src/viewmode.cpp
     src/lz4family.cpp
     src/zfamily.cpp
     src/zipscan.cpp

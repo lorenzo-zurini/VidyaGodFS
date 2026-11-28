@@ -76,6 +76,7 @@ bool ParseSpecText(const std::string &Text, Spec &Out, std::string &Err)
             else if (Type == "file")  LS.type = LayerType::File;
             else if (Type == "delta") LS.type = LayerType::Delta;   // a .vgdelta over the earlier layers it names (`bases`)
             else if (Type == "coded") LS.type = LayerType::Coded;   // a stream coded back from its content (`bases`) and decisions
+            else if (Type == "view")  LS.type = LayerType::View;    // the files a listing finds in a content (`bases`)
             else { Err = "unknown layer type: " + Type; return false; }
             LS.source  = L.at("source").get<std::string>();
             LS.target  = NormalizeVPath(L.value("target", std::string()));
@@ -87,15 +88,15 @@ bool ParseSpecText(const std::string &Text, Spec &Out, std::string &Err)
             const auto Bad = [&](const std::string &Why) { Err = "layer " + std::to_string(Self) + ": " + Why; return false; };
             //A layer of bytes — a zip, a delta, a single file (a disc image a delta is built over): what a delta names by CID.
             const bool Bytes = LS.type == LayerType::Zip || LS.type == LayerType::Delta || LS.type == LayerType::File || LS.type == LayerType::Coded;
-            const bool Rebuilt = LS.type == LayerType::Delta || LS.type == LayerType::Coded;
+            const bool Rebuilt = LS.type == LayerType::Delta || LS.type == LayerType::Coded || LS.type == LayerType::View;
             if (L.contains("cid"))
             {
-                if (!Bytes) return Bad("only a zip, a delta or a file has a cid");
+                if (!Bytes && LS.type != LayerType::View) return Bad("only a zip, a delta, a file or a view has a cid");
                 if (!L["cid"].is_string() || L["cid"].get<std::string>().empty()) return Bad("cid must be a non-empty string");
                 LS.cid = L["cid"].get<std::string>();
             }
             if (L.contains("bases") != Rebuilt)
-                return Bad(L.contains("bases") ? "only a delta or a coded stream has bases" : "a delta or a coded stream must name its bases");
+                return Bad(L.contains("bases") ? "only a delta, a coded stream or a view has bases" : "a delta, a coded stream or a view must name its bases");
             if (Rebuilt)
             {
                 //null: the layer named no base (its node has none, or a malformed list): the plan reports it and mounts none
@@ -110,6 +111,7 @@ bool ParseSpecText(const std::string &Text, Spec &Out, std::string &Err)
                     LS.bases.push_back(B.get<std::string>());
                 }
             }
+            if (LS.type == LayerType::View && LS.bases.size() != 1) return Bad("a view names exactly one base: its content");
             if (LS.type == LayerType::Coded)
             {
                 if (LS.bases.size() != 1) return Bad("a coded stream names exactly one base: its content");

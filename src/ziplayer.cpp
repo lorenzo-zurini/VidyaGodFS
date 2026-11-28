@@ -227,6 +227,7 @@ uint64_t ZipDataOffset(const ZipIndex &Z, const ZipEntry &E)
 int OpenZipEntry(ZipIndex &Z, const ZipEntry &E, ZipReader &Out)
 {
     Out.size = E.size;
+    if (E.own) { Out.stored = true; Out.src = E.own.get(); Out.dataOffset = 0; return 0; }   // a VIEW's file of several extents
 
     // Only STORED entries are servable — zero-copy through the ByteSource (no materialization).
     if (E.stored)

@@ -18,6 +18,7 @@
 #include "bytesource.h"
 #include "deflatelayer.h"
 #include "coding.h"
+#include "viewmode.h"
 #include "descbuilders.h"
 #include <nlohmann/json.hpp>
 #include "lz4family.h"
@@ -5330,4 +5331,206 @@ TEST(a_deep_stack_of_mixed_encodings_reads_through_every_layer) {
     if (H) { std::vector<uint8_t> got(S[depth].size()); size_t o = 0;
         while (o < got.size()) { const ssize_t n = VfsRead(H, (char *)got.data() + o, std::min<size_t>(131072, got.size() - o), (off_t)o); if (n <= 0) break; o += (size_t)n; }
         CHECK(o == got.size() && got == S[depth]); VfsRelease(H); }
+}
+
+
+// ---- ISA 10: VIEW mode (viewmode.h, MetaPackageFormat 22.17) -------------------------------------------------------
+// A toy container, "VW01": a u32 count at 4, then 16-byte entries at 8 (u32 name offset, u16 name length, u8 kind, a
+// pad byte, u32 offset, u32 length), the names and the data after them. Kind 0 a file, 1 a folder, 2 a file of 4 bytes
+// every 6 (estride), 3 a file in two extents (epart/efin).
+static const char *kToyView = R"J({
+  "NAME": "toy view", "ISA": 10, "MODE": "VIEW", "NAMES": "latin-1",
+  "REGISTERS": { "i": 1, "n": 2, "e": 3, "k": 4, "o": 5, "l": 6 },
+  "ENTRY": "@v",
+  "CODE": [
+    "@v",
+    "assert (eq (u32be 0) 0x56573031)",
+    "set n (u32 4)",
+    "set i 0",
+    "@next",
+    "jz (lt i n) @done",
+    "set e (add 8 (mul i 16))",
+    "ename (u32 e) (u16 (add e 4))",
+    "set k (byte (add e 6))",
+    "set o (u32 (add e 8))",
+    "set l (u32 (add e 12))",
+    "set i (add i 1)",
+    "jz (eq k 1) @notdir",
+    "edir",
+    "jmp @next",
+    "@notdir",
+    "jz (eq k 2) @notstride",
+    "estride o l 4 6",
+    "jmp @next",
+    "@notstride",
+    "jz (eq k 3) @plain",
+    "epart o 2",
+    "epart (add o 10) (sub l 2)",
+    "efin",
+    "jmp @next",
+    "@plain",
+    "efinish o l",
+    "jmp @next",
+    "@done",
+    "end"
+  ]
+})J";
+struct ToyEntry { std::string name; uint8_t kind; uint32_t off, len; };
+static std::vector<uint8_t> toyContent(const std::vector<ToyEntry> &E, const std::string &Data, uint32_t DataAt) {
+    std::vector<uint8_t> B(8 + 16 * E.size());
+    auto u32 = [&](size_t at, uint32_t v) { for (int i = 0; i < 4; ++i) B[at + i] = (uint8_t)(v >> (8 * i)); };
+    B[0] = 'V'; B[1] = 'W'; B[2] = '0'; B[3] = '1'; u32(4, (uint32_t)E.size());
+    for (size_t i = 0; i < E.size(); ++i) {
+        const size_t e = 8 + 16 * i;
+        u32(e, (uint32_t)B.size()); B[e + 4] = (uint8_t)E[i].name.size(); B[e + 5] = 0; B[e + 6] = E[i].kind;
+        u32(e + 8, E[i].off); u32(e + 12, E[i].len);
+        B.insert(B.end(), E[i].name.begin(), E[i].name.end());
+    }
+    if (B.size() < DataAt) B.resize(DataAt);
+    B.insert(B.end(), Data.begin(), Data.end());
+    return B;
+}
+
+TEST(a_view_lists_the_files_in_its_content) {
+    coding::Description D; std::string Err;
+    CHECK(coding::Read(kToyView, D, Err));
+    if (!Err.empty()) std::cerr << "  toy view: " << Err << "\n";
+    CHECK(D.view && D.names == coding::kNamesLatin1 && D.isa == 10);
+    const uint32_t At = 512;
+    const std::string Data = "hello" "0123456789ABCDEFGH" "xyAAAAAAAAzw!";
+    // hello at 512; the strided run at 517 (0123 then 6789 then CD: 4 of every 6); the two-part file at 535 (xy, then zw! 10 on)
+    const auto Bytes = toyContent({ {"docs", 1, 0, 0}, {"docs/readme.txt", 0, At, 5}, {"a/b/c.bin", 0, At, 2},
+                                    {std::string("caf\xE9.txt"), 0, At + 1, 3}, {"raw.dat", 2, At + 5, 10},
+                                    {"two.dat", 3, At + 23, 5}, {"empty", 0, At, 0} }, Data, At);
+    MemByteSource Src(Bytes);
+    std::vector<coding::ViewEntry> V;
+    CHECK(coding::RunView(D, Src, V, Err));
+    std::vector<std::string> Paths; for (const auto &E : V) Paths.push_back(E.path + (E.dir ? "/" : ""));
+    CHECK((Paths == std::vector<std::string>{ "a/", "a/b/", "a/b/c.bin", "caf\xC3\xA9.txt", "docs/", "docs/readme.txt", "empty", "raw.dat", "two.dat" }));
+    auto find = [&](const std::string &P) -> const coding::ViewEntry * { for (const auto &E : V) if (E.path == P) return &E; return nullptr; };
+    auto bytesOf = [&](const coding::ViewEntry &E) { std::string S; for (const auto &[o, n] : E.extents) S.append((const char *)Bytes.data() + o, n); return S; };
+    CHECK(find("docs/readme.txt") && bytesOf(*find("docs/readme.txt")) == "hello");
+    CHECK(find("raw.dat") && bytesOf(*find("raw.dat")) == "01236789CD" && find("raw.dat")->extents.size() == 3);
+    CHECK(find("two.dat") && bytesOf(*find("two.dat")) == "xyzw!" && find("two.dat")->extents.size() == 2);
+    CHECK(find("empty") && find("empty")->extents.empty() && !find("empty")->dir);
+    //the listing: canonical, read back to the same table, refused when altered
+    const std::string L = coding::ViewListing(V);
+    std::vector<coding::ViewEntry> Back;
+    CHECK(coding::ReadViewListing(L, Back, Err, Bytes.size()));
+    CHECK(coding::ViewListing(Back) == L);
+    CHECK(L.find("f\traw.dat\t10\t517+4,523+4,529+2\n") != std::string::npos);
+    CHECK(!coding::ReadViewListing(L, Back, Err, 520));                                  // an extent past the content
+    std::string Swapped = L; const size_t A1 = Swapped.find("d\ta\n"); Swapped.erase(A1, 4); Swapped += "d\ta\n";
+    CHECK(!coding::ReadViewListing(Swapped, Back, Err));                                  // out of order
+    std::string NoDir = L; NoDir.erase(NoDir.find("d\tdocs\n"), 7);
+    CHECK(!coding::ReadViewListing(NoDir, Back, Err));                                   // a file's folder missing
+    std::string Touch = L; Touch.replace(Touch.find("517+4,523+4,529+2"), 17, "517+4,521+4,529+2");
+    CHECK(!coding::ReadViewListing(Touch, Back, Err));                                   // touching extents are one
+    std::string Size = L; Size.replace(Size.find("raw.dat\t10"), 10, "raw.dat\t11");
+    CHECK(!coding::ReadViewListing(Size, Back, Err));                                    // a size not its extents'
+    //printed and read back: the same description
+    std::string Text; CHECK(coding::Print(D, Text, Err));
+    coding::Description D2; CHECK(coding::Read(Text, D2, Err)); CHECK(coding::Serialize(D2) == coding::Serialize(D));
+}
+
+// A view is untrusted (it comes from a peer): what it lists must be inside its content, named as paths may be, once.
+// Teeth: drop any check below and its case lists.
+TEST(a_view_is_refused_what_it_may_not_list) {
+    coding::Description D; std::string Err;
+    CHECK(coding::Read(kToyView, D, Err));
+    const uint32_t At = 512;
+    auto run = [&](const std::vector<ToyEntry> &E, std::string *Why = nullptr) {
+        const auto B = toyContent(E, "hello world", At);
+        MemByteSource Src(B);
+        std::vector<coding::ViewEntry> V; std::string W;
+        const bool Ok = coding::RunView(D, Src, V, W);
+        if (Why) *Why = W;
+        return Ok;
+    };
+    std::string Why;
+    CHECK(run({ {"f", 0, At, 11} }));
+    CHECK(!run({ {"f", 0, At, 12} }, &Why) && Why.find("outside the content") != std::string::npos);
+    CHECK(!run({ {"../etc/passwd", 0, At, 1} }, &Why) && Why.find("may not list") != std::string::npos);
+    CHECK(!run({ {"a//b", 0, At, 1} }));
+    CHECK(!run({ {"a/./b", 0, At, 1} }));
+    CHECK(!run({ {"a\\b", 0, At, 1} }));
+    CHECK(!run({ {"f", 0, At, 1}, {"f", 0, At, 2} }, &Why) && Why.find("twice") != std::string::npos);
+    CHECK(run({ {"d", 1, 0, 0}, {"d", 1, 0, 0} }));                                     // a folder twice is one folder
+    CHECK(!run({ {"d", 0, At, 1}, {"d/x", 0, At, 1} }, &Why) && Why.find("also a folder") != std::string::npos);
+    CHECK(!run({ {"r", 2, At, 20} }));                                                   // a strided run past the content
+    //not the container it reads: its assert refuses
+    std::vector<uint8_t> NotIt(64, 0);
+    { MemByteSource Src(NotIt); std::vector<coding::ViewEntry> V; CHECK(!coding::RunView(D, Src, V, Why) && Why.find("assert") != std::string::npos); }
+    //a name over 4096 bytes; a loop that never ends: refused by its limits
+    coding::Description Long; CHECK(coding::Read(R"J({"NAME": "n", "ISA": 10, "MODE": "VIEW", "NAMES": "utf-8", "REGISTERS": {"i": 1}, "ENTRY": "@v",
+        "CODE": ["@v", "set i 0", "@l", "jz (lt i 5000) @f", "echar 97", "set i (add i 1)", "jmp @l", "@f", "edir", "end"]})J", Long, Err));
+    { MemByteSource Src(NotIt); std::vector<coding::ViewEntry> V; CHECK(!coding::RunView(Long, Src, V, Why) && Why.find("4096") != std::string::npos); }
+    coding::Description Spin; CHECK(coding::Read(R"J({"NAME": "s", "ISA": 10, "MODE": "VIEW", "NAMES": "utf-8", "ENTRY": "@v", "CODE": ["@v", "jmp @v"]})J", Spin, Err));
+    { MemByteSource Src(NotIt); std::vector<coding::ViewEntry> V; CHECK(!coding::RunView(Spin, Src, V, Why, 100000) && Why.find("too long") != std::string::npos); }
+    //what a view may hold, and where: no coder in a view, no file table in a codec, no view as a codec
+    coding::Description X;
+    CHECK(!coding::Read(R"J({"NAME": "x", "ISA": 10, "MODE": "VIEW", "NAMES": "utf-8", "ENTRY": "@v", "CODE": ["@v", "outlit 1", "end"]})J", X, Err));
+    CHECK(!coding::Read(R"J({"NAME": "x", "ISA": 10, "CODER": "BITS", "ENTRY": "@v", "CODE": ["@v", "edir", "end"]})J", X, Err));
+    CHECK(!coding::Read(R"J({"NAME": "x", "ISA": 9, "MODE": "VIEW", "NAMES": "utf-8", "ENTRY": "@v", "CODE": ["@v", "edir", "end"]})J", X, Err));
+    CHECK(!coding::Read(R"J({"NAME": "x", "ISA": 10, "MODE": "VIEW", "NAMES": "koi8", "ENTRY": "@v", "CODE": ["@v", "end"]})J", X, Err));
+    CHECK(!coding::Read(R"J({"NAME": "x", "ISA": 10, "MODE": "VIEW", "NAMES": "utf-8", "CODER": "BITS", "ENTRY": "@v", "CODE": ["@v", "end"]})J", X, Err));
+    std::vector<uint8_t> Content, Record;
+    CHECK(!coding::Mint(D, NotIt.data(), NotIt.size(), 0, 1024, 0, Content, Record, Why));
+}
+
+// Names as discs write them, read to UTF-8 (the mount presents UTF-8). Teeth: read UTF-16 little-endian; accept an
+// unpaired surrogate; accept a NUL; skip the Shift JIS conversion.
+TEST(a_views_names_are_read_in_its_encoding) {
+    std::string O, Err;
+    CHECK(coding::DecodeViewName(coding::kNamesUtf16be, std::string("\x00" "A" "\x00" "/" "\x00\xE9", 6), O, Err) && O == "A/\xC3\xA9");
+    CHECK(coding::DecodeViewName(coding::kNamesUtf16be, std::string("\xD8\x3D\xDE\x00", 4), O, Err) && O == "\xF0\x9F\x98\x80");   // a surrogate pair
+    CHECK(!coding::DecodeViewName(coding::kNamesUtf16be, std::string("\xD8\x3D", 2), O, Err));                                     // unpaired
+    CHECK(!coding::DecodeViewName(coding::kNamesUtf16be, std::string("\x00", 1), O, Err));                                         // odd length
+    CHECK(!coding::DecodeViewName(coding::kNamesUtf16be, std::string("\x00\x00", 2), O, Err));                                     // NUL
+    CHECK(coding::DecodeViewName(coding::kNamesLatin1, "\xE9t\xE9", O, Err) && O == "\xC3\xA9t\xC3\xA9");
+    CHECK(!coding::DecodeViewName(coding::kNamesAscii, "\xE9", O, Err));
+    CHECK(coding::DecodeViewName(coding::kNamesAscii, "README.TXT", O, Err) && O == "README.TXT");
+    CHECK(!coding::DecodeViewName(coding::kNamesUtf8, "\xC3", O, Err));
+    CHECK(coding::DecodeViewName(coding::kNamesShiftJis, "\x83\x7D\x83\x8A\x83\x49", O, Err) && O == "\xE3\x83\x9E\xE3\x83\xAA\xE3\x82\xAA");   // マリオ
+}
+
+// A VIEW layer (ISA 10): the folder of files a listing finds in a content, served from the content's bytes (one extent
+// in place, several stitched), the content itself bytes only. Teeth: serve a file of several extents from its first
+// only; mount a listing whose extents pass the content; mount a view whose content no layer carries.
+TEST(a_view_mounts_its_contents_files) {
+    TmpDir t;
+    coding::Description D; std::string err;
+    CHECK(coding::Read(kToyView, D, err));
+    const uint32_t At = 512;
+    const std::string Data = "hello" "0123456789ABCDEFGH" "xyAAAAAAAAzw!";
+    const auto Bytes = toyContent({ {"docs/readme.txt", 0, At, 5}, {"raw.dat", 2, At + 5, 10}, {"two.dat", 3, At + 23, 5}, {"empty", 0, At, 0} }, Data, At);
+    MemByteSource Src(Bytes);
+    std::vector<coding::ViewEntry> V; CHECK(coding::RunView(D, Src, V, err));
+    const std::string L = coding::ViewListing(V);
+    std::ofstream(t / "disc.img", std::ios::binary).write((const char *)Bytes.data(), (std::streamsize)Bytes.size());
+    std::ofstream(t / "disc.vgview", std::ios::binary) << L;
+    const std::string spec = std::string(R"({"mountpoint":"/m","readonly":true,"layers":[)")
+        + R"({"type":"file","source":")" + t.str("disc.img") + R"(","target":"","cid":"bafydisc","bytesOnly":true},)"
+        + R"({"type":"view","source":")" + t.str("disc.vgview") + R"(","bases":["bafydisc"],"target":"disc","cid":"bafylisting"}]})";
+    Spec sp; CHECK(ParseSpecText(spec, sp, err)); CHECK(sp.layers.size() == 2 && sp.layers[1].type == LayerType::View);
+    VfsState S; CHECK(S.Init(sp, err));
+    VfsAttr a;
+    CHECK_EQ(VfsGetattr(S, "disc/docs", a), 0); CHECK(a.isDir);
+    CHECK_EQ(VfsGetattr(S, "disc/raw.dat", a), 0); CHECK_EQ(a.size, (uint64_t)10);
+    CHECK_EQ(VfsGetattr(S, "disc.img", a), -ENOENT);                     // the content is bytes only
+    CHECK_EQ(readAll(S, "disc/docs/readme.txt", 3), std::string("hello"));
+    CHECK_EQ(readAll(S, "disc/raw.dat", 3), std::string("01236789CD"));     // three extents, read across them
+    CHECK_EQ(readAll(S, "disc/two.dat", 4), std::string("xyzw!"));
+    CHECK_EQ(readAll(S, "disc/empty", 4), std::string());
+    // a listing past its content: the view is left out; the content named by a CID nothing carries: planned broken
+    std::string Past = L; Past.replace(Past.find("517+4,523+4,529+2"), 17, "517+4,523+4,529+999");
+    Past.replace(Past.find("raw.dat\t10"), 10, "raw.dat\t1007");
+    std::ofstream(t / "past.vgview", std::ios::binary) << Past;
+    Spec bad; CHECK(ParseSpecText(spec.substr(0, spec.find("disc.vgview")) + "past.vgview" + spec.substr(spec.find("disc.vgview") + 11), bad, err));
+    VfsState B; CHECK(B.Init(bad, err)); CHECK_EQ(VfsGetattr(B, "disc/raw.dat", a), -ENOENT);
+    Spec none; CHECK(ParseSpecText(spec.substr(0, spec.rfind("bafydisc")) + "bafynothing" + spec.substr(spec.rfind("bafydisc") + 8), none, err));
+    CHECK(!PlanTree(none).problems.empty());
+    // a view names one content
+    Spec x; CHECK(!ParseSpecText(R"J({"mountpoint":"/m","layers":[{"type":"view","source":"/l","bases":["a","b"]}]})J", x, err));
+    CHECK(!ParseSpecText(R"J({"mountpoint":"/m","layers":[{"type":"view","source":"/l"}]})J", x, err));
 }

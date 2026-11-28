@@ -28,9 +28,9 @@
 
 namespace coding {
 
-constexpr uint32_t kIsa = 9;          // the instruction set a description may use; newer is refused (3: HUFFRUN, BYTERUN; 4: STREAMPOS; 5: PREDICT; 6: U16 U32 U16BE U32BE;
+constexpr uint32_t kIsa = 10;         // the instruction set a description may use; newer is refused (3: HUFFRUN, BYTERUN; 4: STREAMPOS; 5: PREDICT; 6: U16 U32 U16BE U32BE;
                                       // 7: the BITS16M coder, RAWBYTES, DIV MOD, a bounded HUFFRUN; 8: E8FRAME E8END NEAREST;
-                                      // 9: the LZX family: LZXFOLDER LZXEND LZXSIZE LZXEMIT)
+                                      // 9: the LZX family: LZXFOLDER LZXEND LZXSIZE LZXEMIT; 10: VIEW mode, viewmode.h)
 constexpr int kRegs = 64;
 constexpr int kRegPlace = 0;          // register 0: the place in the content
 constexpr uint32_t kNoSlot = 255;
@@ -116,6 +116,18 @@ enum OpCode : uint8_t {
                  // frame: past the folder's last, or the family not at hand)
     OP_LZXEMIT,  // frame x's payload at the stream's byte position: CODE writes it; DECODE compares (register tgt = 1 if the
                  // stream holds it there, else 0; nothing is read)
+    // ---- ISA 10: VIEW mode (a description with view = true: no coder, no stream, no decisions). Run over a content (a disc
+    // image, an archive), it lists the files in it: a file table (viewmode.h). The name being built is bytes, read in
+    // the description's NAMES encoding when the entry is finished; '/' separates folders
+    OP_ENAME,    // the name being built += content bytes [x, x+v) (inside the content; the name at most 4096 bytes)
+    OP_ECHAR,    // the name being built += the byte v (0..255)
+    OP_ETAB,     // the name being built += constant table imm, one byte per element
+    OP_EDIR,     // the name built is a folder (an entry with no bytes); the name starts again
+    OP_EFINISH,  // the name built is a file: content bytes [x, x+v); the name starts again
+    OP_ESTRIDE,  // the name built is a file of v bytes taken imm at a time, one run every m bytes from x (a file of a raw
+                 // 2352-byte CD image: 2048 of every 2352); runs that touch merge; the name starts again
+    OP_EPART,    // the file being built gets content bytes [x, x+v) as its next extent (a file in several extents: UDF)
+    OP_EFIN,     // the name built is a file: the extents EPART gave it, in order; the name and extents start again
     OP_COUNT
 };
 constexpr uint8_t kFree = 1;          // op flag: its value is a decision
@@ -124,9 +136,14 @@ constexpr uint8_t kBounded = 2;       // op flag (HUFFRUN, ISA 7): v bounds the 
 struct Ex { uint8_t op = 0; uint16_t a = 0, b = 0; uint32_t imm = 0; };
 struct Op { uint8_t op = 0, modes = 0, flags = 0, nb = 0, tgt = 0; uint16_t x = 0, v = 0, m = 0, target = 0; uint32_t imm = 0; };
 
+// How a VIEW's names are written in its content (ISA 10): read to UTF-8 when an entry is finished.
+enum Names : uint8_t { kNamesUtf8 = 0, kNamesAscii = 1, kNamesLatin1 = 2, kNamesUtf16be = 3, kNamesShiftJis = 4 };
+
 struct Description {
     std::string name;
     uint32_t isa = 4;                                   // the instruction set it needs (a builder using newer ops says so)
+    bool view = false;                                  // ISA 10: MODE "VIEW" (viewmode.h), else a codec
+    uint8_t names = kNamesUtf8;                         // VIEW: how its names are written
     uint8_t coder = kRange;
     std::vector<Op> ops;
     std::vector<Ex> ex;
