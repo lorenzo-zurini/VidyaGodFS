@@ -5,6 +5,7 @@
 
 #include "test_guard.h"
 #include <random>
+#include <future>
 #include <thread>
 #include <condition_variable>
 #include "overlay.h"
@@ -19,6 +20,7 @@
 #include "deflatelayer.h"
 #include "coding.h"
 #include "viewmode.h"
+#include "treelayer.h"
 #include "descbuilders.h"
 #include <nlohmann/json.hpp>
 #include "lz4family.h"
@@ -5491,7 +5493,9 @@ TEST(a_views_names_are_read_in_its_encoding) {
     CHECK(!coding::DecodeViewName(coding::kNamesAscii, "\xE9", O, Err));
     CHECK(coding::DecodeViewName(coding::kNamesAscii, "README.TXT", O, Err) && O == "README.TXT");
     CHECK(!coding::DecodeViewName(coding::kNamesUtf8, "\xC3", O, Err));
-    CHECK(coding::DecodeViewName(coding::kNamesShiftJis, "\x83\x7D\x83\x8A\x83\x49", O, Err) && O == "\xE3\x83\x9E\xE3\x83\xAA\xE3\x82\xAA");   // マリオ
+    CHECK(coding::DecodeViewName(coding::kNamesCp932, "\x83\x7D\x83\x8A\x83\x49", O, Err) && O == "\xE3\x83\x9E\xE3\x83\xAA\xE3\x82\xAA");   // マリオ
+    CHECK(coding::DecodeViewName(coding::kNamesCp932, "\x81\x60", O, Err) && O == "\xEF\xBD\x9E");     // CP932's table: U+FF5E, never JIS's U+301C
+    CHECK(coding::DecodeViewName(coding::kNamesCp437, "CAF\x90.TXT", O, Err) && O == "CAF\xC3\x89.TXT");   // 0x90 = É
 }
 
 // A VIEW layer (ISA 10): the folder of files a listing finds in a content, served from the content's bytes (one extent
@@ -5533,4 +5537,543 @@ TEST(a_view_mounts_its_contents_files) {
     // a view names one content
     Spec x; CHECK(!ParseSpecText(R"J({"mountpoint":"/m","layers":[{"type":"view","source":"/l","bases":["a","b"]}]})J", x, err));
     CHECK(!ParseSpecText(R"J({"mountpoint":"/m","layers":[{"type":"view","source":"/l"}]})J", x, err));
+}
+
+
+// A TREE (treelayer.h, MetaPackageFormat 22.18): an install whose files are read from its bases — a view's file, a zip's
+// member, a single file — whole (BASE), a range (RANGE), pieces (DELTA), or from its own ADD region; a link; folders. The
+// bases show nowhere. Teeth: read a DELTA's pieces out of order; serve a RANGE from the file's start; mount a tree whose
+// table names other bases than its layer.
+TEST(a_tree_mounts_an_install_over_its_bases) {
+    TmpDir t;
+    coding::Description D; std::string err;
+    CHECK(coding::Read(kToyView, D, err));
+    const uint32_t At = 512;
+    const std::string Data = "hello" "0123456789ABCDEFGH" "xyAAAAAAAAzw!";
+    const auto Disc = toyContent({ {"docs/readme.txt", 0, At, 5}, {"raw.dat", 2, At + 5, 10} }, Data, At);
+    MemByteSource Src(Disc);
+    std::vector<coding::ViewEntry> V; CHECK(coding::RunView(D, Src, V, err));
+    std::ofstream(t / "disc.img", std::ios::binary).write((const char *)Disc.data(), (std::streamsize)Disc.size());
+    std::ofstream(t / "disc.vgview", std::ios::binary) << coding::ViewListing(V);
+    std::string IniOld, IniNew;
+    for (int i = 0; i < 20; ++i) { IniOld += "key" + std::to_string(i) + "=" + std::to_string(i) + "\n"; IniNew += "key" + std::to_string(i) + "=" + std::to_string(i == 7 ? 99 : i) + "\n"; }
+    writeStoreZip(t / "old.zip", { {"bin/game.exe", "MZ-old-game-0123456789", false}, {"docs/game.ini", IniOld, false} });
+    writeFile(t / "track.pcm", "AAAABBBBCCCCDDDD");
+    vgtree::Table T;
+    T.bases = { "bafyview", "bafyold", "bafytrack" };
+    auto F = [](const std::string &P, vgtree::Entry::Op Op, uint32_t B, const std::string &BP, uint64_t Size) {
+        vgtree::Entry E; E.path = P; E.op = Op; E.base = B; E.basePath = BP; E.size = Size; return E; };
+    vgtree::Entry Readme = F("Game/Docs/README.TXT", vgtree::Entry::Same, 0, "docs/readme.txt", 5);
+    vgtree::Entry Raw = F("Game/raw.dat", vgtree::Entry::Same, 0, "raw.dat", 10);
+    vgtree::Entry Exe = F("Game/bin/game.exe", vgtree::Entry::Pieces, 1, "bin/game.exe", 0);
+    Exe.pieces = { {vgtree::Piece::Keep, 0, 3}, {vgtree::Piece::New, 0, 3}, {vgtree::Piece::Keep, 6, 16} };   // "MZ-" "new" "-game-0123456789"
+    Exe.size = 22; Exe.mode = 0755;
+    vgtree::Entry Song = F("Game/music/02.pcm", vgtree::Entry::Range, 2, "", 8); Song.off = 4; Song.len = 8;
+    vgtree::Entry Cfg = F("Game/game.cfg", vgtree::Entry::New, 0, "", 7);
+    vgtree::Entry Ini = F("Game/game.ini", vgtree::Entry::Patch, 1, "docs/game.ini", IniNew.size());
+    std::string IniPatch; CHECK(vgtree::MakePatch(IniOld, IniNew, "docs/game.ini", "Game/game.ini", IniPatch));
+    CHECK(IniPatch.find("-key7=7\n+key7=99\n") != std::string::npos);
+    { std::string A, B, Pt, Back, E;                                                              // CRLF lines, and a last line with no newline
+      for (int i = 0; i < 30; ++i) { A += "line " + std::to_string(i) + "\r\n"; B += (i == 12 ? std::string("changed") : "line " + std::to_string(i)) + "\r\n"; }
+      A += "tail"; B += "tail2";
+      CHECK(vgtree::MakePatch(A, B, "f", "f", Pt) && Pt.find("\\ No newline at end of file") != std::string::npos);
+      CHECK(vgtree::ApplyPatch(A, Pt, Back, E) && Back == B);
+      std::string Big(4000, 'x'), Big2 = Big; Big2[100] = 'y';                                    // one line rewritten whole: not worth a patch
+      CHECK(!vgtree::MakePatch(Big, Big2, "f", "f", Pt)); }
+    vgtree::Entry Lnk; Lnk.path = "Game/latest"; Lnk.kind = vgtree::Entry::Link; Lnk.link = "bin/game.exe";
+    auto Dir = [](const std::string &P) { vgtree::Entry E; E.path = P; E.kind = vgtree::Entry::Dir; return E; };
+    T.entries = { Dir("Game"), Dir("Game/Docs"), Readme, Dir("Game/bin"), Exe, Cfg, Ini, Lnk, Dir("Game/music"), Song, Raw };
+    std::sort(T.entries.begin(), T.entries.end(), [](const vgtree::Entry &a, const vgtree::Entry &b) { return a.path < b.path; });
+    const std::string ExeNew = "new", CfgNew = "fps=60\n";
+    std::map<std::string, vgtree::AddBytes> Adds = { {"Game/bin/game.exe", {(const uint8_t *)ExeNew.data(), ExeNew.size(), false}},
+                                                     {"Game/game.cfg", {(const uint8_t *)CfgNew.data(), CfgNew.size(), true}} };
+    CHECK(vgtree::WriteTree(t.str("install.vgtz"), T, Adds, { {"Game/game.ini", IniPatch} }, err));
+    const std::string spec = std::string(R"J({"mountpoint":"/m","readonly":true,"layers":[)J")
+        + R"J({"type":"file","source":")J" + t.str("disc.img") + R"J(","target":"","cid":"bafydisc","bytesOnly":true},)J"
+        + R"J({"type":"view","source":")J" + t.str("disc.vgview") + R"J(","bases":["bafydisc"],"target":"","cid":"bafyview","bytesOnly":true},)J"
+        + R"J({"type":"zip","source":")J" + t.str("old.zip") + R"J(","target":"","cid":"bafyold","bytesOnly":true},)J"
+        + R"J({"type":"file","source":")J" + t.str("track.pcm") + R"J(","target":"","cid":"bafytrack","bytesOnly":true},)J"
+        + R"J({"type":"tree","source":")J" + t.str("install.vgtz") + R"J(","bases":["bafyview","bafyold","bafytrack"],"target":"C","cid":"bafytree"}]})J";
+    Spec sp; CHECK(ParseSpecText(spec, sp, err)); CHECK(sp.layers.size() == 5 && sp.layers[4].type == LayerType::Tree);
+    CHECK(PlanTree(sp).problems.empty());
+    VfsState S; CHECK(S.Init(sp, err));
+    VfsAttr a;
+    CHECK_EQ(VfsGetattr(S, "C/Game/Docs", a), 0); CHECK(a.isDir);
+    CHECK_EQ(readAll(S, "C/Game/Docs/README.TXT", 2), std::string("hello"));
+    CHECK_EQ(readAll(S, "C/Game/raw.dat", 3), std::string("01236789CD"));       // a view file of three extents
+    CHECK_EQ(readAll(S, "C/Game/bin/game.exe", 4), std::string("MZ-new-game-0123456789"));   // "MZ-" "new" "-game-0123456789"
+    CHECK_EQ(readAll(S, "C/Game/music/02.pcm", 3), std::string("BBBBCCCC"));
+    CHECK_EQ(readAll(S, "C/Game/game.cfg", 5), std::string("fps=60\n"));
+    CHECK_EQ(readAll(S, "C/Game/game.ini", 5), IniNew);                                           // a patch over the zip's file
+    { zip_t *z = zip_open(t.str("install.vgtz").c_str(), ZIP_RDONLY, nullptr); CHECK(z);           // an ordinary zip: its members by name
+      if (z) { CHECK(zip_name_locate(z, "TREE.txt", 0) == 0); CHECK(zip_name_locate(z, "add/Game/game.cfg.add", 0) >= 0);
+               CHECK(zip_name_locate(z, "add/Game/bin/game.exe.add.zst", 0) >= 0); CHECK(zip_name_locate(z, "patch/Game/game.ini.patch", 0) >= 0); zip_close(z); } }
+    CHECK_EQ(VfsGetattr(S, "docs", a), -ENOENT);                                // the bases show nowhere
+    CHECK_EQ(VfsGetattr(S, "bin/game.exe", a), -ENOENT);
+    // the table: canonical, read back, refused when altered
+    std::string Text; CHECK(vgtree::TableText(T, Text, err));
+    vgtree::Table Back; CHECK(vgtree::ReadTable(Text, Back, err));
+    std::string Again; CHECK(vgtree::TableText(Back, Again, err)); CHECK(Again == Text);
+    CHECK(Text.find("pieces\tGame/bin/game.exe\t22\t755\tfrom 1\tbin/game.exe\tkeep 0..3, new 3, keep 6..22\n") != std::string::npos);
+    CHECK(Text.find("patch\tGame/game.ini\t" + std::to_string(IniNew.size()) + "\t-\tfrom 1\tdocs/game.ini\n") != std::string::npos);
+    CHECK(Text.find("new\tGame/game.cfg\t7\t-\n") != std::string::npos);
+    std::string NoDir = Text; NoDir.erase(NoDir.find("dir\tGame/music\n"), 15);
+    CHECK(!vgtree::ReadTable(NoDir, Back, err));
+    std::string Size = Text; Size.replace(Size.find("\t22\t755"), 7, "\t23\t755");
+    CHECK(!vgtree::ReadTable(Size, Back, err));                                // a size not its pieces'
+    std::string Idx = Text; Idx.replace(Idx.find("from 1\tbin"), 10, "from 7\tbin");
+    CHECK(!vgtree::ReadTable(Idx, Back, err));                                 // a base past the list
+    std::string Up = Text; Up.replace(Up.find("Game/game.cfg"), 13, "Game/../x.cfg");
+    CHECK(!vgtree::ReadTable(Up, Back, err));
+    // a tree whose table names other bases than its layer: left out
+    const std::string Was = "\"bases\":[\"bafyview\",\"bafyold\",\"bafytrack\"]", Now = "\"bases\":[\"bafyview\",\"bafytrack\",\"bafyold\"]";
+    Spec bad; CHECK(ParseSpecText(spec.substr(0, spec.rfind(Was)) + Now + spec.substr(spec.rfind(Was) + Was.size()), bad, err));
+    VfsState B; CHECK(B.Init(bad, err)); CHECK_EQ(VfsGetattr(B, "C/Game/game.cfg", a), -ENOENT);
+}
+
+
+// The review's holes (2026-11-28), each pinned. Teeth: evaluate a shared expression once per use (2^60); charge no fuel
+// for expressions; build every prefix of every path; check every ancestor of every listed path; take a 0-byte content
+// as "unchecked"; accept a control byte in a path; accept a codec's fields in a view; accept a name table of non-bytes.
+TEST(a_view_is_bounded_however_it_is_written) {
+    std::string err;
+    // an expression of 60 shared levels (add e e): once per op, a few dozen nodes, not 2^60
+    coding::Description D; D.name = "shared"; D.isa = 10; D.view = true; D.names = coding::kNamesUtf8;
+    coding::Ex c; c.op = coding::EX_CONST; c.imm = 1; D.ex.push_back(c);
+    for (uint16_t i = 1; i <= 60; ++i) { coding::Ex e; e.op = coding::EX_ADD; e.a = (uint16_t)(i - 1); e.b = (uint16_t)(i - 1); D.ex.push_back(e); }
+    coding::Op set; set.op = coding::OP_SET; set.tgt = 1; set.v = 60; coding::Op end; end.op = coding::OP_END;
+    D.ops = { set, end };
+    std::vector<uint8_t> Nothing(16, 0);
+    MemByteSource Src(Nothing);
+    std::vector<coding::ViewEntry> V;
+    const auto T0 = std::chrono::steady_clock::now();
+    CHECK(coding::RunView(D, Src, V, err));
+    CHECK(std::chrono::steady_clock::now() - T0 < std::chrono::seconds(2));
+    CHECK(!coding::RunView(D, Src, V, err, 30) && err.find("too long") != std::string::npos);   // and paid for
+    // deep paths: each ancestor made once (a 2,047-part path as one entry, then 300 more under it)
+    std::string Deep = "x"; for (int i = 0; i < 2046; ++i) Deep += "/a";
+    coding::Description Dp; CHECK(coding::Read(R"J({"NAME": "d", "ISA": 10, "MODE": "VIEW", "NAMES": "utf-8", "TABLES": {"p": [)J" + [&] {
+        std::string L; for (size_t i = 0; i < Deep.size(); ++i) L += (i ? "," : "") + std::to_string((uint8_t)Deep[i]); return L; }()
+        + R"J(]}, "REGISTERS": {"i": 1}, "ENTRY": "@v", "CODE": ["@v", "set i 0", "@l", "jz (lt i 300) @f", "etab p", "echar 47", "echar (add 98 (mod i 20))", "echar (add 98 (div i 20))", "edir", "set i (add i 1)", "jmp @l", "@f", "end"]})J", Dp, err));
+    CHECK(coding::RunView(Dp, Src, V, err));
+    CHECK(V.size() == 2047 + 300);                                        // the 2,047 ancestors once, the 300 leaves
+    // 600 deep paths that share no ancestor (2,047 folders each, 4 KB apiece): refused by the paths' budget, early,
+    // never ~4 GB of folders made first (the review's probe)
+    coding::Description Wide; CHECK(coding::Read(R"J({"NAME": "w", "ISA": 10, "MODE": "VIEW", "NAMES": "utf-8", "TABLES": {"p": [)J" + [&] {
+        std::string L, Tail; for (int i = 0; i < 2045; ++i) Tail += "/a"; for (size_t i = 0; i < Tail.size(); ++i) L += (i ? "," : "") + std::to_string((uint8_t)Tail[i]); return L; }()
+        + R"J(]}, "REGISTERS": {"i": 1}, "ENTRY": "@v", "CODE": ["@v", "set i 0", "@l", "jz (lt i 600) @f", "echar (add 98 (mod i 20))", "echar (add 98 (div i 30))", "etab p", "echar 47", "echar 122", "edir", "set i (add i 1)", "jmp @l", "@f", "end"]})J", Wide, err));
+    const auto W0 = std::chrono::steady_clock::now();
+    CHECK(!coding::RunView(Wide, Src, V, err) && err.find("256 MiB") != std::string::npos);
+    CHECK(std::chrono::steady_clock::now() - W0 < std::chrono::seconds(5));
+    // a name holding a control byte; a codec's fields in a view; a name table of non-bytes
+    coding::Description Esc; CHECK(coding::Read(R"J({"NAME": "e", "ISA": 10, "MODE": "VIEW", "NAMES": "utf-8", "ENTRY": "@v", "CODE": ["@v", "echar 27", "echar 91", "edir", "end"]})J", Esc, err));
+    CHECK(!coding::RunView(Esc, Src, V, err) && err.find("may not list") != std::string::npos);
+    coding::Description X;
+    CHECK(!coding::Read(R"J({"NAME": "x", "ISA": 10, "MODE": "VIEW", "NAMES": "utf-8", "WINDOW": 32768, "ENTRY": "@v", "CODE": ["@v", "end"]})J", X, err));
+    CHECK(!coding::Read(R"J({"NAME": "x", "ISA": 10, "MODE": "VIEW", "NAMES": "utf-8", "TABLES": {"t": [65, 300]}, "ENTRY": "@v", "CODE": ["@v", "etab t", "edir", "end"]})J", X, err));
+    // a listing over an empty content names no byte; a listing missing a middle folder is refused (one pass)
+    std::vector<coding::ViewEntry> L;
+    CHECK(!coding::ReadViewListing("VGVIEW 1\nf\tX\t5\t0+5\n", L, err, 0));
+    CHECK(coding::ReadViewListing("VGVIEW 1\nf\tX\t0\t-\n", L, err, 0));
+    CHECK(!coding::ReadViewListing("VGVIEW 1\nd\ta\nf\ta/b/c\t0\t-\n", L, err));
+    CHECK(coding::ReadViewListing("VGVIEW 1\nd\ta\nd\ta/b\nf\ta/b/c\t0\t-\n", L, err));
+}
+
+
+// A tree's review holes (2026-11-28), each pinned. Teeth: read a link's target as file bytes; serve a B file over a base
+// file of another size; mount a garbage .vgtree; keep a failed tree hiding the zip it was over; give an ambiguous CID
+// to the first layer carrying it; accept a table of 70,000 bases.
+TEST(a_tree_is_refused_what_it_may_not_mount) {
+    TmpDir t;
+    std::string err;
+    writeStoreZip(t / "base.zip", { {"a.txt", "alpha", false}, {"b.txt", "bravo-bravo", false} });
+    auto Dir = [](const std::string &P) { vgtree::Entry E; E.path = P; E.kind = vgtree::Entry::Dir; return E; };
+    auto Base = [](const std::string &P, const std::string &BP, uint64_t N) { vgtree::Entry E; E.path = P; E.op = vgtree::Entry::Same; E.base = 0; E.basePath = BP; E.size = N; return E; };
+    vgtree::Table Good; Good.bases = { "bafybase" };
+    vgtree::Entry Lnk; Lnk.path = "lnk"; Lnk.kind = vgtree::Entry::Link; Lnk.link = "a.txt";
+    Good.entries = { Base("a.txt", "a.txt", 5), Lnk };
+    CHECK(vgtree::WriteTree(t.str("good.vgtz"), Good, {}, {}, err));
+    vgtree::Table Wrong = Good; Wrong.entries = { Base("a.txt", "b.txt", 5) };      // b.txt is 11 bytes: refused whole
+    CHECK(vgtree::WriteTree(t.str("wrong.vgtz"), Wrong, {}, {}, err));
+    writeFile(t / "garbage.vgtz", "PK\x03\x04 not a zip, not a table");
+    auto spec = [&](const std::string &Tree, bool BaseShown) {
+        return std::string(R"J({"mountpoint":"/m","readonly":true,"layers":[{"type":"zip","source":")J") + t.str("base.zip")
+             + R"J(","target":"G","cid":"bafybase")J" + (BaseShown ? "" : R"J(,"bytesOnly":true)J") + R"J(},{"type":"tree","source":")J" + t.str(Tree)
+             + R"J(","bases":["bafybase"],"target":"G","cid":"bafytree"}]})J"; };
+    { Spec sp; CHECK(ParseSpecText(spec("good.vgtz", false), sp, err)); VfsState S; CHECK(S.Init(sp, err));
+      CHECK_EQ(readAll(S, "G/lnk", 2), std::string("alpha"));                  // a tree's link flattens to its file, as a zip's
+      VfsState K; Spec kp = sp; CHECK(K.Init(kp, err)); K.flattenSymlinks = false;
+      std::string L; CHECK_EQ(VfsReadlink(K, "G/lnk", L), 0); CHECK_EQ(L, std::string("a.txt"));
+      CHECK_EQ(readAll(S, "G/a.txt", 2), std::string("alpha")); VfsAttr a; CHECK_EQ(VfsGetattr(S, "G/b.txt", a), -ENOENT); }   // the tree hides its base
+    for (const char *Bad : { "wrong.vgtz", "garbage.vgtz" }) {
+        Spec sp; CHECK(ParseSpecText(spec(Bad, true), sp, err)); VfsState S; CHECK(S.Init(sp, err));
+        CHECK_EQ(readAll(S, "G/b.txt", 3), std::string("bravo-bravo"));         // a failed tree hides nothing: the zip surfaces
+    }
+    // a tree over a tree
+    vgtree::Table Two; Two.bases = { "bafytree" }; Two.entries = { Base("A.TXT", "a.txt", 5) };
+    CHECK(vgtree::WriteTree(t.str("two.vgtz"), Two, {}, {}, err));
+    { const std::string S2 = std::string(R"J({"mountpoint":"/m","readonly":true,"layers":[{"type":"zip","source":")J") + t.str("base.zip")
+            + R"J(","target":"","cid":"bafybase","bytesOnly":true},{"type":"tree","source":")J" + t.str("good.vgtz")
+            + R"J(","bases":["bafybase"],"target":"","cid":"bafytree","bytesOnly":true},{"type":"tree","source":")J" + t.str("two.vgtz")
+            + R"J(","bases":["bafytree"],"target":"top","cid":"bafytwo"}]})J";
+      Spec sp; CHECK(ParseSpecText(S2, sp, err)); VfsState S; CHECK(S.Init(sp, err)); CHECK_EQ(readAll(S, "top/A.TXT", 2), std::string("alpha")); }
+    // one CID, two layers, other bases: a base naming it is refused, never the first one's bytes
+    { const std::string S3 = std::string(R"J({"mountpoint":"/m","readonly":true,"layers":[{"type":"file","source":"/x/c1","cid":"bafyc1"},{"type":"file","source":"/x/c2","cid":"bafyc2"},)J")
+            + R"J({"type":"delta","source":"/x/r","bases":["bafyc1"],"cid":"bafyrec"},{"type":"delta","source":"/x/r","bases":["bafyc2"],"cid":"bafyrec"},)J"
+            + R"J({"type":"delta","source":"/x/next","bases":["bafyrec"],"target":"g"}]})J";
+      Spec sp; CHECK(ParseSpecText(S3, sp, err)); const TreePlan P = PlanTree(sp);
+      bool Said = false; for (const auto &W : P.problems) Said |= W.find("two layers here carry") != std::string::npos;
+      CHECK(Said && P.broken[4]); }
+    // a table of 70,000 bases
+    std::string Many = "VGTZ 1\n"; for (int i = 0; i < 70000; ++i) Many += "base\t" + std::to_string(i) + "\tbafy" + std::to_string(i) + "\n";
+    vgtree::Table M; CHECK(!vgtree::ReadTable(Many, M, err) && err.find("too many bases") != std::string::npos);
+    // exactly the members its table names: one form, so one CID
+    vgtree::Table N1; vgtree::Entry Nw; Nw.path = "n.txt"; Nw.op = vgtree::Entry::New; Nw.size = 3; N1.entries = { Nw };
+    std::string Tx; CHECK(vgtree::TableText(N1, Tx, err));
+    const auto Opens = [&](const char *Name, const std::vector<std::tuple<std::string, std::string, bool>> &Ms) {
+        writeStoreZip(t / Name, Ms); vgtree::Opened O; std::string W;
+        std::ifstream In(t.str(Name), std::ios::binary); std::vector<uint8_t> B((std::istreambuf_iterator<char>(In)), {});
+        return vgtree::OpenTree(std::make_shared<MemByteSource>(B), O, W); };
+    CHECK(Opens("n0.vgtz", { {"TREE.txt", Tx, false}, {"add/n.txt.add", "new", false} }));
+    CHECK(!Opens("n1.vgtz", { {"TREE.txt", Tx, false}, {"add/n.txt.add", "new", false}, {"extra", "x", false} }));
+    CHECK(!Opens("n2.vgtz", { {"TREE.txt", Tx, false}, {"add/n.txt.add", "new", false}, {"add/n.txt.add.zst", "new", false} }));
+    CHECK(!Opens("n3.vgtz", { {"TREE.txt", Tx, false} }));
+    CHECK(!Opens("n4.vgtz", { {"TREE.txt", Tx, false}, {"add/n.txt.add", "new", false}, {"patch/n.txt.patch", "--- a\n+++ b\n", false} }));
+}
+
+
+// The VIEW mutation run's survivors (2026-11-28), every refusal a peer's view can reach, each pinned once.
+namespace {
+struct FailingSource : ByteSource {
+    uint64_t n; explicit FailingSource(uint64_t N) : n(N) {}
+    ssize_t pread(void *, size_t, uint64_t) override { return -1; }
+    uint64_t size() const override { return n; }
+};
+// A view of these ops over N zero bytes: its error ("" when it lists), its entries in Out.
+std::string ViewRun(const std::vector<std::string> &Code, size_t N = 4096, uint64_t Fuel = 1ull << 32, const std::string &Extra = "",
+                    std::vector<coding::ViewEntry> *Out = nullptr, const char *Names = "latin-1") {
+    std::string C; for (size_t i = 0; i < Code.size(); ++i) C += (i ? "," : "") + nlohmann::json(Code[i]).dump();
+    const std::string T = std::string(R"J({"NAME": "t", "ISA": 10, "MODE": "VIEW", "NAMES": ")J") + Names + R"J(", "REGISTERS": {"i": 1, "j": 2})J" + Extra
+                        + R"J(, "ENTRY": "@v", "CODE": ["@v", )J" + C + "]}";
+    coding::Description D; std::string Err;
+    if (!coding::Read(T, D, Err)) return "READ: " + Err;
+    std::vector<uint8_t> Bytes(N, 0);
+    MemByteSource Src(Bytes);
+    std::vector<coding::ViewEntry> V;
+    if (!coding::RunView(D, Src, V, Err, Fuel)) return Err;
+    if (Out) *Out = V;
+    return std::string();
+}
+bool Has(const std::string &E, const char *W) { return E.find(W) != std::string::npos; }
+} // namespace
+
+TEST(a_view_refuses_every_malformed_run) {
+    std::vector<coding::ViewEntry> V;
+    // touching runs are one extent (a cooked image's stride; two touching parts)
+    CHECK(ViewRun({ "echar 97", "estride 512 8 4 4", "end" }, 4096, 1ull << 32, "", &V).empty() && V.size() == 1 && V[0].extents.size() == 1);
+    CHECK(ViewRun({ "echar 97", "epart 512 4", "epart 516 4", "efin", "end" }, 4096, 1ull << 32, "", &V).empty() && V[0].extents.size() == 1);
+    // the limits: extents, entries (repeated folders collapse; files in their own folders do not), a name of exactly 4096
+    CHECK(Has(ViewRun({ "echar 97", "estride 0 4194305 1 2", "end" }, 8388612), "too many extents"));
+    CHECK(Has(ViewRun({ "set i 0", "@l", "jz (lt i 1048577) @f", "echar 100", "edir", "set i (add i 1)", "jmp @l", "@f", "end" }), "too many entries"));
+    CHECK(Has(ViewRun({ "set i 0", "@l", "jz (lt i 1048576) @f", "echar 100", "echar (add 97 (mod i 26))", "echar (add 97 (mod (div i 26) 26))",
+                        "echar (add 97 (mod (div i 676) 26))", "echar (add 97 (mod (div i 17576) 26))", "echar (add 97 (div i 456976))",
+                        "echar 47", "echar 102", "efinish 0 0", "set i (add i 1)", "jmp @l", "@f", "end" }), "too many entries"));
+    CHECK(ViewRun({ "set i 0", "@l", "jz (lt i 4096) @f", "echar 97", "set i (add i 1)", "jmp @l", "@f", "edir", "end" }).empty());
+    CHECK(Has(ViewRun({ "set i 0", "@l", "jz (lt i 4097) @f", "echar 97", "set i (add i 1)", "jmp @l", "@f", "edir", "end" }), "4096"));
+    // fuel: a name's bytes and a stride's runs are paid for
+    CHECK(Has(ViewRun({ "ename 0 1000", "edir", "end" }, 4096, 100), "too long"));
+    CHECK(Has(ViewRun({ "echar 97", "estride 0 20000 1 2", "end" }, 40000, 1000), "too long"));
+    // reads and calls the run cannot make
+    CHECK(Has(ViewRun({ "ename (sub (xleft) 1) 10", "edir", "end" }), "outside the content"));
+    CHECK(Has(ViewRun({ "@f", "call @f" }), "nest too deep"));
+    CHECK(Has(ViewRun({ "ret" }), "a return with no call"));
+    CHECK(Has(ViewRun({ "set i (div 1 0)", "end" }), "division by zero"));
+    CHECK(Has(ViewRun({ "set i (table t 5)", "end" }, 4096, 1ull << 32, R"J(, "TABLES": {"t": [1, 2]})J"), "past its end"));
+    CHECK(Has(ViewRun({ "set i (arr a 5)", "end" }, 4096, 1ull << 32, R"J(, "ARRAYS": {"a": {"SIZE": 2}})J"), "past its end"));
+    CHECK(Has(ViewRun({ "sta a 5 1", "end" }, 4096, 1ull << 32, R"J(, "ARRAYS": {"a": {"SIZE": 2}})J"), "past its end"));
+    CHECK(Has(ViewRun({ "echar 97", "estride 512 8 4 2", "end" }), "stride shorter"));
+    CHECK(Has(ViewRun({ "echar 97", "estride 512 8 4 (sub 0 512)", "end" }), "outside the content"));
+    CHECK(Has(ViewRun({ "echar 97", "end" }), "unfinished"));
+    CHECK(Has(ViewRun({ "epart 512 1", "end" }), "unfinished"));
+    CHECK(Has(ViewRun({ "echar 300", "edir", "end" }), "over 255"));
+    CHECK(Has(ViewRun({ "etab t", "edir", "end" }, 4096, 1ull << 32, R"J(, "TABLES": {"t": [65, 300]})J"), "READ"));
+    // a path's separators and line breaks; a file and a folder of one path, either order
+    for (const char *C : { "echar 9", "echar 10", "echar 13" }) CHECK(Has(ViewRun({ "echar 97", C, "echar 98", "edir", "end" }), "may not list"));
+    CHECK(Has(ViewRun({ "echar 100", "efinish 0 0", "echar 100", "edir", "end" }), "twice"));
+    CHECK(Has(ViewRun({ "echar 100", "edir", "echar 100", "efinish 0 0", "end" }), "twice"));
+    // a content that does not read
+    { coding::Description D; std::string Err; CHECK(coding::Read(R"J({"NAME": "t", "ISA": 10, "MODE": "VIEW", "NAMES": "utf-8", "ENTRY": "@v", "CODE": ["@v", "set r1 (byte 5)", "end"]})J", D, Err));
+      FailingSource F(4096); CHECK(!coding::RunView(D, F, V, Err) && Has(Err, "could not be read")); }
+}
+
+TEST(a_views_names_and_listings_are_read_strictly) {
+    std::string O, Err;
+    CHECK(!coding::DecodeViewName(coding::kNamesUtf16be, std::string("\x00\x41\x42", 3), O, Err));      // odd length
+    CHECK(!coding::DecodeViewName(coding::kNamesUtf16be, std::string("\xD8\x00\xDB\xFF", 4), O, Err));  // a high surrogate, no low
+    CHECK(!coding::DecodeViewName(coding::kNamesUtf16be, std::string("\xDC\x00", 2), O, Err));          // a low surrogate alone
+    CHECK(!coding::DecodeViewName(coding::kNamesAscii, "\x80", O, Err));
+    CHECK(!coding::DecodeViewName(coding::kNamesUtf8, "\xC0\xAF", O, Err));                            // an overlong '/'
+    CHECK(!coding::DecodeViewName(coding::kNamesCp932, std::string("a\0b", 3), O, Err));
+    std::vector<coding::ViewEntry> L;
+    CHECK(!coding::ReadViewListing("VGVIEW 2\n", L, Err));
+    CHECK(!coding::ReadViewListing("VGVIEW 1\nf\tx\t05\t0+5\n", L, Err));
+    CHECK(!coding::ReadViewListing("VGVIEW 1\nf\tx\t5\t0512+5\n", L, Err));
+    CHECK(!coding::ReadViewListing("VGVIEW 1\nf\tx\t18446744073709551616\t-\n", L, Err));
+    CHECK(!coding::ReadViewListing("VGVIEW 1\nf\tx\t0\t512+0\n", L, Err));
+    CHECK(!coding::ReadViewListing("VGVIEW 1\nd\ta\nd\ta\n", L, Err));
+    CHECK(!coding::ReadViewListing("VGVIEW 1\nd\ta\nf\ta//b\t0\t-\n", L, Err));
+    CHECK(!coding::ReadViewListing("VGVIEW 1\nd\ta\nf\ta/../b\t0\t-\n", L, Err));
+    CHECK(coding::ReadViewListing("VGVIEW 1\nd\ta\nf\ta/b\t0\t-\n", L, Err));
+}
+
+TEST(a_view_and_a_codec_never_mix) {
+    coding::Description D; std::string Err;
+    CHECK(!coding::Read(R"J({"NAME": "x", "ISA": 10, "MODE": "VIEW", "NAMES": "utf-8", "ENTRY": "@v", "CODE": ["@v", "code: edir", "end"]})J", D, Err));
+    CHECK(!coding::Read(R"J({"NAME": "x", "ISA": 9, "MODE": "VIEW", "NAMES": "utf-8", "ENTRY": "@v", "CODE": ["@v", "end"]})J", D, Err));
+    CHECK(!coding::Read(R"J({"NAME": "x", "ISA": 10, "MODE": "VIEW", "NAMES": "utf-8", "REGISTERS": {"i": 1}, "ENTRY": "@v", "CODE": ["@v", "set i (bitpos)", "end"]})J", D, Err));
+    CHECK(!coding::Read(R"J({"NAME": "x", "ISA": 10, "MODE": "CODEC", "CODER": "BITS", "ENTRY": "@v", "CODE": ["@v", "end"]})J", D, Err));
+    CHECK(coding::Read(R"J({"NAME": "x", "ISA": 10, "MODE": "VIEW", "NAMES": "ascii", "ENTRY": "@v", "CODE": ["@v", "end"]})J", D, Err) && D.names == coding::kNamesAscii);
+    std::string Text; CHECK(coding::Print(D, Text, Err) && Text.find("\"ascii\"") != std::string::npos);
+    coding::Description Bad = D; Bad.names = 7; CHECK(!coding::Validate(Bad, Err));
+    coding::Description Tab = D; coding::Op Et; Et.op = coding::OP_ETAB; Et.imm = 3; Tab.ops.insert(Tab.ops.begin(), Et); CHECK(!coding::Validate(Tab, Err));
+    std::vector<uint8_t> In(64, 0), Content, Record;
+    CHECK(!coding::Mint(D, In.data(), In.size(), 0, 1024, 0, Content, Record, Err) && Has(Err, "codes no stream"));
+    const auto Desc = coding::Serialize(D);
+    auto Made = coding::CodedByteSource::Create(std::make_shared<MemByteSource>(Desc), std::make_shared<MemByteSource>(std::vector<uint8_t>(16, 0)),
+                                                std::make_shared<MemByteSource>(In), 0, Err);
+    CHECK(!Made && Has(Err, "codes no stream"));
+    // a slice is its own length, wherever it is read
+    auto Src = std::make_shared<MemByteSource>(std::vector<uint8_t>{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    SliceByteSource Sl(Src, 2, 3); uint8_t B[10];
+    CHECK(Sl.pread(B, 10, 0) == 3 && B[0] == 3 && B[2] == 5); CHECK(Sl.pread(B, 10, 5) == 0);
+    // a view spec layer names its one content
+    Spec X; CHECK(!ParseSpecText(R"J({"mountpoint":"/m","layers":[{"type":"view","source":"/l","bases":[]}]})J", X, Err));
+}
+
+TEST(a_mounted_views_folders_list) {
+    TmpDir t;
+    coding::Description D; std::string err;
+    CHECK(coding::Read(kToyView, D, err));
+    const uint32_t At = 512;
+    const auto Bytes = toyContent({ {"docs/readme.txt", 0, At, 5}, {"empty", 1, 0, 0}, {"raw.dat", 0, At, 2} }, "hello", At);
+    MemByteSource Src(Bytes); std::vector<coding::ViewEntry> V; CHECK(coding::RunView(D, Src, V, err));
+    std::ofstream(t / "disc.img", std::ios::binary).write((const char *)Bytes.data(), (std::streamsize)Bytes.size());
+    std::ofstream(t / "disc.vgview", std::ios::binary) << coding::ViewListing(V);
+    const std::string spec = std::string(R"J({"mountpoint":"/m","readonly":true,"layers":[{"type":"file","source":")J") + t.str("disc.img")
+        + R"J(","target":"","cid":"bafydisc","bytesOnly":true},{"type":"view","source":")J" + t.str("disc.vgview") + R"J(","bases":["bafydisc"],"target":"disc"}]})J";
+    Spec sp; CHECK(ParseSpecText(spec, sp, err)); VfsState S; CHECK(S.Init(sp, err));
+    std::set<std::string> Top, Docs, Empty;
+    CHECK_EQ(VfsReaddir(S, "disc", [&](const std::string &n) { Top.insert(n); }), 0);
+    CHECK_EQ(VfsReaddir(S, "disc/docs", [&](const std::string &n) { Docs.insert(n); }), 0);
+    CHECK_EQ(VfsReaddir(S, "disc/empty", [&](const std::string &n) { Empty.insert(n); }), 0);
+    CHECK(Top.count("docs") && Top.count("empty") && Top.count("raw.dat")); CHECK(Docs.count("readme.txt"));
+    for (const char *D0 : { ".", ".." }) { Top.erase(D0); Empty.erase(D0); }
+    CHECK(Empty.empty());
+    // a view whose content nothing carries: no folder, no crash
+    Spec none; CHECK(ParseSpecText(spec.substr(0, spec.rfind("bafydisc")) + "bafynothing" + spec.substr(spec.rfind("bafydisc") + 8), none, err));
+    VfsState N; CHECK(N.Init(none, err)); VfsAttr a; CHECK_EQ(VfsGetattr(N, "disc", a), -ENOENT);
+}
+
+
+// The adversary review of .vgtz (2026-11-28): every bound a peer's tree can push, each pinned.
+TEST(a_tree_patch_is_read_strictly) {
+    std::string New, Err, On, Nn; uint64_t Rm = 0, Ad = 0;
+    const std::string Base = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
+    std::string Edited = Base; Edited.replace(Edited.find("five"), 4, "FIVE");
+    std::string Pt; CHECK(vgtree::MakePatch(Base, Edited, "cfg.txt", "cfg.txt", Pt));
+    CHECK(vgtree::ApplyPatch(Base, Pt, New, Err) && New == Edited);
+    CHECK(vgtree::PatchInfo(Pt, On, Nn, Rm, Ad, Err) && On == "a/cfg.txt" && Nn == "b/cfg.txt" && Rm == 5 && Ad == 5);
+    const auto Refused = [&](const std::string &P) { std::string O, W; return !vgtree::ApplyPatch(Base, P, O, W) && !vgtree::PatchInfo(P, On, Nn, Rm, Ad, W); };
+    const std::string H = "--- a/cfg.txt\n+++ b/cfg.txt\n";
+    CHECK(Refused(H));                                                                          // no hunk: it is 'same'
+    CHECK(Refused(H + "@@ -1,99 +7,0 @@ trailing junk\n-one\n"));                                // junk, counts not its lines
+    CHECK(Refused(H + "@@ -5,1 +5,1 @@\n-five\n+FIVE\n+more\n"));                              // longer than its counts
+    CHECK(Refused(H + "@@ -5,2 +5,2 @@\n-five\n+FIVE\n"));                                     // shorter
+    CHECK(Refused(H + "@@ -5,1 +6,1 @@\n-five\n+FIVE\n"));                                     // its new start elsewhere
+    CHECK(Refused(H + "@@ -5,1 +5,1 @@\n five\n"));                                            // changes nothing
+    CHECK(Refused(H + "@@ -7,1 +7,1 @@\n-seven\n+SEVEN\n@@ -5,1 +5,1 @@\n-five\n+FIVE\n"));    // out of order
+    CHECK(Refused(H + "@@ -05,1 +5,1 @@\n-five\n+FIVE\n"));                                    // a number not as written
+    CHECK(Refused(H + "@@ -5,1 +5,1 @@\n-five\n+FIVE\n\\ No newline at end of file\n@@ -7,1 +7,1 @@\n-seven\n+SEVEN\n"));   // past its end
+    CHECK(Refused("--- a/cfg.txt\n@@ -5,1 +5,1 @@\n-five\n+FIVE\n"));                         // no +++ line
+    { std::string O, W; CHECK(!vgtree::ApplyPatch(Base, H + "@@ -5,1 +5,1 @@\n-FIVE\n+five\n", O, W)); }   // fits not its base
+    { std::string O, W; CHECK(!vgtree::ApplyPatch(Base, H + "@@ -5,1 +5,1 @@\n-five\n+FIVE\n\\ No newline at end of file\n", O, W)); }   // ends before its base
+    { std::string O, W; CHECK(vgtree::ApplyPatch(Base, H + "@@ -10,1 +10,1 @@\n-ten\n+TEN\n\\ No newline at end of file\n", O, W) && O.size() == Base.size() - 1); }   // at its end: its newline taken
+    // UTF-16, either order, behind its mark: over its text, sizes in UTF-16
+    for (const bool Le : { true, false }) {
+        const auto U16 = [&](const std::string &A) { std::string O = Le ? "\xFF\xFE" : "\xFE\xFF"; for (const char c : A) { if (Le) { O += c; O += '\0'; } else { O += '\0'; O += c; } } return O; };
+        const std::string A16 = U16(Base), B16 = U16(Edited);
+        std::string P16; CHECK(vgtree::MakePatch(A16, B16, "s.txt", "s.txt", P16));
+        CHECK(P16.rfind(Le ? "# text utf-16-le\n" : "# text utf-16-be\n", 0) == 0);
+        CHECK(vgtree::ApplyPatch(A16, P16, New, Err) && New == B16);
+        CHECK(vgtree::PatchInfo(P16, On, Nn, Rm, Ad, Err) && Rm == 10 && Ad == 10 && A16.size() - Rm + Ad == B16.size());
+    }
+    // a diff of many changes is bounded: declined, not gigabytes (the review's 80k lines / 2000 changes: OOM at 8 GB)
+    std::string Big, BigB;
+    for (int i = 0; i < 80000; ++i) { Big += "line " + std::to_string(i) + "\n"; BigB += (i % 40 == 0 ? "LINE " : "line ") + std::to_string(i) + "\n"; }
+    const auto T0 = std::chrono::steady_clock::now();
+    std::string BigP; const bool Made = vgtree::MakePatch(Big, BigB, "b", "b", BigP);
+    CHECK(std::chrono::steady_clock::now() - T0 < std::chrono::seconds(20));
+    if (Made) { CHECK(vgtree::ApplyPatch(Big, BigP, New, Err) && New == BigB); }
+    std::string Many; for (int i = 0; i < 9000; ++i) Many += std::to_string(i) + "\n";
+    std::string ManyB; for (int i = 0; i < 9000; ++i) ManyB += std::to_string(i * 7 + 1) + "\n";
+    CHECK(!vgtree::MakePatch(Many, ManyB, "m", "m", BigP));                                     // past its edit steps
+}
+
+TEST(a_trees_added_bytes_read_in_frames) {
+    TmpDir t;
+    std::string err;
+    std::vector<uint8_t> Bin(700000);
+    uint32_t X = 7; for (auto &b : Bin) { X = X * 1103515245u + 12345u; b = (uint8_t)(X >> 24); }   // three frames, none compressible
+    vgtree::Table T; vgtree::Entry E; E.path = "data.bin"; E.op = vgtree::Entry::New; E.size = Bin.size(); T.entries = { E };
+    CHECK(vgtree::WriteTree(t.str("bin.vgtz"), T, { {"data.bin", { Bin.data(), Bin.size(), false }} }, {}, err));
+    const auto Load = [&](const std::string &N) { std::ifstream In(t.str(N), std::ios::binary); return std::vector<uint8_t>((std::istreambuf_iterator<char>(In)), {}); };
+    std::vector<uint8_t> File = Load("bin.vgtz");
+    vgtree::Opened O; CHECK(vgtree::OpenTree(std::make_shared<MemByteSource>(File), O, err));
+    auto Src = vgtree::EntryBytes(O.table.entries[0], [](uint32_t, const std::string &) { return nullptr; }, O, err);
+    CHECK(Src && Src->size() == Bin.size());
+    for (const uint64_t At : { 0ull, 262140ull, 524287ull, 699990ull }) {                       // across frame edges
+        uint8_t B[16]; const ssize_t N = Src->pread(B, 16, At);
+        CHECK(N == (ssize_t)std::min<uint64_t>(16, Bin.size() - At) && std::memcmp(B, Bin.data() + At, (size_t)N) == 0);
+    }
+    // its seekable form is zstd's: the frames decode to the bytes whole
+    { std::string Z = vgtree::SeekableZstd(Bin.data(), Bin.size(), err); std::vector<uint8_t> D(Bin.size());
+      CHECK(ZSTD_decompress(D.data(), D.size(), Z.data(), Z.size()) == Bin.size() && D == Bin); }
+    // a frame corrupted: the tree mounts (adds are read when read), the read fails -EIO, not garbage
+    static const uint8_t Magic[] = { 0x28, 0xB5, 0x2F, 0xFD };
+    const auto Zst = std::search(File.begin(), File.end(), std::begin(Magic), std::end(Magic));
+    CHECK(Zst != File.end());
+    std::vector<uint8_t> Bad = File; Bad[(size_t)(Zst - File.begin()) + 300] ^= 0xFF;
+    { vgtree::Opened Ob; CHECK(vgtree::OpenTree(std::make_shared<MemByteSource>(Bad), Ob, err));
+      auto S = vgtree::EntryBytes(Ob.table.entries[0], [](uint32_t, const std::string &) { return nullptr; }, Ob, err);
+      uint8_t B[16]; CHECK(S && S->pread(B, 16, 0) == -EIO); }
+    // a seek table that lies: refused when read
+    std::string Z = vgtree::SeekableZstd(Bin.data(), Bin.size(), err);
+    std::string Z2 = Z; Z2[Z2.size() - 9] = 9;                                                   // nine frames said, three there
+    CHECK(!vgtree::SeekableZstdSource(std::make_shared<MemByteSource>(std::vector<uint8_t>(Z2.begin(), Z2.end())), err));
+    std::string Z3 = Z; Z3[Z3.size() - 9 - 24 + 4] = (char)0xFF; Z3[Z3.size() - 9 - 24 + 5] = (char)0xFF; Z3[Z3.size() - 9 - 24 + 6] = (char)0x7F;   // a frame of 8 MiB said
+    CHECK(!vgtree::SeekableZstdSource(std::make_shared<MemByteSource>(std::vector<uint8_t>(Z3.begin(), Z3.end())), err));
+    // an add of another size than its table: its reads fail
+    vgtree::Table T2 = T; T2.entries[0].size = Bin.size() - 1;
+    std::string Tx; CHECK(vgtree::TableText(T2, Tx, err));
+    std::string Zs = vgtree::SeekableZstd(Bin.data(), Bin.size(), err);
+    writeStoreZip(t / "lie.vgtz", { {"TREE.txt", Tx, false}, {"add/data.bin.add.zst", Zs, false} });
+    { vgtree::Opened Ol; std::vector<uint8_t> F = Load("lie.vgtz"); CHECK(vgtree::OpenTree(std::make_shared<MemByteSource>(F), Ol, err));
+      auto S = vgtree::EntryBytes(Ol.table.entries[0], [](uint32_t, const std::string &) { return nullptr; }, Ol, err);
+      uint8_t B[4]; CHECK(S && S->pread(B, 4, 0) == -EIO); }
+}
+
+TEST(a_tree_table_has_one_form) {
+    std::string err;
+    vgtree::Table T; T.bases = { "bafybase" };
+    vgtree::Entry K; K.path = "k"; K.op = vgtree::Entry::Pieces; K.base = 0; K.basePath = "b"; K.size = 4;
+    K.pieces = { { vgtree::Piece::Keep, 0, 4 } };
+    std::string Tx;
+    { vgtree::Table A = T; A.entries = { K }; CHECK(!vgtree::TableText(A, Tx, err)); }                 // one kept piece: a range
+    { vgtree::Table A = T; vgtree::Entry Z = K; Z.pieces = { { vgtree::Piece::Zero, 0, 2 }, { vgtree::Piece::New, 0, 2 } }; A.entries = { Z }; CHECK(!vgtree::TableText(A, Tx, err)); }   // keeps nothing: new
+    { vgtree::Table A = T; vgtree::Entry Z; Z.path = "e"; Z.op = vgtree::Entry::Same; Z.base = 0; Z.basePath = "b"; Z.size = 0; A.entries = { Z }; CHECK(!vgtree::TableText(A, Tx, err)); }   // empty: new
+    { vgtree::Table A = T; A.bases = { "bafybase", "bafybase" }; CHECK(!vgtree::TableText(A, Tx, err)); }   // a base twice
+    for (const char *To : { "/etc/passwd", "../../x", "a//b", "../x" }) {                       // a link leaves its tree
+        vgtree::Table A = T; vgtree::Entry L; L.path = "lnk"; L.kind = vgtree::Entry::Link; L.link = To; A.entries = { L };
+        CHECK(!vgtree::TableText(A, Tx, err));
+    }
+    { vgtree::Table A = T; vgtree::Entry D; D.path = "d"; D.kind = vgtree::Entry::Dir; vgtree::Entry L; L.path = "d/lnk"; L.kind = vgtree::Entry::Link; L.link = "../top.txt";
+      A.entries = { D, L }; CHECK(vgtree::TableText(A, Tx, err)); }                             // up to its top: inside
+    // a table line in any other form: refused
+    vgtree::Table M; CHECK(!vgtree::ReadTable("VGTZ 1\nnew\tx\t3\t0644\n", M, err));
+    CHECK(!vgtree::ReadTable("VGTZ 1\nnew\tx\t3\t644\textra\n", M, err));
+    CHECK(vgtree::ReadTable("VGTZ 1\nbase\t0\tbafy\nrange\tx\t3\t-\tfrom 0\tb\t0..3\n", M, err));   // a range reads (its base decides 'same')
+    CHECK(!vgtree::ReadTable("VGTZ 1\nbase\t0\tbafy\npieces\tx\t4\t-\tfrom 0\tb\tkeep 0..2,new 2\n", M, err));
+    CHECK(vgtree::ReadTable("VGTZ 1\nbase\t0\tbafy\npieces\tx\t4\t-\tfrom 0\tb\tkeep 0..2, new 2\n", M, err));
+}
+
+TEST(a_tree_patch_mounts_lazily_and_bounded) {
+    TmpDir t;
+    std::string err;
+    std::string Base; for (int i = 0; i < 20; ++i) Base += "key" + std::to_string(i) + "=" + std::to_string(i) + "\n";
+    std::string Edited = Base; Edited.replace(Edited.find("key9=9"), 6, "key9=99");
+    writeStoreZip(t / "base.zip", { {"cfg.ini", Base, false} });
+    std::string Pt; CHECK(vgtree::MakePatch(Base, Edited, "cfg.ini", "cfg.ini", Pt));
+    vgtree::Table T; T.bases = { "bafybase" };
+    vgtree::Entry E; E.path = "cfg.ini"; E.op = vgtree::Entry::Patch; E.base = 0; E.basePath = "cfg.ini"; E.size = Edited.size(); T.entries = { E };
+    CHECK(vgtree::WriteTree(t.str("p.vgtz"), T, {}, { {"cfg.ini", Pt} }, err));
+    std::string Tx; CHECK(vgtree::TableText(T, Tx, err));
+    const auto Mount = [&](const std::string &Tree) {
+        const std::string spec = std::string(R"J({"mountpoint":"/m","readonly":true,"layers":[{"type":"zip","source":")J") + t.str("base.zip")
+             + R"J(","target":"G","cid":"bafybase","bytesOnly":true},{"type":"tree","source":")J" + t.str(Tree) + R"J(","bases":["bafybase"],"target":"G","cid":"bafytree"}]})J";
+        return spec; };
+    { Spec sp; CHECK(ParseSpecText(Mount("p.vgtz"), sp, err)); VfsState S; CHECK(S.Init(sp, err)); CHECK_EQ(readAll(S, "G/cfg.ini", 2), Edited); }
+    // a patch naming other files, or making another size: refused whole at mount (nothing shown)
+    const auto Refused = [&](const char *Name, const std::string &P, uint64_t Size) {
+        vgtree::Table X = T; X.entries[0].size = Size; std::string Xt; CHECK(vgtree::TableText(X, Xt, err));
+        writeStoreZip(t / Name, { {"TREE.txt", Xt, false}, {"patch/cfg.ini.patch", P, false} });
+        Spec sp; CHECK(ParseSpecText(Mount(Name), sp, err)); VfsState S; CHECK(S.Init(sp, err));
+        VfsAttr a; return VfsGetattr(S, "G/cfg.ini", a) == -ENOENT; };
+    std::string Other = Pt; Other.replace(Other.find("b/cfg.ini"), 9, "b/xyz.ini");
+    CHECK(Refused("names.vgtz", Other, Edited.size()));
+    CHECK(Refused("size.vgtz", Pt, Edited.size() + 1));
+    // a patch whose lines are not its base's: mounts (its grammar and size hold), its reads fail -EIO
+    std::string Wrong = Pt; Wrong.replace(Wrong.find("-key9=9"), 7, "-key9=8");
+    writeStoreZip(t / "wrong.vgtz", { {"TREE.txt", Tx, false}, {"patch/cfg.ini.patch", Wrong, false} });
+    { Spec sp; CHECK(ParseSpecText(Mount("wrong.vgtz"), sp, err)); VfsState S; CHECK(S.Init(sp, err));
+      VfsAttr a; CHECK_EQ(VfsGetattr(S, "G/cfg.ini", a), 0); CHECK(readAll(S, "G/cfg.ini", 2).empty()); }
+}
+
+TEST(a_cid_on_a_zip_and_a_file_is_one_cid) {
+    std::string err;
+    const std::string S1 = R"J({"mountpoint":"/m","readonly":true,"layers":[{"type":"zip","source":"/x/a.zip","cid":"bafyz","bytesOnly":true},{"type":"file","source":"/x/a.zip","cid":"bafyz","bytesOnly":true},)J"
+        R"J({"type":"delta","source":"/x/d","bases":["bafyz"],"target":"g"}]})J";
+    Spec sp; CHECK(ParseSpecText(S1, sp, err)); const TreePlan P = PlanTree(sp);
+    bool Said = false; for (const auto &W : P.problems) Said |= W.find("two layers here carry") != std::string::npos;
+    CHECK(!Said && !P.broken[2]);
+}
+
+
+// The adversary's verify (2026-11-28): a patch over a patch across trees (a chain of versions), and one CID on a zip and a
+// file serving a tree in either order.
+TEST(a_patch_over_a_patch_reads_through_a_chain_of_trees) {
+    TmpDir t;
+    std::string err;
+    std::string V0; for (int i = 0; i < 20; ++i) V0 += "opt" + std::to_string(i) + "=0\n";
+    std::string V1 = V0; V1.replace(V1.find("opt3=0"), 6, "opt3=1");
+    std::string V2 = V1; V2.replace(V2.find("opt15=0"), 7, "opt15=2");
+    vgtree::Table T0; vgtree::Entry N; N.path = "c.ini"; N.op = vgtree::Entry::New; N.size = V0.size(); T0.entries = { N };
+    CHECK(vgtree::WriteTree(t.str("t0.vgtz"), T0, { {"c.ini", { (const uint8_t *)V0.data(), V0.size(), true }} }, {}, err));
+    const auto Over = [&](const char *Name, const char *Base, const std::string &Old, const std::string &New) {
+        std::string Pt; CHECK(vgtree::MakePatch(Old, New, "c.ini", "c.ini", Pt));
+        vgtree::Table T; T.bases = { Base };
+        vgtree::Entry E; E.path = "c.ini"; E.op = vgtree::Entry::Patch; E.base = 0; E.basePath = "c.ini"; E.size = New.size(); T.entries = { E };
+        CHECK(vgtree::WriteTree(t.str(Name), T, {}, { {"c.ini", Pt} }, err)); };
+    Over("t1.vgtz", "bafyt0", V0, V1);
+    Over("t2.vgtz", "bafyt1", V1, V2);
+    const std::string spec = std::string(R"J({"mountpoint":"/m","readonly":true,"layers":[)J")
+        + R"J({"type":"tree","source":")J" + t.str("t0.vgtz") + R"J(","bases":[],"target":"","cid":"bafyt0","bytesOnly":true},)J"
+        + R"J({"type":"tree","source":")J" + t.str("t1.vgtz") + R"J(","bases":["bafyt0"],"target":"","cid":"bafyt1","bytesOnly":true},)J"
+        + R"J({"type":"tree","source":")J" + t.str("t2.vgtz") + R"J(","bases":["bafyt1"],"target":"G","cid":"bafyt2"}]})J";
+    Spec sp; CHECK(ParseSpecText(spec, sp, err)); VfsState S; CHECK(S.Init(sp, err));
+    auto Got = std::make_shared<std::promise<std::string>>();
+    auto F = Got->get_future();
+    std::thread([&S, Got] { Got->set_value(readAll(S, "G/c.ini", 2)); }).detach();
+    if (F.wait_for(std::chrono::seconds(15)) != std::future_status::ready) { std::fprintf(stderr, "  FAIL a patch over a patch hangs\n"); std::_Exit(1); }
+    CHECK_EQ(F.get(), V2);
+}
+
+TEST(a_tree_reads_a_cid_on_a_zip_and_a_file_in_either_order) {
+    TmpDir t;
+    std::string err;
+    writeStoreZip(t / "base.zip", { {"a.txt", "alpha", false} });
+    const uint64_t ZipSize = fs::file_size(t / "base.zip");
+    vgtree::Table T; T.bases = { "bafyz" };
+    vgtree::Entry A; A.path = "a.txt"; A.op = vgtree::Entry::Same; A.base = 0; A.basePath = "a.txt"; A.size = 5;
+    vgtree::Entry W; W.path = "whole.zip"; W.op = vgtree::Entry::Same; W.base = 0; W.basePath = ""; W.size = ZipSize;
+    T.entries = { A, W };
+    CHECK(vgtree::WriteTree(t.str("t.vgtz"), T, {}, {}, err));
+    const std::string Zip = std::string(R"J({"type":"zip","source":")J") + t.str("base.zip") + R"J(","target":"","cid":"bafyz","bytesOnly":true})J";
+    const std::string File = std::string(R"J({"type":"file","source":")J") + t.str("base.zip") + R"J(","target":"","cid":"bafyz","bytesOnly":true})J";
+    const std::string Tree = std::string(R"J({"type":"tree","source":")J") + t.str("t.vgtz") + R"J(","bases":["bafyz"],"target":"G","cid":"bafyt"})J";
+    for (const bool ZipFirst : { true, false }) {
+        const std::string spec = std::string(R"J({"mountpoint":"/m","readonly":true,"layers":[)J") + (ZipFirst ? Zip + "," + File : File + "," + Zip) + "," + Tree + "]}";
+        Spec sp; CHECK(ParseSpecText(spec, sp, err)); VfsState S; CHECK(S.Init(sp, err));
+        CHECK_EQ(readAll(S, "G/a.txt", 3), std::string("alpha"));
+        VfsAttr a; CHECK_EQ(VfsGetattr(S, "G/whole.zip", a), 0); CHECK_EQ((uint64_t)a.size, ZipSize);
+    }
 }

@@ -26,6 +26,9 @@ constexpr size_t kViewMaxEntries = 1u << 20;
 constexpr size_t kViewMaxName = 4096;          // bytes of a name as built (before it is read as text)
 constexpr size_t kViewMaxExtents = 1u << 22;   // every file's together
 constexpr size_t kViewMaxCalls = 1024;
+constexpr size_t kViewMaxNameBytes = 64u << 20;  // every name's bytes together
+constexpr size_t kViewMaxPath = 16384;           // a listed path's bytes (4096 built read as UTF-8)
+constexpr size_t kViewMaxPathBytes = 256u << 20; // every path a run keeps (its folders made for ancestors too), together
 
 struct ViewEntry {
     std::string path;                                     // UTF-8, '/' between parts; no empty, "." or ".." part
@@ -37,7 +40,14 @@ struct ViewEntry {
 // Run a VIEW description over Content. Out: every folder and file, sorted by path (bytewise), a folder for every
 // path's ancestors too. False (Err says why) for a run that is refused: an assert that fails, a name that is not text in
 // the description's NAMES, a path listed twice, an extent outside the content, a limit passed.
-bool RunView(const Description &D, ByteSource &Content, std::vector<ViewEntry> &Out, std::string &Err, uint64_t Fuel = 1ull << 34);
+bool RunView(const Description &D, ByteSource &Content, std::vector<ViewEntry> &Out, std::string &Err, uint64_t Fuel = 1ull << 32);
+
+// A path a VIEW (or a TREE) may list: parts between '/', none empty, "." or ".."; no NUL, '\\', tab, CR or newline.
+bool GoodViewPath(const std::string &Path);
+// A path fit for a message (a log, a terminal): control bytes as '?', cut at 200 bytes.
+std::string PrintablePath(const std::string &Path);
+// Well-formed UTF-8 (shortest forms, no surrogates, no NUL).
+bool ValidUtf8Text(const std::string &S);
 
 // A name as built (bytes in the description's NAMES encoding) read to UTF-8.
 bool DecodeViewName(uint8_t Names, const std::string &Raw, std::string &Utf8, std::string &Err);
@@ -46,8 +56,9 @@ bool DecodeViewName(uint8_t Names, const std::string &Raw, std::string &Utf8, st
 //   "d\t<path>\n"  or  "f\t<path>\t<size>\t<off>+<len>,<off>+<len>…\n"   (numbers decimal; a file of no bytes: "-")
 // Entries must be as RunView gives them (sorted, ancestors present). Paths hold no tab, newline or NUL.
 std::string ViewListing(const std::vector<ViewEntry> &Entries);
-// Read a listing back, refusing anything ViewListing would not write. ContentSize > 0: every extent must lie inside it.
-bool ReadViewListing(const std::string &Text, std::vector<ViewEntry> &Out, std::string &Err, uint64_t ContentSize = 0);
+// Read a listing back, refusing anything ViewListing would not write, and any extent past ContentSize (the default:
+// unchecked; a mount passes its content's size, 0 too).
+bool ReadViewListing(const std::string &Text, std::vector<ViewEntry> &Out, std::string &Err, uint64_t ContentSize = UINT64_MAX);
 
 } // namespace coding
 

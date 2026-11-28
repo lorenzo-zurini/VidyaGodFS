@@ -8,6 +8,7 @@
 #include <functional>
 #include <map>
 #include <set>
+#include <unordered_set>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -76,7 +77,8 @@ bool Utf8Append(uint32_t C, std::string &O) {
     return true;
 }
 
-bool ValidUtf8(const std::string &S) {
+} // namespace
+bool ValidUtf8Text(const std::string &S) {
     for (size_t i = 0; i < S.size();) {
         const uint8_t c = (uint8_t)S[i];
         size_t n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
@@ -88,6 +90,18 @@ bool ValidUtf8(const std::string &S) {
     }
     return true;
 }
+namespace {
+
+// CP437 0x80..0xFF (the IBM PC's OEM code page: what DOS-era archives and CABs without the UTF flag write)
+const uint16_t kCp437[128] = {
+    0x00C7,0x00FC,0x00E9,0x00E2,0x00E4,0x00E0,0x00E5,0x00E7,0x00EA,0x00EB,0x00E8,0x00EF,0x00EE,0x00EC,0x00C4,0x00C5,
+    0x00C9,0x00E6,0x00C6,0x00F4,0x00F6,0x00F2,0x00FB,0x00F9,0x00FF,0x00D6,0x00DC,0x00A2,0x00A3,0x00A5,0x20A7,0x0192,
+    0x00E1,0x00ED,0x00F3,0x00FA,0x00F1,0x00D1,0x00AA,0x00BA,0x00BF,0x2310,0x00AC,0x00BD,0x00BC,0x00A1,0x00AB,0x00BB,
+    0x2591,0x2592,0x2593,0x2502,0x2524,0x2561,0x2562,0x2556,0x2555,0x2563,0x2551,0x2557,0x255D,0x255C,0x255B,0x2510,
+    0x2514,0x2534,0x252C,0x251C,0x2500,0x253C,0x255E,0x255F,0x255A,0x2554,0x2569,0x2566,0x2560,0x2550,0x256C,0x2567,
+    0x2568,0x2564,0x2565,0x2559,0x2558,0x2552,0x2553,0x256B,0x256A,0x2518,0x250C,0x2588,0x2584,0x258C,0x2590,0x2580,
+    0x03B1,0x00DF,0x0393,0x03C0,0x03A3,0x03C3,0x00B5,0x03C4,0x03A6,0x0398,0x03A9,0x03B4,0x221E,0x03C6,0x03B5,0x2229,
+    0x2261,0x00B1,0x2265,0x2264,0x2320,0x2321,0x00F7,0x2248,0x00B0,0x2219,0x00B7,0x221A,0x207F,0x00B2,0x25A0,0x00A0 };
 
 bool ShiftJis(const std::string &Raw, std::string &O) {
 #ifdef _WIN32
@@ -102,9 +116,8 @@ bool ShiftJis(const std::string &Raw, std::string &O) {
     WideCharToMultiByte(CP_UTF8, 0, Ws.data(), W, O.data(), U, nullptr, nullptr);
     return true;
 #else
-    iconv_t Cd = iconv_open("UTF-8", "CP932");                        // Windows-31J: Shift JIS as discs carry it
-    if (Cd == (iconv_t)-1) Cd = iconv_open("UTF-8", "SHIFT_JIS");
-    if (Cd == (iconv_t)-1) return false;
+    iconv_t Cd = iconv_open("UTF-8", "CP932");                        // Windows-31J: Shift JIS as discs carry it, on every
+    if (Cd == (iconv_t)-1) return false;                              // host alike (SHIFT_JIS reads 5C as a yen: another listing)
     std::string In = Raw;
     O.assign(Raw.size() * 4 + 4, '\0');
     char *Ip = In.data(), *Op = O.data();
@@ -119,7 +132,13 @@ bool ShiftJis(const std::string &Raw, std::string &O) {
 
 // A path as a VIEW may list it: parts between '/', none empty, ".", ".." or holding a NUL, '\', tab or newline (a
 // listing's own separators).
-bool GoodPath(const std::string &P) {
+} // namespace
+std::string PrintablePath(const std::string &P) {
+    std::string O;
+    for (const char c : P) O += ((uint8_t)c < 0x20 || c == 0x7F) ? '?' : c;
+    return O.size() > 200 ? O.substr(0, 200) + "…" : O;
+}
+bool GoodViewPath(const std::string &P) {
     if (P.empty()) return false;
     size_t B = 0;
     for (;;) {
@@ -129,9 +148,10 @@ bool GoodPath(const std::string &P) {
         if (E == std::string::npos) break;
         B = E + 1;
     }
-    for (const char c : P) if (c == '\0' || c == '\\' || c == '\t' || c == '\n' || c == '\r') return false;
+    for (const char c : P) if ((uint8_t)c < 0x20 || c == 0x7F || c == '\\') return false;   // no control byte (a log, a terminal), no '\\'
     return true;
 }
+namespace {
 
 std::string Dec(uint64_t V) { return std::to_string(V); }
 
@@ -141,7 +161,7 @@ bool DecodeViewName(uint8_t Names, const std::string &Raw, std::string &O, std::
     O.clear();
     bool ok = true;
     switch (Names) {
-        case kNamesUtf8: ok = ValidUtf8(Raw); if (ok) O = Raw; break;
+        case kNamesUtf8: ok = ValidUtf8Text(Raw); if (ok) O = Raw; break;
         case kNamesAscii: for (const char c : Raw) { if ((uint8_t)c >= 0x80 || c == 0) { ok = false; break; } O += c; } break;
         case kNamesLatin1: for (const char c : Raw) if (!Utf8Append((uint8_t)c, O)) { ok = false; break; } break;
         case kNamesUtf16be:
@@ -157,7 +177,10 @@ bool DecodeViewName(uint8_t Names, const std::string &Raw, std::string &O, std::
                 ok = Utf8Append(C, O);
             }
             break;
-        case kNamesShiftJis: ok = ShiftJis(Raw, O) && ValidUtf8(O); break;
+        case kNamesCp932: ok = ShiftJis(Raw, O) && ValidUtf8Text(O); break;
+        case kNamesCp437:                                       // a fixed table, the same on every host
+            for (const char c : Raw) { const uint8_t b = (uint8_t)c; if (!Utf8Append(b < 0x80 ? b : kCp437[b - 0x80], O)) { ok = false; break; } }
+            break;
         default: Err = "a view's NAMES encoding is unknown"; return false;
     }
     if (!ok) { Err = "a name that is not text in the view's NAMES encoding"; return false; }
@@ -188,8 +211,20 @@ bool RunView(const Description &D, ByteSource &Content, std::vector<ViewEntry> &
     bool bad = false;
     std::string why;
     auto refuse = [&](const std::string &m) { if (!bad) { bad = true; why = m; } return (uint64_t)0; };
-    //(recursive: depth ≤ 512)
-    std::function<uint64_t(uint16_t)> ev = [&](uint16_t i) -> uint64_t {
+    //Each op's values once (an expression shared by others is evaluated once per op: no blow-up), every node evaluated
+    //paid for in fuel; recursive, depth ≤ 512.
+    std::vector<uint64_t> Val(nex);
+    std::vector<uint32_t> Stamp(nex, 0);
+    uint32_t Gen = 0;
+    std::function<uint64_t(uint16_t)> ev0;
+    const auto ev = [&](uint16_t i) -> uint64_t {
+        if (Stamp[i] == Gen) return Val[i];
+        if (Fuel == 0) return refuse("a view that runs too long");
+        --Fuel;
+        Val[i] = ev0(i); Stamp[i] = Gen;
+        return Val[i];
+    };
+    ev0 = [&](uint16_t i) -> uint64_t {
         const Ex &e = D.ex[i];
         switch (e.op) {
             case EX_CONST: return e.imm;
@@ -240,12 +275,20 @@ bool RunView(const Description &D, ByteSource &Content, std::vector<ViewEntry> &
         Got.push_back({Name, Dir, std::move(Ext)});
         Name.clear();
     };
-    const auto nameAdd = [&](uint64_t N) { if (Name.size() + N > kViewMaxName) { refuse("a name over 4096 bytes"); return false; } return true; };
+    uint64_t NameBytes = 0;                                  // every name's together (kViewMaxNameBytes)
+    const auto nameAdd = [&](uint64_t N) {
+        if (Name.size() + N > kViewMaxName) { refuse("a name over 4096 bytes"); return false; }
+        if (NameBytes + N > kViewMaxNameBytes) { refuse("a view whose names pass 64 MiB"); return false; }
+        if (Fuel < N) { refuse("a view that runs too long"); return false; }
+        Fuel -= N; NameBytes += N;                           // a name byte is paid for, however it is added
+        return true;
+    };
     uint32_t pc = D.entryStream;
     for (;;) {
         if (bad) break;
         if (Fuel-- == 0) { refuse("a view that runs too long"); break; }
         if (pc >= D.ops.size()) { refuse("a view that runs past its last op"); break; }
+        if (++Gen == 0) { std::fill(Stamp.begin(), Stamp.end(), 0); Gen = 1; }
         const Op &p = D.ops[pc++];
         switch (p.op) {
             case OP_SET: R[p.tgt] = ev(p.v); break;
@@ -258,10 +301,9 @@ bool RunView(const Description &D, ByteSource &Content, std::vector<ViewEntry> &
             case OP_END: goto done;
             case OP_ENAME: {
                 const uint64_t o = ev(p.x), n = ev(p.v);
-                if (bad || !nameAdd(n)) break;
+                if (bad) break;
                 if (!inside(o, n)) { refuse("a name outside the content"); break; }
-                if (Fuel < n) { refuse("a view that runs too long"); break; }
-                Fuel -= n;
+                if (!nameAdd(n)) break;
                 if (!C.bytes(o, n, Name)) refuse("the content could not be read");
                 break;
             }
@@ -269,7 +311,7 @@ bool RunView(const Description &D, ByteSource &Content, std::vector<ViewEntry> &
             case OP_ETAB: {
                 const auto &T = D.tables[p.imm];
                 if (!nameAdd(T.size())) break;
-                for (const uint32_t c : T) { if (c > 255) { refuse("a name table holding a value over 255"); break; } Name += (char)c; }
+                for (const uint32_t c : T) Name += (char)c;          // (Validate: a name table's values are bytes)
                 break;
             }
             case OP_EDIR: entry(true, {}); break;
@@ -302,11 +344,13 @@ done:
     //Names read as text, paths checked; a folder for every ancestor; one entry a path.
     std::map<std::string, size_t> At;
     std::vector<ViewEntry> All;
-    std::set<std::string> Dirs;
+    uint64_t PathBytes = 0;                                   // every path kept (twice: the table and its index), together
+    const auto keep = [&](const std::string &P) { PathBytes += 2 * (P.size() + 32); return PathBytes <= kViewMaxPathBytes; };
     for (Raw &G : Got) {
         ViewEntry E;
         if (!DecodeViewName(D.names, G.name, E.path, Err)) return false;
-        if (!GoodPath(E.path)) { Err = "a path a view may not list: '" + E.path + "'"; return false; }
+        if (!GoodViewPath(E.path)) { Err = "a path a view may not list: '" + PrintablePath(E.path) + "'"; return false; }
+        if (!keep(E.path)) { Err = "a view whose paths pass 256 MiB"; return false; }
         E.dir = G.dir;
         E.extents = std::move(G.ext);
         const auto It = At.find(E.path);
@@ -317,14 +361,20 @@ done:
         At.emplace(E.path, All.size());
         All.push_back(std::move(E));
     }
-    for (const ViewEntry &E : All)
-        for (size_t S = E.path.find('/'); S != std::string::npos; S = E.path.find('/', S + 1)) Dirs.insert(E.path.substr(0, S));
-    for (const std::string &P : Dirs) {
-        const auto It = At.find(P);
-        if (It == At.end()) { ViewEntry E; E.path = P; E.dir = true; At.emplace(P, All.size()); All.push_back(std::move(E)); }
-        else if (!All[It->second].dir) { Err = "a file that is also a folder: '" + P + "'"; return false; }
+    //each path's ancestors, walked up from its parent until one is already there (whose own are, or will be, walked):
+    //every ancestor once, every one counted against the entries' limit as it is made
+    const size_t Listed = All.size();
+    for (size_t k = 0; k < Listed; ++k) {
+        std::string P = All[k].path;
+        for (size_t S = P.rfind('/'); S != std::string::npos; S = P.rfind('/')) {
+            P.resize(S);
+            const auto It = At.find(P);
+            if (It != At.end()) { if (!All[It->second].dir) { Err = "a file that is also a folder: '" + P + "'"; return false; } break; }
+            if (All.size() >= kViewMaxEntries) { Err = "a view of too many entries"; return false; }
+            if (!keep(P)) { Err = "a view whose paths pass 256 MiB"; return false; }
+            ViewEntry E; E.path = P; E.dir = true; At.emplace(P, All.size()); All.push_back(std::move(E));
+        }
     }
-    if (All.size() > kViewMaxEntries) { Err = "a view of too many entries"; return false; }
     std::sort(All.begin(), All.end(), [](const ViewEntry &a, const ViewEntry &b) { return a.path < b.path; });
     Out = std::move(All);
     return true;
@@ -353,6 +403,7 @@ bool ReadViewListing(const std::string &T, std::vector<ViewEntry> &Out, std::str
         return true;
     };
     size_t Extents = 0;
+    std::unordered_set<std::string> Dirs;
     for (size_t B = Head.size(); B < T.size();) {
         const size_t E = T.find('\n', B);
         if (E == std::string::npos) { Err = "a view listing's last line is unfinished"; return false; }
@@ -372,7 +423,7 @@ bool ReadViewListing(const std::string &T, std::vector<ViewEntry> &Out, std::str
                     const size_t Pl = X.find('+');
                     uint64_t O = 0, N = 0;
                     if (Pl == std::string::npos || !num(X.substr(0, Pl), O) || !num(X.substr(Pl + 1), N) || N == 0) { Err = "a view listing's extent is malformed"; return false; }
-                    if (ContentSize && (O > ContentSize || N > ContentSize - O)) { Err = "a view listing's extent lies outside its content"; return false; }
+                    if (O > ContentSize || N > ContentSize - O) { Err = "a view listing's extent lies outside its content"; return false; }
                     if (!V.extents.empty() && V.extents.back().first + V.extents.back().second == O) { Err = "a view listing's touching extents are not one"; return false; }
                     if (++Extents > kViewMaxExtents || N > UINT64_MAX - Sum) { Err = "a view listing of too many extents"; return false; }
                     Sum += N;
@@ -384,17 +435,15 @@ bool ReadViewListing(const std::string &T, std::vector<ViewEntry> &Out, std::str
         }
         else { Err = "a view listing's line is malformed"; return false; }
         V.path = F[1];
-        if (!GoodPath(V.path) || !ValidUtf8(V.path)) { Err = "a view listing's path is malformed"; return false; }
+        if (V.path.size() > kViewMaxPath || !GoodViewPath(V.path) || !ValidUtf8Text(V.path)) { Err = "a view listing's path is malformed"; return false; }
         if (!Out.empty() && !(Out.back().path < V.path)) { Err = "a view listing out of order (or a path twice)"; return false; }
         if (Out.size() >= kViewMaxEntries) { Err = "a view listing of too many entries"; return false; }
+        //its parent a folder already read (sorted, a parent comes before its children: by induction every ancestor is)
+        if (const size_t S = V.path.rfind('/'); S != std::string::npos && !Dirs.count(V.path.substr(0, S)))
+        { Err = "a view listing missing the folder '" + V.path.substr(0, S) + "'"; return false; }
+        if (V.dir) Dirs.insert(V.path);
         Out.push_back(std::move(V));
     }
-    //every ancestor a folder in the listing
-    std::set<std::string> Dirs;
-    for (const ViewEntry &V : Out) if (V.dir) Dirs.insert(V.path);
-    for (const ViewEntry &V : Out)
-        for (size_t S = V.path.find('/'); S != std::string::npos; S = V.path.find('/', S + 1))
-            if (!Dirs.count(V.path.substr(0, S))) { Err = "a view listing missing the folder '" + V.path.substr(0, S) + "'"; return false; }
     return true;
 }
 

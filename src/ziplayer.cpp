@@ -305,8 +305,13 @@ const ZipEntry *ResolveZipSymlink(ZipIndex &Z, const ZipEntry &E)
             // The link target IS the entry content (STORE archives keep it contiguous — plain pread).
             if (!cur->stored || cur->size == 0 || cur->size > 4096) return nullptr;
             std::string tgt(cur->size, '\0');
-            const uint64_t D = ZipDataOffset(Z, *cur);
-            if (D == UINT64_MAX || Z.src->pread(tgt.data(), tgt.size(), D) != (ssize_t)tgt.size()) { Unread = true; return nullptr; }
+            if (cur->own)                                              // its bytes its own (a tree's link): not the archive's
+            { if (cur->own->pread(tgt.data(), tgt.size(), 0) != (ssize_t)tgt.size()) { Unread = true; return nullptr; } }
+            else
+            {
+                const uint64_t D = ZipDataOffset(Z, *cur);
+                if (D == UINT64_MAX || Z.src->pread(tgt.data(), tgt.size(), D) != (ssize_t)tgt.size()) { Unread = true; return nullptr; }
+            }
             if (!tgt.empty() && tgt[0] == '/') return nullptr;      // absolute → leaves the archive
 
             std::string dir = cur->name.substr(0, cur->name.find_last_of('/') == std::string::npos

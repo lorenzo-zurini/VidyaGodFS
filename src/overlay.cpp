@@ -3,6 +3,7 @@
 #include <map>
 #include "treeplan.h"
 #include "viewmode.h"
+#include "treelayer.h"
 #include "vgdelta.h"
 #include "hostio.h"     // all host filesystem I/O goes through the backend-neutral shim
 
@@ -154,14 +155,13 @@ bool VfsState::Init(const Spec &S, std::string &Err)
         if (Fd < 0) { Why = "cannot open its listing"; return nullptr; }
         HostIO::Stat St;
         std::string Text;
-        if (HostIO::Fstat(Fd, St) == 0 && St.size <= (256ull << 20))
-        {
-            Text.resize((size_t)St.size);
-            size_t Got = 0;
-            while (Got < Text.size()) { const ssize_t R = HostIO::Pread(Fd, Text.data() + Got, Text.size() - Got, Got); if (R <= 0) break; Got += (size_t)R; }
-            Text.resize(Got);
-        }
+        if (HostIO::Fstat(Fd, St) != 0) { HostIO::Close(Fd); Why = "cannot stat its listing"; return nullptr; }
+        if (St.size > (256ull << 20)) { HostIO::Close(Fd); Why = "its listing is over 256 MiB"; return nullptr; }
+        Text.resize((size_t)St.size);
+        size_t Got = 0;
+        while (Got < Text.size()) { const ssize_t R = HostIO::Pread(Fd, Text.data() + Got, Text.size() - Got, Got); if (R <= 0) break; Got += (size_t)R; }
         HostIO::Close(Fd);
+        if (Got != Text.size()) { Why = "its listing did not read whole"; return nullptr; }   // never a listing cut short
         std::vector<coding::ViewEntry> V;
         if (!coding::ReadViewListing(Text, V, Why, Content->size())) return nullptr;
         auto Z = std::make_shared<ZipIndex>(); Z->archivePath = LS.source; Z->src = Content;
@@ -217,18 +217,105 @@ bool VfsState::Init(const Spec &S, std::string &Err)
         for (size_t I = 0; I < S.layers.size(); ++I) Keep[I] = !P.whole[I];
         LayerBytes Bytes(S, P, Keep);
         bool NewFailure = false;
+        //The files of a layer a TREE reads from by path (an archive, a view, a tree), indexed when first asked for — a
+        //base read for its files only shows nowhere, so nothing else indexes it.
+        std::vector<std::shared_ptr<ZipIndex>> Built(S.layers.size());
+        std::vector<char> Visiting(S.layers.size(), 0), NoFiles(S.layers.size(), 0);   // NoFiles: tried, did not build
+        std::function<std::shared_ptr<ZipIndex>(size_t, std::string &)> Files;
+        //A tree (treelayer.h): the folder its table lists, each file's bytes read from its bases (or its ADD region).
+        const auto Rebuilt = [](const LayerSpec &L) { return L.type == LayerType::Delta || L.type == LayerType::Coded || L.type == LayerType::View || L.type == LayerType::Tree; };
+        const auto TreeIndex = [&](size_t I, std::string &Why) -> std::shared_ptr<ZipIndex> {
+            const LayerSpec &LS = S.layers[I];
+            HostIO::Fd Fd = HostIO::Open(LS.source, O_RDONLY);
+            if (Fd < 0) { Why = "cannot open " + LS.source; return nullptr; }
+            HostIO::Stat St;
+            if (HostIO::Fstat(Fd, St) != 0) { HostIO::Close(Fd); Why = "cannot stat " + LS.source; return nullptr; }
+            auto File = std::make_shared<FdByteSource>(Fd, St.size, true);
+            vgtree::Opened Tr;
+            if (!vgtree::OpenTree(File, Tr, Why)) return nullptr;
+            const vgtree::Table &T = Tr.table;
+            if (T.bases != LS.bases) { Why = "its table names other bases than its layer"; return nullptr; }
+            std::string BaseWhy;                                 // why the last base file asked for is not there
+            const auto BaseFile = [&](uint32_t K, const std::string &Path) -> std::shared_ptr<ByteSource> {
+                BaseWhy.clear();
+                if (K >= P.bases[I].size()) { BaseWhy = "no such base"; return nullptr; }
+                const size_t B = P.bases[I][K];
+                const LayerSpec &BL = S.layers[B];
+                //one file: itself — a file, a zip's own bytes, a coded stream, a delta read as one file (a per-file
+                //chain's content). A file and a zip of one CID are one carrier (treeplan): either serves either ask.
+                if (Path.empty() && (BL.type == LayerType::File || BL.type == LayerType::Zip || BL.type == LayerType::Coded || BL.type == LayerType::Delta))
+                { auto Src = Bytes.Get(B, &BaseWhy); return Src; }
+                if (BL.type == LayerType::Coded) { BaseWhy = "a single file has no member '" + Path + "'"; return nullptr; }
+                const auto Z = Files(B, BaseWhy);
+                if (!Z) { BaseWhy = "its files could not be read (" + BaseWhy + ")"; return nullptr; }
+                const auto It = Z->byName.find(Path);
+                if (It == Z->byName.end() || It->second.isDir || It->second.symlink) { BaseWhy = "it has no file '" + Path + "'"; return nullptr; }
+                const ZipEntry &E = It->second;
+                if (E.own) return E.own;
+                if (!E.stored) { BaseWhy = "its '" + Path + "' is compressed"; return nullptr; }
+                //its local header read when first read: a mount of thousands of files makes no read per file
+                const ZipEntry Copy = E;
+                return vgtree::Lazily(E.size, [Z, Copy](std::string &W) -> std::shared_ptr<ByteSource> {
+                    const uint64_t D = ZipDataOffset(*Z, Copy);
+                    if (D == UINT64_MAX) { W = "its local header does not read"; return nullptr; }
+                    return std::make_shared<SliceByteSource>(Z->src, D, Copy.size); }, LS.source + ": its base's '" + coding::PrintablePath(Path) + "'");
+            };
+            auto Z = std::make_shared<ZipIndex>(); Z->archivePath = LS.source; Z->src = File;
+            for (const vgtree::Entry &E : T.entries)
+            {
+                ZipEntry Z1; Z1.name = E.path; Z1.isDir = E.kind == vgtree::Entry::Dir;
+                if (E.kind == vgtree::Entry::Link) { Z1.symlink = true; Z1.stored = true; Z1.own = std::make_shared<MemByteSource>(std::vector<uint8_t>(E.link.begin(), E.link.end())); Z1.size = E.link.size(); }
+                else if (E.kind == vgtree::Entry::File)
+                {
+                    Z1.own = vgtree::EntryBytes(E, BaseFile, Tr, Why);
+                    if (!Z1.own) { Why = "its file '" + coding::PrintablePath(E.path) + "': " + Why + (BaseWhy.empty() ? "" : " — " + BaseWhy); return nullptr; }
+                    Z1.stored = true; Z1.size = E.size; Z1.dataOffset = 0;
+                }
+                const size_t Sl = E.path.find_last_of('/');
+                Z->dirChildren[Sl == std::string::npos ? std::string() : E.path.substr(0, Sl)].insert(Sl == std::string::npos ? E.path : E.path.substr(Sl + 1));
+                if (Z1.isDir) Z->dirChildren.try_emplace(E.path);
+                Z->byName.emplace(E.path, std::move(Z1));
+            }
+            return Z;
+        };
+        Files = [&](size_t B, std::string &Why) -> std::shared_ptr<ZipIndex> {
+            if (Index[B]) return Index[B];
+            if (Built[B]) return Built[B];
+            if (NoFiles[B]) { Why = "it did not build"; return nullptr; }
+            const LayerSpec &BL = S.layers[B];
+            if (Failed[B] || (Rebuilt(BL) && P.broken[B])) { Why = "it did not build"; return nullptr; }
+            if (Visiting[B]) { Why = "trees name each other in a ring"; return nullptr; }
+            Visiting[B] = 1;
+            std::shared_ptr<ZipIndex> Z;
+            if (BL.type == LayerType::View) { auto C = Bytes.Get(P.bases[B][0], &Why); if (C) Z = ViewIndex(C, BL, Why); }
+            else if (BL.type == LayerType::Tree) Z = TreeIndex(B, Why);
+            else if (BL.type == LayerType::Zip || BL.type == LayerType::Delta || BL.type == LayerType::File)   // (a file: as the zip it is)
+            {
+                auto Src = Bytes.Get(B, &Why);
+                if (Src) Z = BuildZipIndex(Src, BL.source);
+                if (!Z && Why.empty()) Why = "an unreadable zip";
+            }
+            Visiting[B] = 0;
+            Built[B] = Z;
+            if (!Z) NoFiles[B] = 1;                          // asked once: every tree naming it is told, nothing reopened
+            return Z;
+        };
         for (size_t I = 0; I < S.layers.size(); ++I)
         {
             const LayerSpec &LS = S.layers[I];
-            const bool Coded = LS.type == LayerType::Coded, View = LS.type == LayerType::View;
-            if ((LS.type != LayerType::Zip && LS.type != LayerType::Delta && !Coded && !View) || P.whole[I] || Index[I] || Failed[I]) continue;
-            if ((LS.type == LayerType::Delta || Coded || View) && P.broken[I]) continue;
+            const bool Coded = LS.type == LayerType::Coded, View = LS.type == LayerType::View, Tree = LS.type == LayerType::Tree;
+            if ((LS.type != LayerType::Zip && LS.type != LayerType::Delta && !Coded && !View && !Tree) || P.whole[I] || Index[I] || Failed[I]) continue;
+            if ((LS.type == LayerType::Delta || Coded || View || Tree) && P.broken[I]) continue;
             std::string Why;
-            if (View)
+            if (View || LS.type == LayerType::Tree)
             {
-                std::shared_ptr<ByteSource> Content = Bytes.Get(P.bases[I][0], &Why);
-                if (Content) Index[I] = ViewIndex(Content, LS, Why);
-                if (!Index[I]) { std::cerr << "[vidyagodfs] skipping view " << LS.source << ": " << Why << "\n"; Failed[I] = true; }
+                Index[I] = Files(I, Why);
+                if (!Index[I])
+                {
+                    std::cerr << "[vidyagodfs] skipping " << (View ? "view " : "tree ") << LS.source << ": " << Why << "\n";
+                    Failed[I] = true;
+                    if (Tree) NewFailure = true;                 // a tree that does not build hides nothing: plan again
+                }
                 continue;
             }
             std::shared_ptr<ByteSource> Src = Bytes.Get(I, &Why);
@@ -238,7 +325,7 @@ bool VfsState::Init(const Spec &S, std::string &Err)
                 if (Bytes.Failed(I)) { Failed[I] = true; NewFailure = true; }
                 continue;
             }
-            Index[I] = Coded ? CodedIndex(Src, LS) : BuildZipIndex(Src, LS.source);
+            Index[I] = Coded ? CodedIndex(Src, LS) : Built[I] ? Built[I] : BuildZipIndex(Src, LS.source);   // (a tree's base: indexed already)
             if (!Index[I]) std::cerr << "[vidyagodfs] skipping unreadable zip layer: " << LS.source << "\n";
         }
         for (size_t I = 0; I < S.layers.size(); ++I)          // a delta read only as a base can fail too
@@ -250,7 +337,7 @@ bool VfsState::Init(const Spec &S, std::string &Err)
     for (size_t gi = 0; gi < S.layers.size(); ++gi)
     {
         const LayerSpec &LS = S.layers[gi];
-        const bool Archive = LS.type == LayerType::Zip || LS.type == LayerType::Delta || LS.type == LayerType::Coded || LS.type == LayerType::View;
+        const bool Archive = LS.type == LayerType::Zip || LS.type == LayerType::Delta || LS.type == LayerType::Coded || LS.type == LayerType::View || LS.type == LayerType::Tree;
         if (Archive && (P.whole[gi] || !Index[gi])) continue;   // a byte input only, or nothing to serve
         for (const auto &[sub, tgt] : P.mounts[gi])
         {

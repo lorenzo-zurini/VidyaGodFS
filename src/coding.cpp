@@ -106,12 +106,16 @@ bool Validate(const Description &D, std::string &Err) {
     for (const Op &p : D.ops) if (p.op >= OP_ENAME && (D.isa < 10 || !D.view)) { Err = p.op >= OP_ENAME && D.isa < 10 ? "an op newer than the instruction set it names" : "a file-table op in a codec (VIEW mode only)"; return false; }
     if (D.view) {
         if (D.isa < 10) { Err = "VIEW mode is ISA 10"; return false; }
-        if (D.names > kNamesShiftJis) { Err = "a view's NAMES encoding is unknown"; return false; }
+        if (D.names > kNamesLast) { Err = "a view's NAMES encoding is unknown"; return false; }
+        if (D.nslots || D.window || D.maxlen || D.shift != 5 || D.nhuff || D.histbase || D.histlen || D.tokK || D.tokL || D.tokSL || D.tokD ||
+            D.entryToken != -1 || D.len1slot != -1 || D.coder != kRange)
+        { Err = "a view has no coder: SHIFT SLOTS WINDOW MAXLEN LEN1SLOT HISTORY TOKEN HUFFS TOKEN_ENTRY mean nothing in it"; return false; }
         for (const Op &p : D.ops) {
             const bool ok = p.op == OP_SET || p.op == OP_STA || p.op == OP_JZ || p.op == OP_JMP || p.op == OP_CALL || p.op == OP_RET ||
                             p.op == OP_ASSERT || p.op == OP_END || p.op >= OP_ENAME;
             if (!ok || p.modes || p.flags) { Err = "a view runs no coder: only set sta jz jmp call ret assert end and the entry ops"; return false; }
             if ((p.op == OP_STA && p.nb >= na) || (p.op == OP_ETAB && p.imm >= nt)) { Err = "an op naming something the description lacks"; return false; }
+            if (p.op == OP_ETAB) for (const uint32_t c : D.tables[p.imm]) if (c > 255) { Err = "a name table holds bytes (0..255)"; return false; }
         }
         for (const Ex &e : D.ex)
             if (e.op == EX_BITPOS || e.op == EX_DLEFT || e.op == EX_INLEFT || e.op == EX_STREAMPOS) { Err = "a view has no stream: bitpos dleft inleft streampos mean nothing in it"; return false; }

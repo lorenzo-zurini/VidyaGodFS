@@ -10,7 +10,7 @@
 //one per launch (TempPath/vidyagodfs.spec.json) describing an ordered, target-rooted layer stack;
 //the helper serves the merged tree from it. See the plan / README for the format.
 
-enum class LayerType { Dir, Zip, File, Delta, Coded, View };
+enum class LayerType { Dir, Zip, File, Delta, Coded, View, Tree };
 
 struct LayerSpec {
     LayerType   type = LayerType::Dir;
@@ -45,6 +45,8 @@ struct LayerSpec {
     //VIEW only (ISA 10): the files in a content (its one CID in `bases`, any layer carrying bytes: a disc image, an
     //archive), listed by `source`, the VIEW's canonical listing (.vgview, MetaPackageFormat 22.17). It appears as a folder
     //of those files at its target; their bytes are the content's. `cid`: the listing's CID (what a TREE names it by).
+    //TREE (treelayer.h): `source` the .vgtz, `bases` what its files are read from (archives, views, trees, files, by
+    //CID, in its table's order); it appears as the folder its table lists.
     //Places (virtual paths, normalized) this layer does not serve: a file, or a folder and everything below it. What a
     //re-provided copy of a node's layer leaves to the layers beneath it (MetaPackageFormat 05 §5.4: the paths later
     //layers of the same composition rewrite). Hidden like a delta hides its bases (TreePlan::maskedUnder).

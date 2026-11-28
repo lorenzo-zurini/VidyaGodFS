@@ -176,8 +176,8 @@ bool Print(const Description &D, std::string &Out, std::string &Err, const TextN
     field("NAME", Quote(D.name));
     field("ISA", std::to_string(D.isa));
     if (D.view) {                                      // ISA 10: a file table, no coder
-        static const char *const kNames[] = {"utf-8", "ascii", "latin-1", "utf-16be", "shift-jis"};
-        if (D.names > kNamesShiftJis) { Err = "a view's NAMES encoding is unknown"; return false; }
+        static const char *const kNames[] = {"utf-8", "ascii", "latin-1", "utf-16be", "cp932", "cp437"};
+        if (D.names > kNamesLast) { Err = "a view's NAMES encoding is unknown"; return false; }
         field("MODE", "\"VIEW\"");
         field("NAMES", Quote(kNames[D.names]));
     }
@@ -462,10 +462,10 @@ bool Read(const std::string &Text, Description &Out, std::string &Err, TextNames
         if (!J["MODE"].is_string() || J["MODE"].get<std::string>() != "VIEW") return bad("MODE is \"VIEW\" (a codec names none)");
         D.view = true;
         if (J.contains("CODER")) return bad("a view has no CODER");
-        if (!J.contains("NAMES") || !J["NAMES"].is_string()) return bad("a view says how its names are written: NAMES utf-8, ascii, latin-1, utf-16be or shift-jis");
+        if (!J.contains("NAMES") || !J["NAMES"].is_string()) return bad("a view says how its names are written: NAMES utf-8, ascii, latin-1, utf-16be, cp932 or cp437");
         const std::string n = J["NAMES"].get<std::string>();
         if (n == "utf-8") D.names = kNamesUtf8; else if (n == "ascii") D.names = kNamesAscii; else if (n == "latin-1") D.names = kNamesLatin1;
-        else if (n == "utf-16be") D.names = kNamesUtf16be; else if (n == "shift-jis") D.names = kNamesShiftJis;
+        else if (n == "utf-16be") D.names = kNamesUtf16be; else if (n == "cp932") D.names = kNamesCp932; else if (n == "cp437") D.names = kNamesCp437;
         else return bad("no such NAMES encoding: " + n);
     } else {
         if (J.contains("NAMES")) return bad("NAMES belongs to a view (MODE \"VIEW\")");

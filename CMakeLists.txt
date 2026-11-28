@@ -46,6 +46,7 @@ set(VGFS_CORE_SRC
     src/coding.cpp
     src/codingtext.cpp
     src/viewmode.cpp
+    src/treelayer.cpp
     src/lz4family.cpp
     src/zfamily.cpp
     src/zipscan.cpp

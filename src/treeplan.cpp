@@ -20,7 +20,9 @@ bool Within(const std::string &vrel, const std::string &root)
 //file's own bytes (a disc image).
 static bool CarriesBytes(const LayerSpec &L) { return L.type == LayerType::Zip || L.type == LayerType::Delta || L.type == LayerType::File || L.type == LayerType::Coded; }
 //A layer rebuilt over the bytes its `bases` name: a delta over its base, a coded stream over its content.
-static bool Rebuilt(const LayerSpec &L) { return L.type == LayerType::Delta || L.type == LayerType::Coded || L.type == LayerType::View; }
+static bool Rebuilt(const LayerSpec &L) { return L.type == LayerType::Delta || L.type == LayerType::Coded || L.type == LayerType::View || L.type == LayerType::Tree; }
+//A layer of FILES a tree reads from by path (a view's, a tree's): never bytes a delta, a coded stream or a view reads.
+static bool CarriesFiles(const LayerSpec &L) { return L.type == LayerType::View || L.type == LayerType::Tree; }
 static std::string Name(const LayerSpec &L)
 {
     const size_t S = L.source.find_last_of("/\\");
@@ -33,6 +35,10 @@ TreePlan PlanTree(const Spec &S, const std::vector<bool> &Failed)
     TreePlan P;
     P.mounts.resize(N); P.bases.resize(N); P.maskedUnder.resize(N); P.whole.assign(N, false); P.broken.assign(N, false);
     std::unordered_map<std::string, size_t> Carrier;   // CID -> the first layer carrying it (one CID, one file)
+    //A CID two layers carry with different bytes (the same record or delta over different bases: a per-file chain's
+    //unchanged record): which file it names is not one thing, so anything built over it is refused, never given the
+    //first one's bytes.
+    std::unordered_set<std::string> Ambiguous;
     for (size_t I = 0; I < N; ++I)
     {
         const LayerSpec &L = S.layers[I];
@@ -42,7 +48,14 @@ TreePlan PlanTree(const Spec &S, const std::vector<bool> &Failed)
             for (const auto &M : L.submounts) P.mounts[I].push_back(M);
             if (P.mounts[I].empty()) P.mounts[I].push_back({ std::string(), L.target });
         }
-        if (CarriesBytes(L) && !L.cid.empty()) Carrier.try_emplace(L.cid, I);
+        if ((CarriesBytes(L) || CarriesFiles(L)) && !L.cid.empty())
+        {
+            const auto [It, New] = Carrier.try_emplace(L.cid, I);
+            //bytes as stored (a file, a zip) are one CID's bytes whichever type carries them; rebuilt ones (a delta, a
+            //coded stream, a view, a tree) are their type's over their bases
+            const auto Kind = [](const LayerSpec &X) { return X.type == LayerType::Zip ? LayerType::File : X.type; };
+            if (!New && (S.layers[It->second].bases != L.bases || Kind(S.layers[It->second]) != Kind(L))) Ambiguous.insert(L.cid);
+        }
     }
     //Which deltas can rebuild: every CID on a zip, a file, or a delta that can; no ring.
     enum Mark : unsigned char { Unseen, Visiting, Done };
@@ -55,11 +68,13 @@ TreePlan PlanTree(const Spec &S, const std::vector<bool> &Failed)
         if (D < Failed.size() && Failed[D]) Why = "its bytes did not rebuild over its bases";
         //a delta over NO base is its own bytes, zstd-compressed with random access (content at rest); a coded stream
         //always has its content
-        if ((S.layers[D].type == LayerType::Delta ? !S.layers[D].basesNamed : S.layers[D].bases.empty()) && Why.empty()) Why = "it names no base";
+        if ((S.layers[D].type == LayerType::Delta ? !S.layers[D].basesNamed : S.layers[D].bases.empty() && S.layers[D].type != LayerType::Tree) && Why.empty()) Why = "it names no base";   // a tree over nothing: its own bytes
         for (const std::string &C : S.layers[D].bases)
         {
             const auto It = Carrier.find(C);
             if (It == Carrier.end()) { if (Why.empty()) Why = "it names " + C + ", which no zip, delta or file here carries"; continue; }
+            if (Ambiguous.count(C)) { if (Why.empty()) Why = "it names " + C + ", which two layers here carry with different bytes (the same file over other bases)"; continue; }
+            if (CarriesFiles(S.layers[It->second]) && S.layers[D].type != LayerType::Tree) { if (Why.empty()) Why = "it names " + C + ", a view or tree: files, not bytes"; continue; }
             P.bases[D].push_back(It->second);
             if (Rebuilt(S.layers[It->second]))
             {
@@ -68,7 +83,7 @@ TreePlan PlanTree(const Spec &S, const std::vector<bool> &Failed)
             }
         }
         P.broken[D] = !Why.empty();
-        if (P.broken[D]) P.problems.push_back(std::string(S.layers[D].type == LayerType::Coded ? "coded stream " : S.layers[D].type == LayerType::View ? "view " : "delta ") + Name(S.layers[D]) + " (at '" + S.layers[D].target + "') cannot rebuild: " + Why);
+        if (P.broken[D]) P.problems.push_back(std::string(S.layers[D].type == LayerType::Coded ? "coded stream " : S.layers[D].type == LayerType::View ? "view " : S.layers[D].type == LayerType::Tree ? "tree " : "delta ") + Name(S.layers[D]) + " (at '" + S.layers[D].target + "') cannot rebuild: " + Why);
         Seen[D] = Done;
         return !P.broken[D];
     };
@@ -79,7 +94,7 @@ TreePlan PlanTree(const Spec &S, const std::vector<bool> &Failed)
     //steps, not a million. Per CID: place -> the highest layer whose placements beneath it are hidden there.
     std::unordered_map<std::string, std::vector<size_t>> NamedBy;   // CID -> the rebuilding deltas naming it
     for (size_t D = 0; D < N; ++D)
-        if (S.layers[D].type == LayerType::Delta && !P.broken[D])
+        if ((S.layers[D].type == LayerType::Delta || S.layers[D].type == LayerType::Tree) && !P.broken[D])   // a tree hides its bases too
             for (const std::string &C : S.layers[D].bases) NamedBy[C].push_back(D);
     std::unordered_map<std::string, std::map<std::string, size_t>> Down;
     std::unordered_set<std::string> Passed;
@@ -99,7 +114,7 @@ TreePlan PlanTree(const Spec &S, const std::vector<bool> &Failed)
     };
     for (size_t L = 0; L < N; ++L)
     {
-        if (!CarriesBytes(S.layers[L]) || S.layers[L].cid.empty()) continue;
+        if (!(CarriesBytes(S.layers[L]) || CarriesFiles(S.layers[L])) || S.layers[L].cid.empty()) continue;
         for (const auto &[Place, Upto] : DownOf(S.layers[L].cid))
             if (L < Upto) P.maskedUnder[L].push_back(Place);
     }

@@ -137,7 +137,8 @@ struct Ex { uint8_t op = 0; uint16_t a = 0, b = 0; uint32_t imm = 0; };
 struct Op { uint8_t op = 0, modes = 0, flags = 0, nb = 0, tgt = 0; uint16_t x = 0, v = 0, m = 0, target = 0; uint32_t imm = 0; };
 
 // How a VIEW's names are written in its content (ISA 10): read to UTF-8 when an entry is finished.
-enum Names : uint8_t { kNamesUtf8 = 0, kNamesAscii = 1, kNamesLatin1 = 2, kNamesUtf16be = 3, kNamesShiftJis = 4 };
+enum Names : uint8_t { kNamesUtf8 = 0, kNamesAscii = 1, kNamesLatin1 = 2, kNamesUtf16be = 3, kNamesCp932 = 4, kNamesCp437 = 5, kNamesLast = 5 };
+// (cp932: Windows-31J, the Shift JIS table Windows tools show — 0x8160 is U+FF5E; cp437: the IBM PC's OEM code page)
 
 struct Description {
     std::string name;
